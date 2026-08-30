@@ -15,4 +15,6 @@ patches/
 reviews/
 history/
 .wiz/
+.codex/**
+.mdkb/**
 marketing/
