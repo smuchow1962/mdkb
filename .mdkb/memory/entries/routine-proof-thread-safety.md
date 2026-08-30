@@ -6,15 +6,14 @@ source_type: auto_extracted
 status: active
 tags: [self-learning, success-routine]
 created_at: 1783298426
-updated_at: 1786201101
-expires_at: 1788793101
+updated_at: 1787925179
 ---
 
-Proven approach for "thread-safety" recurred across 18 stories on 3 distinct days — a reusable routine.
+Proven approach for "thread-safety" recurred across 16 stories on 3 distinct days — a reusable routine.
 
 What worked:
-- salvage reads corrupt via immutable=1 （no lock/hot-journal）; detach best-effort; single fresh connection
-- project_scope_token and entry_in_scope are pure functions over borrowed data, no shared state. The one DB read （list_collections） happens under the existing ctx mutex guard, which is dropped before any await.
-- <redacted> is a pure function that consumes its Vec by value; no shared state, no interior mutability, nothing held across an await.
+- Daemon-owned Context/IndexFacade resources execute all mutations; read processes open read-only and leave neither index.sqlite nor code.sqlite WAL/SHM sidecars. Both routed and direct contention probes passed.
+- The scope split only changes which PathBuf the DISCOVER thread walks; the channel topology, stage handles and join order are unchanged. <redacted> runs on the caller's thread before any stage is spawned.
+- Extraction happens on the PARSE threads, which own their parser; the collected imports cross to COLLECT and INDEX through the existing bounded channel. Writes stay on the single INDEX thread inside its transaction — no new shared state.
 
-Source stories: 083-c95d, 006-07d0, 007-9099, 008-a52a, 005-c348, 022-d950, 014-fdf0, 023-fc7c, 015-2dc2, 012-19e7, 011-9a41, 016-a6dd, 020-9824, 021-0636, 017-a378, 009-686d, 019-3248, 018-56b2
+Source stories: 025-6cb6, 013-358d, 011-e97e, 018-b102, 019-eb8b, 024-b6df, 020-c1ce, 021-beab, 023-95e2, 022-85f5, 033-c5b0, 034-d0b5, 035-97e1, 036-75b1, 038-9509, 039-f464

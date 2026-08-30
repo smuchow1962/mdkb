@@ -6,15 +6,14 @@ source_type: auto_extracted
 status: active
 tags: [self-learning, success-routine]
 created_at: 1783298426
-updated_at: 1786201101
-expires_at: 1788793101
+updated_at: 1787925178
 ---
 
-Proven approach for "input-validation" recurred across 15 stories on 4 distinct days — a reusable routine.
+Proven approach for "input-validation" recurred across 26 stories on 3 distinct days — a reusable routine.
 
 What worked:
-- strip_prefix guards non-matching refs; empty basename skipped in collection_prefixes
-- relation is an optional filter compared against edge.relation; limit is usize; no injection （columns hardcoded）
-- <redacted>: an older quarantine with no sidecar is still surfaced （never hidden）
+- Serde rejects malformed typed requests before dispatch; core validators still validate IDs, paths, retention, experiment parameters and imports. Admission tests pin safe fallback classification.
+- Byte ranges come from tree-sitter nodes and index the same source string the tree was parsed from, so slicing is always on a char boundary. Malformed C yields ERROR nodes, which hit the _ arm and are logged, not sliced.
+- Every user-supplied path is still canonicalized and rejected if it does not start with the canonical root. <redacted> joins stored relative paths onto root, and a stored absolute path （used for files outside root） replaces the join, so no path is misresolved.
 
-Source stories: 077-5c76, 081-ae1c, 083-c95d, 006-07d0, 007-9099, 005-c348, 010-b146, 022-d950, 013-4b7f, 014-fdf0, 023-fc7c, 015-2dc2, 016-a6dd, 017-a378, 024-0c7e
+Source stories: 025-6cb6, 017-96d8, 013-358d, 032-0960, 026-7b25, 025-3141, 008-12f2, 011-e97e, 018-b102, 019-eb8b, 024-b6df, 020-c1ce, 021-beab, 023-95e2, 022-85f5, 034-d0b5, 035-97e1, 036-75b1, 040-7354, 037-8060, 009-ffd5, 027-3f70, 028-8d30, 029-4608, 030-6c0d, 031-4947
