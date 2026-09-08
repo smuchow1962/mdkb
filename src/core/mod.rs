@@ -566,6 +566,7 @@ pub(crate) fn ensure_store_gitignore(memory_dir: &Path) -> Result<()> {
 
 pub mod cli_mutation;
 pub mod code;
+pub mod dup;
 pub mod graph;
 pub mod indexing;
 pub mod memory;

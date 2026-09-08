@@ -325,17 +325,20 @@ pub fn ignore_cluster(
 
 /// Whether an accepted-duplication decision is currently standing.
 ///
-/// [`resolve_active`](crate::store::memory_graph::resolve_active) is the store's
-/// own answer to "is this entry still in force", so a superseded *or* expired
-/// entry stops filtering and the cluster comes back — which is the point of
-/// keeping this in the memory store rather than a text file.
+/// [`resolve_active_untracked`](crate::store::memory_graph::resolve_active_untracked)
+/// is the store's own answer to "is this entry still in force", so a superseded
+/// *or* expired entry stops filtering and the cluster comes back — which is the
+/// point of keeping this in the memory store rather than a text file. The
+/// untracked form because an audit is a read: it runs over every cluster, must
+/// work on a read-only connection, and must not inflate the access counts that
+/// rank memory search.
 ///
 /// The entry type and tag are checked too. An unrelated entry that happens to
 /// hold this id must not silently delete a finding: suppression fails open
 /// here for the same reason it does in the call-graph pass.
 pub fn is_ignored(conn: &rusqlite::Connection, cluster_hash: &str) -> crate::error::Result<bool> {
     let id = ignore_entry_id(cluster_hash);
-    let Some(entry) = crate::store::memory_graph::resolve_active(conn, &id)? else {
+    let Some(entry) = crate::store::memory_graph::resolve_active_untracked(conn, &id)? else {
         return Ok(false);
     };
     Ok(entry.entry_type == crate::store::memory::EntryType::Decision

@@ -266,18 +266,33 @@ pub fn incoming(
 /// Used by recall expansion (Step 5) so only active neighbors surface; also
 /// proves a dangling edge resolves once its target entry is created.
 pub fn resolve_active(conn: &Connection, target_ref: &str) -> Result<Option<MemoryEntry>> {
-    let Some(entry) = memory::get_entry(conn, target_ref)? else {
-        return Ok(None);
-    };
+    Ok(live(memory::get_entry(conn, target_ref)?))
+}
+
+/// The same resolution without counting the lookup as a use.
+///
+/// A machine checking whether an entry still stands — the duplication
+/// ignore-list does it once per cluster per audit — is not a recall. Counting
+/// it would both inflate the recency signal that ranks memory search and
+/// require a writable connection for what is a read.
+pub fn resolve_active_untracked(
+    conn: &Connection,
+    target_ref: &str,
+) -> Result<Option<MemoryEntry>> {
+    Ok(live(memory::get_entry_without_tracking(conn, target_ref)?))
+}
+
+/// `None` when the entry is superseded or past its expiry — the one liveness
+/// rule both resolvers share.
+fn live(entry: Option<MemoryEntry>) -> Option<MemoryEntry> {
+    let entry = entry?;
     if entry.status == memory::EntryStatus::Superseded {
-        return Ok(None);
+        return None;
     }
-    if let Some(exp) = entry.expires_at {
-        if exp <= Utc::now().timestamp() {
-            return Ok(None);
-        }
+    if entry.expires_at.is_some_and(|exp| exp <= Utc::now().timestamp()) {
+        return None;
     }
-    Ok(Some(entry))
+    Some(entry)
 }
 
 /// `(status, confirmations, corrections)` for a memory target, or `None` if it

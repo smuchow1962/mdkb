@@ -322,14 +322,52 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     format_code_symbols(&found.symbols, cli.format);
                     report_find_truncation(&found);
                 }
+                Some("duplicates") => {
+                    // The query is not a query here: duplication is a sweep,
+                    // and what narrows it is `--file`, not words. An empty
+                    // query is therefore the ordinary case, not a mistake.
+                    let report = run_dup(
+                        &cwd,
+                        Some(&ctx.conn),
+                        &ctx.config_path,
+                        &mdkb::core::dup::DupOverrides {
+                            file: file.clone().or_else(|| {
+                                (!query.is_empty()).then(|| query.clone())
+                            }),
+                            ..Default::default()
+                        },
+                    )?;
+                    print!("{}", report.markdown);
+                }
                 Some(invalid) => {
                     eprintln!(
-                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols. Omit for docs+memory.",
+                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols, duplicates. Omit for docs+memory.",
                         invalid
                     );
                     std::process::exit(1);
                 }
             }
+        }
+        Command::Dup {
+            threshold,
+            min_nodes,
+            file,
+        } => {
+            // Read-only, and tolerant of a repository nobody has indexed: the
+            // report says so and exits 0. An audit that has nothing to audit is
+            // not a failure.
+            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let report = run_dup(
+                &cwd,
+                Some(&ctx.conn),
+                &ctx.config_path,
+                &mdkb::core::dup::DupOverrides {
+                    threshold,
+                    min_nodes,
+                    file,
+                },
+            )?;
+            print!("{}", report.markdown);
         }
         Command::Get { id, lines } => {
             use mdkb::cli::handlers::GetResult;
@@ -3279,6 +3317,21 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
 
 /// Render semantic search hits. The similarity score is the reason a hit is in
 /// the list at all, so it travels with the symbol rather than being dropped.
+/// Run the duplication audit for either surface that asks for it.
+///
+/// `mdkb dup` and `mdkb search --scope duplicates` are two ways of asking the
+/// same question; they load the config the same way and call the same handler,
+/// so they cannot answer differently.
+fn run_dup(
+    root: &std::path::Path,
+    memory: Option<&rusqlite::Connection>,
+    config_path: &std::path::Path,
+    overrides: &mdkb::core::dup::DupOverrides,
+) -> mdkb::error::Result<mdkb::core::dup::DupReport> {
+    let config = mdkb::config::Config::load_or_default(config_path);
+    mdkb::core::dup::handle_dup(root, memory, &config, overrides)
+}
+
 fn format_scored_symbols(scored: &[(mdkb::code::symbol::Symbol, f32)], format: OutputFormat) {
     match format {
         OutputFormat::Json => {

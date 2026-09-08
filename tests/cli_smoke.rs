@@ -236,6 +236,38 @@ fn smoke_search_scope_memory() {
     assert_ok(&out, "search --scope memory");
 }
 
+/// `mdkb dup` before anyone ran `mdkb code index`.
+///
+/// `mdkb init` creates an empty `code.sqlite`, so this is the state a fresh
+/// repository is really in — the audit must say the index is missing and exit
+/// 0, because an audit with nothing to audit is not a failure.
+#[test]
+fn smoke_dup_without_a_code_index() {
+    let repo = Repo::new();
+    let out = run(&["dup"], &repo.root);
+    assert_ok(&out, "dup without a code index");
+    let text = stdout(&out);
+    assert!(text.contains("No code index"), "dup said: {text}");
+    assert!(
+        text.contains("mdkb code index"),
+        "and must say what to run: {text}"
+    );
+}
+
+/// The scope spelling is the same audit as the subcommand, on the CLI too —
+/// `search --scope duplicates` exists because that is how MCP asks for it.
+#[test]
+fn smoke_search_scope_duplicates_matches_dup() {
+    let repo = Repo::new();
+    let scoped = run(&["search", "", "--scope", "duplicates"], &repo.root);
+    assert_ok(&scoped, "search --scope duplicates");
+    assert_eq!(
+        stdout(&scoped),
+        stdout(&run(&["dup"], &repo.root)),
+        "the two spellings must not drift"
+    );
+}
+
 #[test]
 fn smoke_get_by_path() {
     let repo = Repo::new();
@@ -1255,6 +1287,7 @@ fn smoke_help_all_subcommands() {
         &["update", "--help"],
         &["embed", "--help"],
         &["search", "--help"],
+        &["dup", "--help"],
         &["get", "--help"],
         &["mget", "--help"],
         &["stats", "--help"],

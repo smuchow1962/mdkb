@@ -77,6 +77,21 @@ pub enum Command {
     #[command(subcommand)]
     Collection(CollectionCommand),
 
+    /// Report duplicated code
+    Dup {
+        /// Cosine floor for the semantic pass. Omit to use code.duplication.similarity_threshold
+        #[arg(long)]
+        threshold: Option<f32>,
+
+        /// Fewest AST nodes a body needs to be worth comparing. Omit to use code.duplication.min_nodes
+        #[arg(long = "min-nodes")]
+        min_nodes: Option<u32>,
+
+        /// Only look at paths starting with this. Omit to sweep the repository
+        #[arg(short, long)]
+        file: Option<String>,
+    },
+
     /// Search documents, memory, or code symbols
     Search {
         /// Search query

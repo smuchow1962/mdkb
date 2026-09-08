@@ -25,7 +25,7 @@ pub struct SearchParams {
     #[serde(default)]
     pub include_superseded: bool,
 
-    /// Search scope: "docs", "memory", "code", or "symbols". Omit to search docs+memory.
+    /// Search scope: "docs", "memory", "code", "symbols", or "duplicates". Omit to search docs+memory.
     #[serde(default)]
     pub scope: Option<String>,
 
@@ -33,11 +33,11 @@ pub struct SearchParams {
     #[serde(default)]
     pub kind: Option<String>,
 
-    /// Minimum similarity score 0.0-1.0 when scope is "code". Omit to use the configured code.semantic_search.threshold.
+    /// Minimum similarity score 0.0-1.0 when scope is "code" or "duplicates". Omit to use the configured threshold.
     #[serde(default)]
     pub threshold: Option<f32>,
 
-    /// Filter by file path (substring match) when scope is "symbols".
+    /// Filter by file path: substring match when scope is "symbols", path prefix when scope is "duplicates". Omit with scope="duplicates" to sweep the repository; query is then ignored.
     #[serde(default)]
     pub file: Option<String>,
 

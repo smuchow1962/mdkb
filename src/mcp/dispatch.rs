@@ -1424,8 +1424,32 @@ pub async fn search_impl(
                 Ok((out, count))
             }
         }
+        Some("duplicates") => {
+            // The audit reads the code index off its own read-only connection,
+            // so it does not take the code-index guard the other code scopes
+            // need. It does take the memory connection, for the ignore-list.
+            let mut ctx_guard = handle.ctx.lock().await;
+            let report = crate::core::run_guarded_read(&mut ctx_guard, "duplication audit", |ctx| {
+                crate::core::dup::handle_dup(
+                    &handle.root,
+                    Some(&ctx.conn),
+                    &handle.config,
+                    &crate::core::dup::DupOverrides {
+                        threshold: params.threshold,
+                        min_nodes: None,
+                        // An empty query sweeps the repository; `file` is what
+                        // narrows it, matching `mdkb dup --file`.
+                        file: params.file.clone(),
+                    },
+                )
+            })
+            .ok_or_else(|| mcp_error("Database not initialized"))?
+            .map_err(|e| mcp_error(format!("Duplication audit failed: {e}")))?;
+
+            Ok((report.markdown, report.clusters))
+        }
         Some(invalid) => Err(mcp_error(format!(
-            "Invalid scope: '{invalid}'. Valid: docs, memory, code, symbols."
+            "Invalid scope: '{invalid}'. Valid: docs, memory, code, symbols, duplicates."
         ))),
     }
 }
@@ -1449,9 +1473,9 @@ pub async fn cross_repo_search_impl(
     let scope = params.scope.as_deref();
     let limit = params.limit.min(100);
 
-    if matches!(scope, Some("code" | "symbols")) {
+    if matches!(scope, Some("code" | "symbols" | "duplicates")) {
         return Err(mcp_error(
-            "Cross-repo search is not supported for code/symbols scope. Specify a root.",
+            "Cross-repo search is not supported for code/symbols/duplicates scope. Specify a root.",
         ));
     }
 
