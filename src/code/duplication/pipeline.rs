@@ -10,13 +10,13 @@
 //! differently, and a duplication report that disagrees with itself depending
 //! on how it was asked for is worse than no report.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 
 use super::body::hamming;
 use super::candidates::{DupCandidate, MAX_SUPPRESSING_TIER, candidates, confident_call_pairs};
-use super::cluster::{Fingerprint, UnionFind, cluster, suppression_for};
+use super::cluster::{Fingerprint, UnionFind, cluster, dense_groups, suppression_for};
 use super::embed::{BodyEmbedder, score_semantic_tail};
 use super::report::{Cluster, Evidence, filter_ignored, rank};
 use super::scan::{Scanned, fingerprint_candidates};
@@ -198,20 +198,28 @@ fn semantic_clusters(
 ) -> Result<Vec<Cluster>> {
     let scored = score_semantic_tail(dup, bodies, groups, embedder, threshold)?;
 
-    // Union-find again, for the same reason as the structural pass: three
-    // mutually similar bodies are one finding a reader acts on once.
-    let mut uf = UnionFind::new(scan.scanned.len());
-    let mut joined = false;
-    for &(i, j, _) in &scored {
-        if suppression_for(&scan.fingerprints[i], &scan.fingerprints[j], scan.suppressed).is_some()
-        {
-            continue;
-        }
-        uf.union(i, j);
-        joined = true;
-    }
-    if !joined {
+    // A pair is admissible only if the model actually scored it above the
+    // threshold. `scored` holds nothing else, so a pair that is absent is a
+    // pair that failed — and it must block a merge rather than be skipped.
+    // Skipping it is what let a semantic group report the weakest score it
+    // *kept* while hiding the member pair that never matched at all.
+    let pairs: HashMap<(usize, usize), f32> = scored
+        .iter()
+        .filter(|&&(i, j, _)| {
+            suppression_for(&scan.fingerprints[i], &scan.fingerprints[j], scan.suppressed).is_none()
+        })
+        .map(|&(i, j, score)| (ordered(i, j), score))
+        .collect();
+    if pairs.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Union-find as the same cheap pre-filter as the structural pass, then the
+    // same diameter bound inside each component: a semantic chain is no more a
+    // finding than a structural one.
+    let mut uf = UnionFind::new(scan.scanned.len());
+    for &(i, j) in pairs.keys() {
+        uf.union(i, j);
     }
 
     // Drop the groups the structural pass already reported: a semantic pair may
@@ -220,16 +228,30 @@ fn semantic_clusters(
     Ok(uf
         .groups()
         .into_iter()
-        .filter(|group| !group.iter().any(|i| already.contains(i)))
+        .filter(|component| !component.iter().any(|i| already.contains(i)))
+        .flat_map(|component| {
+            dense_groups(
+                &component,
+                |i| scan.fingerprints[i].simhash,
+                |a, b| pairs.contains_key(&ordered(a, b)),
+            )
+        })
         .map(|group| Cluster {
             members: scan.members(&group),
             // The weakest link, not the strongest: a group is only as much of a
-            // finding as the pair that barely held it together.
+            // finding as the pair that barely held it together. Every member
+            // pair is present by construction, so this is the real weakest.
             evidence: Evidence::Semantic {
-                similarity: group_similarity(&group, &scored),
+                similarity: group_similarity(&group, &pairs),
             },
         })
         .collect())
+}
+
+/// A pair key, lower index first, so a lookup does not depend on which way the
+/// scorer emitted it.
+fn ordered(a: usize, b: usize) -> (usize, usize) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 /// `(body_hash, body_text)` for each scanned candidate, in the same order.
@@ -265,13 +287,18 @@ fn bodies_of(
 }
 
 /// The lowest score among the pairs inside a group.
-fn group_similarity(group: &[usize], scored: &[(usize, usize, f32)]) -> f32 {
-    let members: HashSet<usize> = group.iter().copied().collect();
-    scored
-        .iter()
-        .filter(|(i, j, _)| members.contains(i) && members.contains(j))
-        .map(|&(_, _, score)| score)
-        .fold(f32::MAX, f32::min)
+///
+/// Every member pair is in `pairs` — the group was built by requiring exactly
+/// that — so this is the group's real weakest link and not the weakest of the
+/// pairs that happened to be kept.
+fn group_similarity(group: &[usize], pairs: &HashMap<(usize, usize), f32>) -> f32 {
+    let mut weakest = f32::MAX;
+    for (n, &i) in group.iter().enumerate() {
+        for &j in &group[n + 1..] {
+            weakest = weakest.min(pairs.get(&ordered(i, j)).copied().unwrap_or(0.0));
+        }
+    }
+    weakest
 }
 
 /// Candidates the pass would look at, without running it.
@@ -537,6 +564,106 @@ mod tests {
             similarity_threshold: 0.5,
             ..DupOptions::default()
         }
+    }
+
+    /// Three bodies the model places on a chain: A and B agree, B and C agree,
+    /// A and C do not. Unit vectors 40° apart, so cos is 0.766 for a step and
+    /// 0.174 across two of them, against a 0.5 floor.
+    struct Chain;
+    impl BodyEmbedder for Chain {
+        fn embed_bodies(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let turns = if t.contains("alpha_fn") {
+                        0.0
+                    } else if t.contains("beta_fn") {
+                        1.0
+                    } else {
+                        2.0
+                    };
+                    let a = turns * 40.0f32.to_radians();
+                    vec![a.cos(), a.sin()]
+                })
+                .collect())
+        }
+    }
+
+    /// Three shapes, all different, so the structural pass leaves every pair
+    /// open and only the model can join them.
+    fn three_different_shapes() -> (Connection, Vec<(&'static str, String)>) {
+        let conn = code_db();
+        insert_owned(&conn, 1, "alpha_fn", "src/a.rs", "alpha", 6, None);
+        insert_owned(&conn, 2, "beta_fn", "src/b.rs", "beta", 6, None);
+        insert_owned(&conn, 3, "gamma_fn", "src/c.rs", "gamma", 6, None);
+        let alpha = "fn alpha_fn() -> i64 {\n\
+                     let mut total = 0;\n\
+                     for item in items {\n\
+                     \x20   total += item.weight * 2;\n\
+                     }\n\
+                     total\n\
+                     }\n";
+        let beta = "fn beta_fn() -> i64 {\n\
+                    let value = match kind {\n\
+                    \x20   Kind::A => compute(1, 2),\n\
+                    \x20   Kind::B => fallback(),\n\
+                    };\n\
+                    value\n\
+                    }\n";
+        let gamma = "fn gamma_fn() -> i64 {\n\
+                     while ready(state) {\n\
+                     \x20   state = advance(state, 3);\n\
+                     }\n\
+                     let out = finish(state);\n\
+                     out\n\
+                     }\n";
+        (
+            conn,
+            vec![
+                ("src/a.rs", alpha.to_string()),
+                ("src/b.rs", beta.to_string()),
+                ("src/c.rs", gamma.to_string()),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_semantic_chain_is_split_the_same_way_a_structural_one_is() {
+        let (conn, sources) = three_different_shapes();
+        let dup = DupDb::in_memory().unwrap();
+
+        let out = scan_duplication(
+            &conn,
+            None,
+            &dup,
+            Some(&Chain),
+            &mut files(&sources),
+            &semantic_options(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(out.considered, 3, "all three must reach the model");
+        for cluster in &out.clusters {
+            let names: Vec<&str> = cluster.members.iter().map(|m| m.name.as_str()).collect();
+            assert!(
+                !(names.contains(&"alpha_fn") && names.contains(&"gamma_fn")),
+                "the ends of the chain scored 0.17 against a floor of 0.5, and \
+                 a third body must not carry them into one finding: {names:?}"
+            );
+            let Evidence::Semantic { similarity } = cluster.evidence else {
+                panic!("the model found these, not the shapes: {cluster:?}");
+            };
+            assert!(
+                similarity >= 0.5,
+                "the reported weakest link must be a link that actually held: \
+                 {similarity} in {names:?}"
+            );
+        }
+        assert!(
+            !out.clusters.is_empty(),
+            "the two adjacent pairs are still findings"
+        );
     }
 
     /// The control. Without the call edge the model's verdict stands, and the

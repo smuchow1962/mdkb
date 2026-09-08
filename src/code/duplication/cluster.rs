@@ -108,18 +108,99 @@ pub fn cluster<S: BuildHasher>(
     threshold: u32,
     suppressed_pairs: &HashSet<(i64, i64), S>,
 ) -> Vec<Vec<usize>> {
+    let admissible = |a: usize, b: usize| {
+        hamming(fingerprints[a].simhash, fingerprints[b].simhash) <= threshold
+            && suppression_for(&fingerprints[a], &fingerprints[b], suppressed_pairs).is_none()
+    };
+
+    // Union-find first, but only as a cheap pre-filter: it says which
+    // candidates *could* share a group, and most components are two or three
+    // symbols that need no further work. The bound is applied inside each one.
     let mut uf = UnionFind::new(fingerprints.len());
     for i in 0..fingerprints.len() {
         for j in (i + 1)..fingerprints.len() {
-            if hamming(fingerprints[i].simhash, fingerprints[j].simhash) > threshold {
-                continue;
-            }
-            if suppression_for(&fingerprints[i], &fingerprints[j], suppressed_pairs).is_none() {
+            if admissible(i, j) {
                 uf.union(i, j);
             }
         }
     }
-    uf.groups()
+
+    let mut groups: Vec<Vec<usize>> = uf
+        .groups()
+        .into_iter()
+        .flat_map(|component| {
+            dense_groups(&component, |i| fingerprints[i].simhash, &admissible)
+        })
+        .collect();
+    groups.sort_unstable_by_key(|g| g[0]);
+    groups
+}
+
+/// Split a component into groups where *every* pair is admissible.
+///
+/// A connected component is not a finding. Similarity is not transitive, so
+/// closing it transitively lets a chain of admissible pairs carry two members
+/// into one group that resemble nothing of each other — on the real store that
+/// put 3209 symbols in a single cluster whose widest pair was 47 bits apart
+/// against a threshold of 12, while the report described it with that 47.
+///
+/// Complete linkage restores the bound by construction: a member joins only if
+/// it is admissible with every member already in the group, so the group's
+/// diameter cannot exceed the threshold. Greedy rather than optimal — the
+/// minimum such partition is a clique partition, which is NP-hard and not even
+/// unique — so this is a deterministic heuristic and says so.
+///
+/// `key` orders the candidates. It must be content-derived: seeding on the row
+/// id or on the position in the candidate list would repartition the repository
+/// when a file is edited above a symbol, and the ignore-list is keyed on
+/// membership.
+///
+/// Ties on the key are ties at distance zero, so which of two identical shapes
+/// seeds first cannot change who is admissible with whom.
+///
+/// O(k²) admissibility tests and O(k) memory: each seed and each member added
+/// costs one sweep, and there are at most k of each.
+pub fn dense_groups<K: Ord>(
+    component: &[usize],
+    key: impl Fn(usize) -> K,
+    admissible: impl Fn(usize, usize) -> bool,
+) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = component.to_vec();
+    order.sort_unstable_by(|&a, &b| key(a).cmp(&key(b)).then(a.cmp(&b)));
+
+    let mut taken = vec![false; order.len()];
+    // `allowed[n]` — is `order[n]` still admissible with every member taken so
+    // far. Rebuilt per seed, narrowed by each member added.
+    let mut allowed = vec![false; order.len()];
+    let mut groups = Vec::new();
+
+    for seed in 0..order.len() {
+        if taken[seed] {
+            continue;
+        }
+        taken[seed] = true;
+        let mut group = vec![order[seed]];
+        for (n, slot) in allowed.iter_mut().enumerate().skip(seed + 1) {
+            *slot = !taken[n] && admissible(order[seed], order[n]);
+        }
+
+        for n in (seed + 1)..order.len() {
+            if !allowed[n] {
+                continue;
+            }
+            taken[n] = true;
+            group.push(order[n]);
+            for (m, slot) in allowed.iter_mut().enumerate().skip(n + 1) {
+                *slot = *slot && admissible(order[n], order[m]);
+            }
+        }
+
+        if group.len() > 1 {
+            group.sort_unstable();
+            groups.push(group);
+        }
+    }
+    groups
 }
 
 /// Why this pair is not duplication, or `None` if nothing rules it out.
@@ -206,17 +287,139 @@ mod tests {
     }
 
     #[test]
-    fn a_chain_of_similar_candidates_transitively_joins() {
-        // A resembles B, B resembles C, A does not resemble C. Union-find makes
-        // that one finding, which is what a reader acts on: the three are one
-        // idea written three times.
+    fn a_chain_past_the_threshold_is_split_rather_than_joined() {
+        // A resembles B, B resembles C, A does not resemble C. Closing that
+        // transitively is what put 3209 symbols in one group on the real store,
+        // with a widest pair of 47 bits against a threshold of 12 — a group the
+        // report then described using a number the threshold says is
+        // impossible. A resembles B, and that is the whole finding.
         let fps = [
             fp(1, 0b0000_0000, None),
             fp(2, 0b0000_1111, None),
             fp(3, 0b1111_1111, None),
         ];
 
-        assert_eq!(cluster(&fps, 4, &no_calls()), vec![vec![0, 1, 2]]);
+        assert_eq!(
+            cluster(&fps, 4, &no_calls()),
+            vec![vec![0, 1]],
+            "C is 8 bits from A: it belongs to neither group, and alone it is \
+             not a finding"
+        );
+    }
+
+    /// Every pair of every reported group is within the threshold.
+    ///
+    /// The contract the report renders — "same shape, N bits apart", where N is
+    /// the widest pair — is only meaningful if N cannot exceed the threshold.
+    fn assert_bounded(groups: &[Vec<usize>], fps: &[Fingerprint], threshold: u32) {
+        for group in groups {
+            for (n, &i) in group.iter().enumerate() {
+                for &j in &group[n + 1..] {
+                    let d = hamming(fps[i].simhash, fps[j].simhash);
+                    assert!(
+                        d <= threshold,
+                        "group {group:?} holds a pair {d} bits apart, above the \
+                         threshold of {threshold}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A spread of shapes dense enough that a connected-component pass chains
+    /// most of them together: consecutive values differ by few bits.
+    fn a_chainable_spread() -> Vec<Fingerprint> {
+        (0..64u64)
+            .map(|n| fp(n as i64 + 1, (1u64 << n) - 1, None))
+            .collect()
+    }
+
+    #[test]
+    fn no_reported_group_is_wider_than_the_threshold() {
+        let fps = a_chainable_spread();
+        for threshold in [1, 4, 12, 20] {
+            let groups = cluster(&fps, threshold, &no_calls());
+            assert!(
+                !groups.is_empty(),
+                "threshold {threshold} must still find something to bound"
+            );
+            assert_bounded(&groups, &fps, threshold);
+        }
+    }
+
+    #[test]
+    fn the_connected_component_pass_would_have_failed_that_bound() {
+        // The control: the same input under the old rule produces a group far
+        // wider than the threshold, so the test above is not passing because
+        // the fixture is easy.
+        let fps = a_chainable_spread();
+        let mut uf = UnionFind::new(fps.len());
+        for i in 0..fps.len() {
+            for j in (i + 1)..fps.len() {
+                if hamming(fps[i].simhash, fps[j].simhash) <= 12 {
+                    uf.union(i, j);
+                }
+            }
+        }
+        let component = uf.groups().into_iter().max_by_key(Vec::len).expect("one");
+        let widest = component
+            .iter()
+            .flat_map(|&i| component.iter().map(move |&j| (i, j)))
+            .map(|(i, j)| hamming(fps[i].simhash, fps[j].simhash))
+            .max()
+            .expect("pairs");
+        assert!(
+            widest > 12,
+            "the fixture must actually chain: widest pair was {widest}"
+        );
+    }
+
+    #[test]
+    fn the_partition_does_not_depend_on_the_order_the_candidates_arrived_in() {
+        // Determinism is tie-broken on the fingerprint, not on the row id or the
+        // position in the candidate list — both of which move when a file is
+        // edited above the symbol.
+        let fps = a_chainable_spread();
+        let shapes = |groups: Vec<Vec<usize>>, source: &[Fingerprint]| {
+            let mut out: Vec<Vec<u64>> = groups
+                .iter()
+                .map(|g| {
+                    let mut s: Vec<u64> = g.iter().map(|&i| source[i].simhash).collect();
+                    s.sort_unstable();
+                    s
+                })
+                .collect();
+            out.sort();
+            out
+        };
+
+        let forward = shapes(cluster(&fps, 12, &no_calls()), &fps);
+
+        let mut reversed: Vec<Fingerprint> = fps.clone();
+        reversed.reverse();
+        let backward = shapes(cluster(&reversed, 12, &no_calls()), &reversed);
+
+        assert_eq!(forward, backward, "the same index, two arrival orders");
+    }
+
+    #[test]
+    fn a_suppressed_pair_cannot_rejoin_through_a_third_member() {
+        // Three identical shapes, one pair suppressed by a call edge. Under a
+        // connected component the third member reinstates the pair the
+        // suppression removed, which makes the suppression decorative.
+        let fps = [
+            fp(1, 0b1010, None),
+            fp(2, 0b1010, None),
+            fp(3, 0b1010, None),
+        ];
+        let calls = HashSet::from([(1i64, 2i64)]);
+
+        for group in cluster(&fps, 12, &calls) {
+            assert!(
+                !(group.contains(&0) && group.contains(&1)),
+                "the suppressed pair is back in {group:?}"
+            );
+        }
     }
 
     #[test]
@@ -303,8 +506,12 @@ mod tests {
         ];
         let calls = HashSet::from([(1i64, 2i64)]);
 
-        // 1-2 is suppressed, but 1-3 and 2-3 are not, so all three still join.
-        assert_eq!(cluster(&fps, 12, &calls), vec![vec![0, 1, 2]]);
+        // 1-2 is suppressed. 1-3 and 2-3 are not, and either is a finding, but
+        // a partition has to choose: symbol 3 can hold one of them, not both.
+        // The alternative is overlapping groups, which shows the same symbol
+        // twice and leaves the reader to work out it is one decision. The pair
+        // the suppression removed stays removed either way, which is the point.
+        assert_eq!(cluster(&fps, 12, &calls), vec![vec![0, 2]]);
     }
 
     #[test]
