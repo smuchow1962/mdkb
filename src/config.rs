@@ -289,6 +289,36 @@ pub struct CodeConfig {
 
     /// Semantic code search settings.
     pub semantic_search: CodeSemanticSearchConfig,
+
+    /// Duplication detection settings.
+    pub duplication: CodeDuplicationConfig,
+}
+
+/// Duplication detection settings.
+///
+/// Its own model, deliberately. `semantic_search.model` backs `vec_documents`
+/// and `vec_memory`; repointing it would invalidate both and force a full
+/// re-embed of everything indexed. Duplication asks a different question and
+/// measurably needs a different model — see `src/eval/embedding_gap.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeDuplicationConfig {
+    /// Enable `mdkb dup`. Never runs during `mdkb index` either way.
+    pub enabled: bool,
+
+    /// Embedding model for bodies. Must be one of the models the duplication
+    /// pass supports; an unknown name is rejected at load rather than mid-run.
+    pub model: String,
+
+    /// Minimum cosine similarity for a pair the structural pass did not
+    /// already cluster.
+    pub similarity_threshold: f32,
+
+    /// Bits two structural fingerprints may differ by and still cluster.
+    pub hamming_threshold: u32,
+
+    /// Fewest named AST nodes a body may hold and still be reported.
+    pub min_nodes: u32,
 }
 
 /// Code indexing pipeline settings.
@@ -343,6 +373,19 @@ impl Default for CodeConfig {
             index_path: "code.sqlite".to_string(),
             indexing: CodeIndexingConfig::default(),
             semantic_search: CodeSemanticSearchConfig::default(),
+            duplication: CodeDuplicationConfig::default(),
+        }
+    }
+}
+
+impl Default for CodeDuplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: crate::code::duplication::embed::DEFAULT_DUP_MODEL.to_string(),
+            similarity_threshold: DEFAULT_DUP_SIMILARITY_THRESHOLD,
+            hamming_threshold: crate::code::duplication::body::SIMHASH_HAMMING_THRESHOLD,
+            min_nodes: crate::code::duplication::scan::MIN_BODY_NODES,
         }
     }
 }
@@ -778,6 +821,15 @@ const DEFAULT_CODE_SEMANTIC_MODEL: &str = "AllMiniLML6V2";
 /// 0.3 is a permissive default; higher values improve precision at cost of recall.
 const DEFAULT_CODE_SEMANTIC_THRESHOLD: f64 = 0.3;
 
+/// Cosine floor for a duplication pair, from the measured gate.
+///
+/// `JinaEmbeddingsV2BaseCode` truncated to 256 dims scored a mean of 0.7453 on
+/// the case set built to be duplication and 0.5949 on the adversarial set built
+/// to look like it and not be. 0.70 sits between the two, near the upper one:
+/// the report is read by a human, so a finding that is not one costs more than
+/// a borderline one that goes unreported.
+const DEFAULT_DUP_SIMILARITY_THRESHOLD: f32 = 0.70;
+
 impl Config {
     /// Load configuration from a TOML file.
     ///
@@ -877,6 +929,48 @@ impl Config {
             return Err(ErrorKind::ConfigInvalid {
                 field: "code.semantic_search.threshold".to_string(),
                 message: "must be between 0.0 and 1.0".to_string(),
+            }
+            .into());
+        }
+
+        // Duplication validation. Rejected at load, not mid-run: a scan that
+        // parses a repository and then fails on a threshold has wasted the
+        // expensive part before reading the cheap mistake.
+        let dup = &self.code.duplication;
+        if !(0.0..=1.0).contains(&dup.similarity_threshold) {
+            return Err(ErrorKind::ConfigInvalid {
+                field: "code.duplication.similarity_threshold".to_string(),
+                message: "must be between 0.0 and 1.0".to_string(),
+            }
+            .into());
+        }
+
+        // A simhash is 64 bits, so a threshold at or above 64 clusters every
+        // body with every other one — the report would be one group holding the
+        // whole repository.
+        if dup.hamming_threshold >= 64 {
+            return Err(ErrorKind::ConfigInvalid {
+                field: "code.duplication.hamming_threshold".to_string(),
+                message: "must be less than 64, the width of a simhash".to_string(),
+            }
+            .into());
+        }
+
+        if dup.min_nodes == 0 {
+            return Err(ErrorKind::ConfigInvalid {
+                field: "code.duplication.min_nodes".to_string(),
+                message: "must be greater than 0".to_string(),
+            }
+            .into());
+        }
+
+        if !crate::code::duplication::embed::SUPPORTED_DUP_MODELS.contains(&dup.model.as_str()) {
+            return Err(ErrorKind::ConfigInvalid {
+                field: "code.duplication.model".to_string(),
+                message: format!(
+                    "must be one of: {}",
+                    crate::code::duplication::embed::SUPPORTED_DUP_MODELS.join(", ")
+                ),
             }
             .into());
         }
@@ -1357,6 +1451,73 @@ threshold = 0.5
         config.code.semantic_search.threshold = -0.1;
         let result = config.validate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_duplication_similarity_threshold_out_of_range() {
+        let mut config = Config::default();
+        config.code.duplication.similarity_threshold = 1.5;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("code.duplication.similarity_threshold"), "{err}");
+
+        config.code.duplication.similarity_threshold = -0.1;
+        assert!(config.validate().is_err());
+    }
+
+    /// A simhash is 64 bits wide. A threshold at 64 puts every body in one
+    /// cluster, so the report becomes a single group holding the repository —
+    /// not an error anyone would notice at read time.
+    #[test]
+    fn test_validate_duplication_hamming_threshold_cannot_reach_the_simhash_width() {
+        let mut config = Config::default();
+        config.code.duplication.hamming_threshold = 64;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("code.duplication.hamming_threshold"), "{err}");
+
+        config.code.duplication.hamming_threshold = 63;
+        assert!(config.validate().is_ok(), "63 bits is legal, if useless");
+    }
+
+    #[test]
+    fn test_validate_duplication_min_nodes_zero() {
+        let mut config = Config::default();
+        config.code.duplication.min_nodes = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("code.duplication.min_nodes"), "{err}");
+    }
+
+    /// An unmeasured model silently reports the wrong pairs instead of failing.
+    #[test]
+    fn test_validate_duplication_model_must_be_one_that_was_measured() {
+        let mut config = Config::default();
+        config.code.duplication.model = "BgeSmallEnV15".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("code.duplication.model"), "{err}");
+    }
+
+    #[test]
+    fn test_duplication_defaults_match_the_measured_gate() {
+        let config = Config::default();
+        let dup = &config.code.duplication;
+
+        assert!(dup.enabled);
+        assert_eq!(dup.model, "JinaEmbeddingsV2BaseCode");
+        assert!((dup.similarity_threshold - 0.70).abs() < f32::EPSILON);
+        assert_eq!(dup.hamming_threshold, 12);
+        assert_eq!(dup.min_nodes, 30);
+        assert!(config.validate().is_ok(), "the defaults must be valid");
+    }
+
+    /// The section is `#[serde(default)]`: an existing config file with no
+    /// `[code.duplication]` table still loads, with the measured defaults.
+    #[test]
+    fn test_a_config_without_a_duplication_section_still_parses() {
+        let parsed: Config = toml::from_str("[code]\n").unwrap();
+
+        assert_eq!(
+            parsed.code.duplication.model,
+            crate::code::duplication::embed::DEFAULT_DUP_MODEL
+        );
     }
 
     #[test]
