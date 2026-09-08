@@ -1022,7 +1022,7 @@ fn io_as_sqlite(operation: &str, error: std::io::Error) -> rusqlite::Error {
 /// clause that would fix the first problem then takes for itself. `substr(x, -n)`
 /// asks the question directly — "do these characters end it" — and a name too
 /// short to fill `n` simply fails to compare equal.
-const RESOLUTION_TIER: &str = "CASE \
+pub(crate) const RESOLUTION_TIER: &str = "CASE \
      WHEN r.to_qualifier IS NOT NULL THEN ( CASE \
          WHEN s.owner_name IS NOT NULL AND ( \
              r.to_qualifier = s.owner_name \
@@ -1071,7 +1071,7 @@ pub const TIER_UNPLACED: i64 = 7;
 ///
 /// Callers keep the rows where `tier = nearest`: that is the first rule of the
 /// cascade to yield anything, and no later rule runs once one has.
-fn resolved_edges(filter: &str) -> String {
+pub(crate) fn resolved_edges(filter: &str) -> String {
     format!(
         "SELECT r.from_symbol_id AS from_id, s.id AS sym_id, \
                 {RESOLUTION_TIER} AS tier, \

@@ -5,4 +5,7 @@
 //! content-addressed database (see [`store`]).
 
 pub mod body;
+pub mod candidates;
+pub mod cluster;
+pub mod scan;
 pub mod store;
