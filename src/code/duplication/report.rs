@@ -262,6 +262,100 @@ fn fence_tag(path: &str) -> &'static str {
         .map_or("", Language::config_key)
 }
 
+// --- the ignore-list ---
+//
+// Intentional duplication reported forever makes the tool useless after the
+// first run. slopo keeps a flat list of hashes with no reason attached; this
+// keeps a `decision` in the memory store, so the accepted cluster carries *why*
+// it was accepted, is searchable like any other decision, and can be superseded
+// when the reason stops holding. No new schema — the store already models all
+// of it.
+
+/// The tag every ignore entry carries.
+pub const IGNORE_TAG: &str = "dup-ignore";
+
+/// The memory id for an accepted cluster.
+///
+/// Namespaced rather than the bare hash: a memory store holds ids a human
+/// chose, and an eight-character hex string is exactly the kind of id somebody
+/// else might pick. The prefix also makes the whole list greppable.
+pub fn ignore_entry_id(cluster_hash: &str) -> String {
+    format!("dup-ignore-{cluster_hash}")
+}
+
+/// Record a cluster as accepted duplication.
+///
+/// Written through [`handle_memory_add`](crate::core::memory::handle_memory_add)
+/// rather than straight into the table, so the entry is projected to disk,
+/// indexed and embedded like every other decision. An ignore nobody can find
+/// later is how a flat file behaves.
+///
+/// `source_type` is `user_statement`: somebody looked at the finding and
+/// decided. Nothing here is inferred.
+pub fn ignore_cluster(
+    ctx: &crate::core::Context,
+    cluster: &Cluster,
+    rationale: &str,
+) -> crate::error::Result<String> {
+    let hash = cluster.cluster_hash();
+    let id = ignore_entry_id(&hash);
+    let name = cluster.members.first().map_or("(empty)", |c| c.name.as_str());
+    let locations = cluster.members.iter().fold(String::new(), |mut acc, m| {
+        use std::fmt::Write;
+        // Display is 1-based, as everywhere else the reader sees a line number.
+        let _ = writeln!(acc, "- `{}:{}`", m.file_path, m.line_start + 1);
+        acc
+    });
+    let content = format!("{rationale}\n\nCluster `{hash}`:\n\n{locations}");
+
+    crate::core::memory::handle_memory_add(
+        ctx,
+        &id,
+        &format!("Accepted duplication: {name}"),
+        "decision",
+        Some(IGNORE_TAG),
+        &content,
+        None,
+        None,
+        None,
+        Some("user_statement"),
+    )?;
+    Ok(id)
+}
+
+/// Whether an accepted-duplication decision is currently standing.
+///
+/// [`resolve_active`](crate::store::memory_graph::resolve_active) is the store's
+/// own answer to "is this entry still in force", so a superseded *or* expired
+/// entry stops filtering and the cluster comes back — which is the point of
+/// keeping this in the memory store rather than a text file.
+///
+/// The entry type and tag are checked too. An unrelated entry that happens to
+/// hold this id must not silently delete a finding: suppression fails open
+/// here for the same reason it does in the call-graph pass.
+pub fn is_ignored(conn: &rusqlite::Connection, cluster_hash: &str) -> crate::error::Result<bool> {
+    let id = ignore_entry_id(cluster_hash);
+    let Some(entry) = crate::store::memory_graph::resolve_active(conn, &id)? else {
+        return Ok(false);
+    };
+    Ok(entry.entry_type == crate::store::memory::EntryType::Decision
+        && entry.tags.iter().any(|t| t == IGNORE_TAG))
+}
+
+/// Drop the clusters somebody already accepted.
+pub fn filter_ignored(
+    conn: &rusqlite::Connection,
+    clusters: Vec<Cluster>,
+) -> crate::error::Result<Vec<Cluster>> {
+    let mut kept = Vec::with_capacity(clusters.len());
+    for cluster in clusters {
+        if !is_ignored(conn, &cluster.cluster_hash())? {
+            kept.push(cluster);
+        }
+    }
+    Ok(kept)
+}
+
 /// The head of a body, with a marker where the rest was cut.
 fn elide(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
@@ -594,6 +688,225 @@ mod tests {
 
         assert_eq!(first[0].cluster_hash(), second[0].cluster_hash());
         assert_eq!(first[1].cluster_hash(), second[1].cluster_hash());
+    }
+
+    // --- the ignore-list ---
+
+    use crate::store::memory::{
+        EntryStatus, EntryType, MemoryEntry, SourceType, add_entry, get_entry_without_tracking,
+    };
+    use crate::store::memory_graph::{MemoryRelation, TargetKind, add_edge};
+    use rusqlite::Connection;
+
+    fn memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        conn
+    }
+
+    fn decision(id: &str, tags: Vec<String>, entry_type: EntryType) -> MemoryEntry {
+        let now = chrono::Utc::now().timestamp();
+        MemoryEntry {
+            id: id.to_string(),
+            title: "Accepted duplication".to_string(),
+            content: "Two adapters, deliberately not shared.".to_string(),
+            entry_type,
+            tags,
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        }
+    }
+
+    fn ignored_cluster() -> Cluster {
+        cluster(vec![
+            member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+            member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 10),
+        ])
+    }
+
+    #[test]
+    fn an_active_decision_filters_the_cluster_out_of_the_report() {
+        let conn = memory_db();
+        let c = ignored_cluster();
+        add_entry(
+            &conn,
+            &decision(
+                &ignore_entry_id(&c.cluster_hash()),
+                vec![IGNORE_TAG.to_string()],
+                EntryType::Decision,
+            ),
+        )
+        .unwrap();
+
+        assert!(is_ignored(&conn, &c.cluster_hash()).unwrap());
+        assert!(filter_ignored(&conn, vec![c]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_superseded_decision_lets_the_cluster_come_back() {
+        // The whole reason this lives in the memory store: a decision that
+        // stopped holding stops hiding the finding, with no separate cleanup.
+        let conn = memory_db();
+        let c = ignored_cluster();
+        let id = ignore_entry_id(&c.cluster_hash());
+        add_entry(
+            &conn,
+            &decision(&id, vec![IGNORE_TAG.to_string()], EntryType::Decision),
+        )
+        .unwrap();
+        add_entry(
+            &conn,
+            &decision("newer-decision", vec![IGNORE_TAG.to_string()], EntryType::Decision),
+        )
+        .unwrap();
+
+        add_edge(
+            &conn,
+            "newer-decision",
+            &id,
+            TargetKind::Memory,
+            MemoryRelation::Supersedes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_entry_without_tracking(&conn, &id).unwrap().unwrap().status,
+            EntryStatus::Superseded,
+            "the edge flipped the status"
+        );
+        assert!(!is_ignored(&conn, &c.cluster_hash()).unwrap());
+        assert_eq!(filter_ignored(&conn, vec![c]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_cluster_nobody_accepted_is_not_filtered() {
+        let conn = memory_db();
+
+        assert_eq!(filter_ignored(&conn, vec![ignored_cluster()]).unwrap().len(), 1);
+    }
+
+    /// Suppression fails open here for the same reason it does in the
+    /// call-graph pass: an entry that is not an accepted-duplication decision
+    /// must not silently delete a finding.
+    #[test]
+    fn an_unrelated_entry_holding_the_id_does_not_hide_the_finding() {
+        let conn = memory_db();
+        let c = ignored_cluster();
+        let id = ignore_entry_id(&c.cluster_hash());
+
+        add_entry(&conn, &decision(&id, vec!["unrelated".into()], EntryType::Decision)).unwrap();
+        assert!(!is_ignored(&conn, &c.cluster_hash()).unwrap(), "wrong tag");
+
+        crate::store::memory::update_entry(
+            &conn,
+            &decision(&id, vec![IGNORE_TAG.to_string()], EntryType::Topic),
+        )
+        .unwrap();
+        assert!(!is_ignored(&conn, &c.cluster_hash()).unwrap(), "wrong type");
+    }
+
+    /// The id follows the cluster, not the ids or lines inside it — so an
+    /// accepted cluster stays accepted across a reparse.
+    #[test]
+    fn the_ignore_id_is_namespaced_and_follows_the_cluster_hash() {
+        let c = ignored_cluster();
+
+        assert_eq!(ignore_entry_id("a1b2c3d4"), "dup-ignore-a1b2c3d4");
+        assert!(ignore_entry_id(&c.cluster_hash()).ends_with(&c.cluster_hash()));
+        assert_ne!(
+            ignore_entry_id(&c.cluster_hash()),
+            c.cluster_hash(),
+            "a bare hash could collide with an id a human picked"
+        );
+    }
+
+    /// The write path, end to end through the store's own entry point.
+    ///
+    /// `auto_embed_memory` is switched off in the config the context reads, so
+    /// the test exercises the write without loading an ONNX model — the same
+    /// hermetic switch the store's own tests use.
+    #[test]
+    fn an_accepted_cluster_is_written_as_a_tagged_decision_that_says_why() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".mdkb")).unwrap();
+        std::fs::write(
+            root.path().join(".mdkb/config.toml"),
+            "[search]\nauto_embed_memory = false\n",
+        )
+        .unwrap();
+        let ctx = crate::core::Context::open(root.path()).unwrap();
+        let c = ignored_cluster();
+
+        let id = ignore_cluster(&ctx, &c, "Two adapters, deliberately not shared.").unwrap();
+
+        assert_eq!(id, ignore_entry_id(&c.cluster_hash()));
+        let entry = get_entry_without_tracking(&ctx.conn, &id).unwrap().unwrap();
+        assert_eq!(entry.entry_type, EntryType::Decision);
+        assert!(entry.tags.iter().any(|t| t == IGNORE_TAG), "{:?}", entry.tags);
+        assert_eq!(entry.status, EntryStatus::Active);
+        assert_eq!(entry.source_type, SourceType::UserStatement);
+        assert!(
+            entry.content.contains("Two adapters, deliberately not shared."),
+            "the rationale:\n{}",
+            entry.content
+        );
+        assert!(entry.content.contains("src/a.rs:11"), "where:\n{}", entry.content);
+        // And what it wrote is what the filter reads.
+        assert!(is_ignored(&ctx.conn, &c.cluster_hash()).unwrap());
+    }
+
+    /// The ignore-list adds no schema and writes no SQL of its own.
+    ///
+    /// It goes through the store's API, so the entry gets the projection,
+    /// index and revision history every other decision gets. A hand-written
+    /// INSERT here would produce a row the rest of mdkb does not know about.
+    #[test]
+    fn the_ignore_list_reuses_the_memory_store_rather_than_adding_to_it() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/code/duplication/report.rs"),
+        )
+        .unwrap();
+        let code = source.split("#[cfg(test)]").next().unwrap();
+
+        for sql in ["CREATE TABLE", "ALTER TABLE", "INSERT INTO", "UPDATE ", "memory_entries"] {
+            assert!(!code.contains(sql), "report.rs writes its own SQL: {sql}");
+        }
+    }
+
+    #[test]
+    fn filtering_keeps_the_clusters_nobody_accepted_and_their_order() {
+        let conn = memory_db();
+        let accepted = ignored_cluster();
+        let other = cluster(vec![
+            member(3, "c", "src/c.rs", Some("gamma"), Visibility::Public, 10),
+            member(4, "d", "src/d.rs", Some("delta"), Visibility::Public, 10),
+        ]);
+        add_entry(
+            &conn,
+            &decision(
+                &ignore_entry_id(&accepted.cluster_hash()),
+                vec![IGNORE_TAG.to_string()],
+                EntryType::Decision,
+            ),
+        )
+        .unwrap();
+
+        let kept = filter_ignored(&conn, vec![accepted, other.clone()]).unwrap();
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].cluster_hash(), other.cluster_hash());
     }
 
     #[test]
