@@ -13,3 +13,10 @@ pub use sqlite::{CodeDb, NameMatch, TIER_UNPLACED};
 /// drift from the one that resolves the graph — the suppression would then be
 /// judging edges by rules the index no longer uses.
 pub(crate) use sqlite::resolved_edges;
+
+/// The `visibility` column's decoding, for the duplication pass.
+///
+/// Re-exported for the same reason: ranking a cluster by how public it is has
+/// to agree with what the symbol readers report, and a second copy of the
+/// discriminants would disagree the day a level is added.
+pub(crate) use sqlite::visibility_from_i64;

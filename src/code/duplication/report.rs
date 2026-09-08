@@ -1,0 +1,609 @@
+//! Ordering the findings, and writing them down.
+//!
+//! A flat list of similar pairs is noise. What a reader can act on is a short
+//! list where the first entry is the one worth fixing, so the ranking has to
+//! encode why duplication costs anything: a copy in another module is one
+//! nobody will find when they fix the original, and a copy behind a `pub`
+//! signature is one other people are already calling.
+//!
+//! The cluster identity is deliberately built from names, not ids. Symbol ids
+//! do not survive a reparse — `split_by_reuse` reassigns them — so a hash over
+//! ids would change under the user, and the ignore-list keyed on it would
+//! forget every decision they had made.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use sha2::{Digest, Sha256};
+
+use super::candidates::DupCandidate;
+use crate::code::parsing::language::Language;
+use crate::code::symbol::Visibility;
+
+/// Lines of a body the report prints before eliding the rest.
+///
+/// A 200-line duplicated function pasted twice is not evidence, it is a wall.
+/// The head of a body is enough to recognise it; the `file:line` above it is
+/// how the reader gets the rest.
+const MAX_SNIPPET_LINES: usize = 20;
+
+/// What made a cluster a finding.
+///
+/// Kept apart rather than folded into one number: hamming bits and cosine are
+/// different scales, and printing them in one column would invite a reader to
+/// compare 12 against 0.84.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Evidence {
+    /// The bodies have the same shape — within `hamming` bits of each other,
+    /// with identifiers and literals ignored.
+    Structural { hamming: u32 },
+    /// The bodies mean the same thing — cosine between their embeddings.
+    Semantic { similarity: f32 },
+}
+
+impl Evidence {
+    /// How the score reads in the report.
+    fn describe(self) -> String {
+        match self {
+            Self::Structural { hamming } => format!("same shape, {hamming} bits apart"),
+            Self::Semantic { similarity } => format!("cosine {similarity:.3}"),
+        }
+    }
+}
+
+/// A group of symbols reported as one finding.
+#[derive(Debug, Clone)]
+pub struct Cluster {
+    pub members: Vec<DupCandidate>,
+    pub evidence: Evidence,
+}
+
+/// How wide a symbol reaches, largest first.
+///
+/// An explicit ladder because [`Visibility`]'s discriminants are storage
+/// numbers, not an order: `Package` is 4 and `Crate` is 1, but package reaches
+/// further than crate. Ordering on the discriminant would rank backwards.
+fn reach(visibility: Visibility) -> u8 {
+    match visibility {
+        Visibility::Public => 5,
+        Visibility::Package => 4,
+        Visibility::Crate => 3,
+        Visibility::Module => 2,
+        Visibility::Restricted => 1,
+        Visibility::Private => 0,
+    }
+}
+
+impl Cluster {
+    /// Distinct modules the members live in.
+    ///
+    /// A member with no module path counts under its file, so a language the
+    /// parser gives no modules for still separates two files instead of
+    /// collapsing the whole repository into one module.
+    pub fn module_spread(&self) -> usize {
+        self.members
+            .iter()
+            .map(|c| c.module_path.as_deref().unwrap_or(&c.file_path))
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    /// Distinct files the members live in.
+    pub fn file_spread(&self) -> usize {
+        self.members
+            .iter()
+            .map(|c| c.file_path.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    /// The widest reach among the members.
+    ///
+    /// The widest, not the average: one `pub` copy of a private helper is
+    /// already public API, and averaging would hide it behind its siblings.
+    pub fn reach(&self) -> u8 {
+        self.members.iter().map(|c| reach(c.visibility)).max().unwrap_or(0)
+    }
+
+    /// Lines that would go away if the cluster became one function.
+    ///
+    /// Every copy but the largest — the one that stays.
+    pub fn duplicated_lines(&self) -> u32 {
+        let total: u32 = self.members.iter().map(DupCandidate::lines).sum();
+        let kept = self.members.iter().map(DupCandidate::lines).max().unwrap_or(0);
+        total - kept
+    }
+
+    /// Identity that survives a reparse.
+    ///
+    /// Built from the sorted `(module_path, name)` pairs and nothing else. Not
+    /// ids, which `split_by_reuse` reassigns; not line numbers, which move when
+    /// anything above the symbol is edited. Sorted so that the order the
+    /// members happened to come back in cannot change the answer.
+    pub fn cluster_hash(&self) -> String {
+        cluster_hash(&self.members)
+    }
+}
+
+/// See [`Cluster::cluster_hash`].
+pub fn cluster_hash(members: &[DupCandidate]) -> String {
+    // Unit separator between the fields and record separator between members:
+    // neither can occur in an identifier or a module path, so ("a::b", "c")
+    // cannot collide with ("a", "b::c").
+    let mut keys: Vec<String> = members
+        .iter()
+        .map(|c| format!("{}\u{1f}{}", c.module_path.as_deref().unwrap_or(""), c.name))
+        .collect();
+    keys.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(keys.join("\u{1e}").as_bytes());
+    // First 8 hex characters: enough to name a cluster in a report and in an
+    // ignore-list entry, short enough for a human to retype.
+    format!("{:x}", hasher.finalize())[..8].to_string()
+}
+
+/// Order clusters worst-first.
+///
+/// Lexicographic, spread before reach, because distance is the stronger signal:
+/// two copies in one file sit under one reader's eyes and get fixed together,
+/// while two copies in different modules diverge — one gets the bug fix and the
+/// other does not. Reach breaks the tie between equally-distant clusters, then
+/// the line count, then the hash so that two runs over an unchanged repository
+/// print the same report.
+pub fn rank(clusters: &mut [Cluster]) {
+    clusters.sort_by(|a, b| {
+        b.module_spread()
+            .cmp(&a.module_spread())
+            .then(b.file_spread().cmp(&a.file_spread()))
+            .then(b.reach().cmp(&a.reach()))
+            .then(b.duplicated_lines().cmp(&a.duplicated_lines()))
+            .then(a.cluster_hash().cmp(&b.cluster_hash()))
+    });
+}
+
+/// The markdown report.
+///
+/// `snippet` yields a member's body, or `None` when the file has changed under
+/// the index — a stale line range prints no code rather than the wrong code.
+pub fn render(
+    clusters: &[Cluster],
+    snippet: &mut dyn FnMut(&DupCandidate) -> Option<String>,
+) -> String {
+    if clusters.is_empty() {
+        return "# Duplication\n\nNo clusters found.\n".to_string();
+    }
+
+    let mut out = String::from("# Duplication\n\n");
+    let total: u32 = clusters.iter().map(Cluster::duplicated_lines).sum();
+    out.push_str(&format!(
+        "{} cluster{}, {total} duplicated line{}.\n",
+        clusters.len(),
+        if clusters.len() == 1 { "" } else { "s" },
+        if total == 1 { "" } else { "s" },
+    ));
+
+    for (n, cluster) in clusters.iter().enumerate() {
+        out.push('\n');
+        render_cluster(&mut out, n + 1, cluster, snippet);
+    }
+    out
+}
+
+fn render_cluster(
+    out: &mut String,
+    n: usize,
+    cluster: &Cluster,
+    snippet: &mut dyn FnMut(&DupCandidate) -> Option<String>,
+) {
+    let name = cluster
+        .members
+        .first()
+        .map_or("(empty)", |c| c.name.as_str());
+    out.push_str(&format!("## {n}. `{name}` — {}\n\n", cluster.cluster_hash()));
+    out.push_str(&format!(
+        "{} copies across {} module{} · {} · {} duplicated lines · {}\n\n",
+        cluster.members.len(),
+        cluster.module_spread(),
+        if cluster.module_spread() == 1 { "" } else { "s" },
+        visibility_label(cluster.reach()),
+        cluster.duplicated_lines(),
+        cluster.evidence.describe(),
+    ));
+
+    for member in &cluster.members {
+        // Display is 1-based; the stored rows are 0-based tree-sitter rows.
+        out.push_str(&format!(
+            "- `{}:{}-{}` — {}\n",
+            member.file_path,
+            member.line_start + 1,
+            member.line_end + 1,
+            qualified(member),
+        ));
+    }
+
+    if let Some(first) = cluster.members.first() {
+        if let Some(body) = snippet(first) {
+            out.push_str(&format!("\n```{}\n", fence_tag(&first.file_path)));
+            out.push_str(&elide(&body));
+            out.push_str("```\n");
+        }
+    }
+}
+
+/// `module::name`, or just the name when the parser gave no module.
+fn qualified(candidate: &DupCandidate) -> String {
+    match &candidate.module_path {
+        Some(module) => format!("`{module}::{}`", candidate.name),
+        None => format!("`{}`", candidate.name),
+    }
+}
+
+fn visibility_label(reach: u8) -> &'static str {
+    match reach {
+        5 => "public",
+        4 => "package",
+        3 => "crate",
+        2 => "module",
+        1 => "restricted",
+        _ => "private",
+    }
+}
+
+/// The fence tag for a path, or none when the language is unknown.
+///
+/// Extension only: [`Language::from_path`] falls back to reading a shebang off
+/// disk, and a report must render the same whether or not the file is still
+/// there.
+fn fence_tag(path: &str) -> &'static str {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(Language::from_extension)
+        .map_or("", Language::config_key)
+}
+
+/// The head of a body, with a marker where the rest was cut.
+fn elide(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::new();
+    for line in lines.iter().take(MAX_SNIPPET_LINES) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if lines.len() > MAX_SNIPPET_LINES {
+        out.push_str(&format!("… {} more lines\n", lines.len() - MAX_SNIPPET_LINES));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(
+        id: i64,
+        name: &str,
+        file: &str,
+        module: Option<&str>,
+        visibility: Visibility,
+        lines: u32,
+    ) -> DupCandidate {
+        DupCandidate {
+            id,
+            name: name.to_string(),
+            file_path: file.to_string(),
+            module_path: module.map(str::to_string),
+            owner_name: None,
+            visibility,
+            line_start: 10,
+            line_end: 10 + lines - 1,
+        }
+    }
+
+    fn cluster(members: Vec<DupCandidate>) -> Cluster {
+        Cluster {
+            members,
+            evidence: Evidence::Semantic { similarity: 0.8 },
+        }
+    }
+
+    /// Two fixed clusters, ranked twice with the spread moved from one to the
+    /// other. Asserting a single run would pass on the hash tie-break alone —
+    /// which is a test that cannot fail. The winner has to *change* when the
+    /// spread moves, and the hash order is the same in both runs, so only the
+    /// spread term can produce both answers.
+    #[test]
+    fn a_cluster_spanning_two_modules_outranks_one_inside_a_single_file() {
+        let ranked_with_spread_on = |spread_on_left: bool| {
+            let (left_file, right_file) = if spread_on_left {
+                ("src/b.rs", "src/c.rs")
+            } else {
+                ("src/a.rs", "src/d.rs")
+            };
+            let (left_module, right_module) = if spread_on_left {
+                (Some("beta"), Some("gamma"))
+            } else {
+                (Some("alpha"), Some("delta"))
+            };
+            let mut clusters = vec![
+                cluster(vec![
+                    member(1, "a", "src/a.rs", Some("alpha"), Visibility::Private, 10),
+                    member(2, "b", left_file, left_module, Visibility::Private, 10),
+                ]),
+                cluster(vec![
+                    member(3, "c", "src/c.rs", Some("gamma"), Visibility::Private, 10),
+                    member(4, "d", right_file, right_module, Visibility::Private, 10),
+                ]),
+            ];
+            rank(&mut clusters);
+            clusters[0].members[0].name.clone()
+        };
+
+        assert_eq!(ranked_with_spread_on(true), "a", "the spread cluster wins");
+        assert_eq!(ranked_with_spread_on(false), "c", "and again when it moves");
+    }
+
+    /// Same shape of proof: the winner must follow the `pub`, not the hash.
+    #[test]
+    fn a_public_cluster_outranks_an_equally_distant_private_one() {
+        let ranked_with_public_on = |public_on_left: bool| {
+            let (left, right) = if public_on_left {
+                (Visibility::Public, Visibility::Private)
+            } else {
+                (Visibility::Private, Visibility::Public)
+            };
+            let mut clusters = vec![
+                cluster(vec![
+                    member(1, "a", "src/a.rs", Some("alpha"), left, 10),
+                    member(2, "b", "src/b.rs", Some("beta"), left, 10),
+                ]),
+                cluster(vec![
+                    member(3, "c", "src/c.rs", Some("gamma"), right, 10),
+                    member(4, "d", "src/d.rs", Some("delta"), right, 10),
+                ]),
+            ];
+            rank(&mut clusters);
+            clusters[0].members[0].name.clone()
+        };
+
+        assert_eq!(ranked_with_public_on(true), "a");
+        assert_eq!(ranked_with_public_on(false), "c", "the winner follows the pub");
+    }
+
+    /// The widest member, not the average: one `pub` copy of a private helper
+    /// is already public API.
+    #[test]
+    fn one_public_member_makes_the_cluster_public() {
+        let mixed = cluster(vec![
+            member(1, "a", "src/a.rs", Some("alpha"), Visibility::Private, 10),
+            member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 10),
+        ]);
+
+        assert_eq!(mixed.reach(), reach(Visibility::Public));
+    }
+
+    /// `Package` is discriminant 4 and `Crate` is 1, so ordering on the stored
+    /// number would rank package below crate — backwards.
+    #[test]
+    fn reach_is_a_ladder_not_the_stored_discriminant() {
+        assert!(reach(Visibility::Public) > reach(Visibility::Package));
+        assert!(reach(Visibility::Package) > reach(Visibility::Crate));
+        assert!(reach(Visibility::Crate) > reach(Visibility::Module));
+        assert!(reach(Visibility::Module) > reach(Visibility::Restricted));
+        assert!(reach(Visibility::Restricted) > reach(Visibility::Private));
+    }
+
+    #[test]
+    fn the_cluster_hash_survives_a_reparse_that_reassigns_ids() {
+        let before = [
+            member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+            member(2, "parse", "src/b.rs", Some("beta"), Visibility::Public, 10),
+        ];
+        // Same code, reparsed: new ids, and the symbols moved down the file.
+        let after = [
+            DupCandidate {
+                id: 907,
+                line_start: 400,
+                line_end: 409,
+                ..before[0].clone()
+            },
+            DupCandidate {
+                id: 908,
+                line_start: 512,
+                line_end: 521,
+                ..before[1].clone()
+            },
+        ];
+
+        assert_eq!(cluster_hash(&before), cluster_hash(&after));
+    }
+
+    #[test]
+    fn the_cluster_hash_ignores_the_order_the_members_came_back_in() {
+        let a = member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 10);
+        let b = member(2, "parse", "src/b.rs", Some("beta"), Visibility::Public, 10);
+
+        assert_eq!(
+            cluster_hash(&[a.clone(), b.clone()]),
+            cluster_hash(&[b, a])
+        );
+    }
+
+    #[test]
+    fn different_members_hash_differently() {
+        let a = [member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 10)];
+        let b = [member(1, "parse", "src/a.rs", Some("beta"), Visibility::Public, 10)];
+
+        assert_ne!(cluster_hash(&a), cluster_hash(&b));
+    }
+
+    /// The separators exist for this: without them `("a::b", "c")` and
+    /// `("a", "b::c")` would concatenate to the same bytes.
+    #[test]
+    fn a_module_boundary_cannot_be_faked_by_a_name() {
+        let a = [member(1, "c", "src/a.rs", Some("a::b"), Visibility::Public, 10)];
+        let b = [member(1, "b::c", "src/a.rs", Some("a"), Visibility::Public, 10)];
+
+        assert_ne!(cluster_hash(&a), cluster_hash(&b));
+    }
+
+    #[test]
+    fn the_hash_is_eight_hex_characters() {
+        let hash = cluster_hash(&[member(
+            1,
+            "a",
+            "src/a.rs",
+            Some("alpha"),
+            Visibility::Public,
+            10,
+        )]);
+
+        assert_eq!(hash.len(), 8);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{hash}");
+    }
+
+    #[test]
+    fn duplicated_lines_counts_every_copy_but_the_one_that_stays() {
+        let c = cluster(vec![
+            member(1, "a", "src/a.rs", None, Visibility::Private, 10),
+            member(2, "b", "src/b.rs", None, Visibility::Private, 8),
+            member(3, "c", "src/c.rs", None, Visibility::Private, 6),
+        ]);
+
+        assert_eq!(c.duplicated_lines(), 14, "8 + 6; the 10-line copy stays");
+    }
+
+    #[test]
+    fn a_member_with_no_module_still_counts_as_its_own_file() {
+        // Collapsing every module-less symbol into one bucket would report a
+        // whole repository of C as a single module.
+        let c = cluster(vec![
+            member(1, "a", "src/a.c", None, Visibility::Private, 10),
+            member(2, "b", "src/b.c", None, Visibility::Private, 10),
+        ]);
+
+        assert_eq!(c.module_spread(), 2);
+    }
+
+    #[test]
+    fn the_report_carries_file_line_the_score_the_hash_and_the_code() {
+        let c = cluster(vec![
+            member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 3),
+            member(2, "parse", "src/b.rs", Some("beta"), Visibility::Public, 3),
+        ]);
+        let hash = c.cluster_hash();
+
+        let out = render(&[c], &mut |_| Some("fn parse() {\n    todo!()\n}\n".into()));
+
+        assert!(out.contains(&hash), "the cluster hash:\n{out}");
+        // 1-based display over 0-based storage: line_start 10 renders as 11.
+        assert!(out.contains("`src/a.rs:11-13`"), "file:line:\n{out}");
+        assert!(out.contains("`src/b.rs:11-13`"), "both members:\n{out}");
+        assert!(out.contains("cosine 0.800"), "the score:\n{out}");
+        assert!(out.contains("```rust"), "a fenced snippet:\n{out}");
+        assert!(out.contains("fn parse() {"), "the code:\n{out}");
+        assert!(out.contains("`alpha::parse`"), "the qualified name:\n{out}");
+    }
+
+    #[test]
+    fn a_structural_finding_does_not_print_a_cosine_it_never_measured() {
+        let c = Cluster {
+            members: vec![
+                member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 3),
+                member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
+            ],
+            evidence: Evidence::Structural { hamming: 4 },
+        };
+
+        let out = render(&[c], &mut |_| None);
+
+        assert!(out.contains("same shape, 4 bits apart"), "{out}");
+        assert!(!out.contains("cosine"), "{out}");
+    }
+
+    #[test]
+    fn a_body_the_reader_cannot_be_shown_prints_no_code_rather_than_wrong_code() {
+        // The file changed under the index: the stored line range no longer
+        // points at the symbol, so there is nothing honest to print.
+        let c = cluster(vec![
+            member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 3),
+            member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
+        ]);
+
+        let out = render(&[c], &mut |_| None);
+
+        assert!(!out.contains("```"), "no empty fence:\n{out}");
+        assert!(out.contains("`src/a.rs:11-13`"), "the location still:\n{out}");
+    }
+
+    #[test]
+    fn a_long_body_is_elided_rather_than_pasted_whole() {
+        let body = (0..100).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write;
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
+        let c = cluster(vec![
+            member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 100),
+            member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 100),
+        ]);
+
+        let out = render(&[c], &mut |_| Some(body.clone()));
+
+        assert!(out.contains("line 19"), "the head is shown:\n{out}");
+        assert!(!out.contains("line 20"), "the tail is not:\n{out}");
+        assert!(out.contains("… 80 more lines"), "{out}");
+    }
+
+    #[test]
+    fn an_unknown_extension_opens_a_plain_fence_not_a_broken_one() {
+        assert_eq!(fence_tag("src/a.rs"), "rust");
+        assert_eq!(fence_tag("notes.xyz"), "");
+        assert_eq!(fence_tag("Makefile"), "");
+    }
+
+    #[test]
+    fn an_empty_report_says_so_instead_of_printing_a_bare_heading() {
+        let out = render(&[], &mut |_| None);
+
+        assert!(out.contains("No clusters found"), "{out}");
+    }
+
+    #[test]
+    fn ranking_two_identical_clusters_is_deterministic() {
+        // Same spread, reach and line count: only the hash separates them, and
+        // it must separate them the same way every run.
+        let build = || {
+            vec![
+                cluster(vec![
+                    member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+                    member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 10),
+                ]),
+                cluster(vec![
+                    member(3, "c", "src/c.rs", Some("gamma"), Visibility::Public, 10),
+                    member(4, "d", "src/d.rs", Some("delta"), Visibility::Public, 10),
+                ]),
+            ]
+        };
+        let mut first = build();
+        let mut second = build();
+        second.reverse();
+
+        rank(&mut first);
+        rank(&mut second);
+
+        assert_eq!(first[0].cluster_hash(), second[0].cluster_hash());
+        assert_eq!(first[1].cluster_hash(), second[1].cluster_hash());
+    }
+
+    #[test]
+    fn an_empty_cluster_renders_instead_of_panicking() {
+        // Not expected from the pipeline, which drops singletons — but a
+        // renderer that panics turns a bad cluster into no report at all.
+        let c = cluster(Vec::new());
+
+        let out = render(&[c], &mut |_| None);
+
+        assert!(out.contains("(empty)"), "{out}");
+    }
+}

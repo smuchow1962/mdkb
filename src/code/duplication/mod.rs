@@ -8,5 +8,6 @@ pub mod body;
 pub mod candidates;
 pub mod cluster;
 pub mod embed;
+pub mod report;
 pub mod scan;
 pub mod store;

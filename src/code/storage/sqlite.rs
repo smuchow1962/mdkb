@@ -1114,6 +1114,26 @@ fn like_pattern(substring: &str) -> String {
 }
 
 /// Convert a row from the standard 14-column symbol SELECT to a `Symbol`.
+/// Decode the `visibility` column.
+///
+/// The numbers are the enum's own discriminants, which are pinned in its
+/// declaration precisely because they are stored here. One definition, shared
+/// with the duplication pass: a second copy would keep answering `Private` for
+/// `Package` the day a level is added.
+///
+/// An unknown number reads as `Private` — the narrowest answer, so an index
+/// written by a newer version under-reports reach instead of over-reporting it.
+pub(crate) fn visibility_from_i64(value: i64) -> Visibility {
+    match value {
+        0 => Visibility::Public,
+        1 => Visibility::Crate,
+        2 => Visibility::Module,
+        4 => Visibility::Package,
+        5 => Visibility::Restricted,
+        _ => Visibility::Private,
+    }
+}
+
 fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let id: i64 = row.get(0)?;
     let name: String = row.get(1)?;
@@ -1151,16 +1171,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         line_end.unwrap_or(line_start),
         col_end.map_or(0, |v| v as u16),
     );
-    // The numbers are the enum's own discriminants, which are pinned in its
-    // declaration precisely because they are stored here.
-    let visibility = match visibility_val {
-        0 => Visibility::Public,
-        1 => Visibility::Crate,
-        2 => Visibility::Module,
-        4 => Visibility::Package,
-        5 => Visibility::Restricted,
-        _ => Visibility::Private,
-    };
+    let visibility = visibility_from_i64(visibility_val);
     let scope_context = scope_context_str.and_then(|s| {
         serde_json::from_str(&s)
             .map_err(|e| {

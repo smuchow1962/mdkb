@@ -9,7 +9,8 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, params};
 
-use crate::code::storage::{TIER_UNPLACED, resolved_edges};
+use crate::code::storage::{TIER_UNPLACED, resolved_edges, visibility_from_i64};
+use crate::code::symbol::Visibility;
 
 /// The most distant resolution tier a call edge may reach and still suppress.
 ///
@@ -33,6 +34,9 @@ pub struct DupCandidate {
     pub module_path: Option<String>,
     /// The class or trait this is a member of, `None` for a free function.
     pub owner_name: Option<String>,
+    /// How far the symbol reaches. Ranking uses it: duplicated `pub` API is
+    /// copied by callers who cannot see it is duplicated.
+    pub visibility: Visibility,
     /// 0-based inclusive tree-sitter rows, as stored.
     pub line_start: u32,
     pub line_end: u32,
@@ -58,7 +62,7 @@ impl DupCandidate {
 /// from touching every file in the repository — see [`files_of`].
 pub fn candidates(conn: &Connection, min_lines: u32) -> rusqlite::Result<Vec<DupCandidate>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, file_path, module_path, owner_name, line_start, line_end \
+        "SELECT id, name, file_path, module_path, owner_name, visibility, line_start, line_end \
          FROM code_symbols \
          WHERE kind IN ('Function', 'Method') \
            AND line_end IS NOT NULL \
@@ -72,8 +76,9 @@ pub fn candidates(conn: &Connection, min_lines: u32) -> rusqlite::Result<Vec<Dup
             file_path: row.get(2)?,
             module_path: row.get(3)?,
             owner_name: row.get(4)?,
-            line_start: row.get(5)?,
-            line_end: row.get(6)?,
+            visibility: visibility_from_i64(row.get(5)?),
+            line_start: row.get(6)?,
+            line_end: row.get(7)?,
         })
     })?;
     rows.collect()

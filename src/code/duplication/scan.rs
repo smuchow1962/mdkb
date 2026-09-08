@@ -164,6 +164,7 @@ mod tests {
             file_path: path.to_string(),
             module_path: None,
             owner_name: None,
+            visibility: crate::code::symbol::Visibility::Private,
             line_start: start,
             line_end: end,
         }
