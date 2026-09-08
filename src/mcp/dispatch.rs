@@ -2317,6 +2317,11 @@ pub async fn code_find_impl(
 }
 
 /// `symbol_at_position` — find the innermost symbol at a given file position.
+///
+/// `params.line` is 1-based, which is what every line number Claude has already
+/// seen is: search results render `start_line + 1`, and so does every editor.
+/// The stored column is a 0-based tree-sitter row, so the conversion happens
+/// here — passing the parameter straight through named the symbol one line down.
 pub async fn symbol_at_position_impl(
     handle: &RepoHandle,
     params: &SymbolAtPositionParams,
@@ -2325,9 +2330,10 @@ pub async fn symbol_at_position_impl(
     let Some(facade) = idx_guard.as_ref() else {
         return Err(mcp_error("code index not available — run `update` first"));
     };
+    let row = params.line.saturating_sub(1);
     let symbol = facade
         .db()
-        .symbol_at_position(&params.file, params.line, params.col)
+        .symbol_at_position(&params.file, row, params.col)
         .map_err(|e| mcp_error(format!("symbol_at_position: {e}")))?;
 
     match symbol {

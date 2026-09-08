@@ -520,7 +520,12 @@ impl CodeDb {
         rows.collect()
     }
 
-    /// Find the innermost symbol enclosing a given position (line is 1-based).
+    /// Find the innermost symbol enclosing a given position.
+    ///
+    /// `line` is 0-based, because `line_start`/`line_end` hold tree-sitter rows
+    /// verbatim (see `stage_index`, which passes `range.start_line` through). A
+    /// caller holding a 1-based line — anything a human or an editor produced —
+    /// must subtract one first, or this returns the symbol on the line below.
     pub fn symbol_at_position(
         &self,
         rel_path: &str,

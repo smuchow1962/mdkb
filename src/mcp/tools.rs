@@ -404,7 +404,8 @@ pub struct SymbolAtPositionParams {
     /// Relative file path from repo root.
     pub file: String,
 
-    /// 1-based line number.
+    /// 1-based line number, as shown in search results and editors. The
+    /// `line_start`/`line_end` in the response are 0-based tree-sitter rows.
     pub line: u32,
 
     /// 0-based column number (optional).
