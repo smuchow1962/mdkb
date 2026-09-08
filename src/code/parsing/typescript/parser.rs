@@ -1374,6 +1374,10 @@ impl LanguageParser for TypeScriptParser {
         self.parse_symbols(code, file_id, counter)
     }
 
+    fn tree(&mut self, code: &str) -> Option<tree_sitter::Tree> {
+        self.parser.parse_cached(code)
+    }
+
     fn language(&self) -> Language {
         Language::TypeScript
     }

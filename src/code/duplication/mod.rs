@@ -4,4 +4,5 @@
 //! each candidate's body from source, and caches what is expensive in its own
 //! content-addressed database (see [`store`]).
 
+pub mod body;
 pub mod store;

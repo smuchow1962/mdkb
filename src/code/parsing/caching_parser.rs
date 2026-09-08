@@ -67,7 +67,10 @@ impl CachingParser {
 }
 
 /// FNV-1a hash for cache keying. Fast, no allocation, good distribution.
-fn fnv1a_hash(bytes: &[u8]) -> u64 {
+///
+/// `pub(crate)` so the duplication cache keys a body on the same hash the tree
+/// cache keys a file on — one hash function, not two that could disagree.
+pub(crate) fn fnv1a_hash(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
         hash ^= u64::from(byte);

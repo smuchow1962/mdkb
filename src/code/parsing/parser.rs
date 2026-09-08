@@ -9,7 +9,7 @@ use super::language::Language;
 use crate::code::symbol::Symbol;
 use crate::code::types::{FileId, Range, SymbolCounter};
 
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 /// Common interface for all language parsers.
 ///
@@ -21,6 +21,20 @@ pub trait LanguageParser: Send {
 
     /// Which language this parser handles.
     fn language(&self) -> Language;
+
+    /// The parsed tree for `code`, for a caller that needs the AST itself
+    /// rather than the symbols extracted from it.
+    ///
+    /// Every parser answers this from its [`CachingParser`], so a caller that
+    /// asks during `stage_parse` — where the same source has already been
+    /// parsed for symbol extraction — gets a clone of the cached tree instead
+    /// of a second run of the state machine.
+    ///
+    /// [`CachingParser`]: super::caching_parser::CachingParser
+    fn tree(&mut self, code: &str) -> Option<Tree> {
+        let _ = code;
+        None
+    }
 
     /// Extract documentation comment for an AST node.
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String>;
