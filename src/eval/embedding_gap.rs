@@ -205,9 +205,9 @@ mod tests {
 
         assert_eq!(report.n, 0);
         assert!(report.gap.is_finite(), "gap must never be NaN");
-        assert_eq!(report.gap, 0.0);
-        assert_eq!(report.high_mean, 0.0);
-        assert_eq!(report.low_mean, 0.0);
+        assert!(report.gap.abs() < f64::EPSILON);
+        assert!(report.high_mean.abs() < f64::EPSILON);
+        assert!(report.low_mean.abs() < f64::EPSILON);
     }
 
     #[test]
@@ -216,7 +216,7 @@ mod tests {
         let report = run_gap(&[GapCase::high("alpha beta", "alpha beta")], &bag_of_words);
 
         assert!(report.gap.is_finite(), "an empty side must not poison the gap");
-        assert_eq!(report.low_mean, 0.0);
+        assert!(report.low_mean.abs() < f64::EPSILON);
     }
 
     #[test]
@@ -272,7 +272,7 @@ mod tests {
 
         let report = run_gap(&[GapCase::high("ab", "abcd")], &ragged);
 
-        assert_eq!(report.high_mean, 0.0);
+        assert!(report.high_mean.abs() < f64::EPSILON);
     }
 
     #[test]
