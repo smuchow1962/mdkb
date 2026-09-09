@@ -1495,7 +1495,7 @@ pub async fn run_file_watcher_inner(
     // Two event sources: FSEvents watcher and injected paths from post-tool-use IPC.
     let mut code_batch: Vec<PathBuf> = Vec::new();
     let mut needs_doc_update = false;
-    let mut needs_memory_sync = false;
+    let mut needs_memory_sync = MemorySyncRequest::Idle;
 
     loop {
         // Helper: receive from the optional injected-path channel, or block forever if absent.
@@ -1510,7 +1510,7 @@ pub async fn run_file_watcher_inner(
             };
         }
 
-        if code_batch.is_empty() && !needs_doc_update && !needs_memory_sync {
+        if code_batch.is_empty() && !needs_doc_update && !needs_memory_sync.is_pending() {
             // No pending work — block until next event from either source.
             tokio::select! {
                 change = watcher.recv() => {
@@ -1525,7 +1525,7 @@ pub async fn run_file_watcher_inner(
                     let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
                     if routes.code { code_batch.push(change.path.clone()); }
                     if routes.doc { needs_doc_update = true; }
-                    if routes.memory { needs_memory_sync = true; }
+                    if routes.memory { needs_memory_sync.note(change.path.clone()); }
                     if !routes.any() {
                         tracing::debug!("Ignoring unrouted change: {:?}", change.path);
                     }
@@ -1550,7 +1550,7 @@ pub async fn run_file_watcher_inner(
                         let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
                         if routes.code { code_batch.push(change.path.clone()); }
                         if routes.doc { needs_doc_update = true; }
-                        if routes.memory { needs_memory_sync = true; }
+                        if routes.memory { needs_memory_sync.note(change.path.clone()); }
                         if !routes.any() {
                             tracing::debug!("Ignoring unrouted change: {:?}", change.path);
                         }
@@ -1583,7 +1583,7 @@ pub async fn run_file_watcher_inner(
                         code_batch.clear();
                         full_code_rescan(&code_index, &root).await;
                         needs_doc_update = true;
-                        needs_memory_sync = true;
+                        needs_memory_sync = MemorySyncRequest::Full;
                     } else {
                         flush_code_batch(&code_index, &root, &mut code_batch).await;
                     }
@@ -1675,7 +1675,7 @@ async fn full_rebuild_from_heal(
     // the only surviving copy — the doc update's reconciliation pass is what
     // re-imports it. Both flags are set for that reason.
     let mut needs_docs = true;
-    let mut needs_memory = true;
+    let mut needs_memory = MemorySyncRequest::Full;
     flush_doc_update(ctx, root, &mut needs_docs, &mut needs_memory).await;
     flush_memory_sync(ctx, &mut needs_memory).await;
     full_code_rescan(code_index, root).await;
@@ -1713,19 +1713,63 @@ async fn full_rebuild_from_heal(
 /// twelve deletions twelve independent choices, each below the cap, and the
 /// breaker would never fire.
 ///
-/// Reconciliation writes into the directory it watches, which re-triggers this
-/// flush once. That pass finds every recorded hash already matching, writes
-/// nothing, and the loop closes.
-async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, needs_sync: &mut bool) {
-    if !*needs_sync {
-        return;
+/// What the memory reconciliation flush has been asked to do.
+#[derive(Debug, Default)]
+enum MemorySyncRequest {
+    /// Nothing pending.
+    #[default]
+    Idle,
+    /// These files under `entries/` changed. The flush may find they are all
+    /// the store's own projections and skip the pass.
+    Changed(Vec<PathBuf>),
+    /// Run the pass whatever changed: dropped watcher events, a post-heal
+    /// rebuild — the change set is unknown or the whole projection is at stake.
+    Full,
+}
+
+impl MemorySyncRequest {
+    fn note(&mut self, path: PathBuf) {
+        match self {
+            Self::Idle => *self = Self::Changed(vec![path]),
+            Self::Changed(paths) => paths.push(path),
+            Self::Full => {}
+        }
     }
-    *needs_sync = false;
+
+    fn is_pending(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+}
+
+/// Every write projects its own file, and reconciliation writes into the
+/// directory it watches, so the store's own writes come back through here. A
+/// change whose bytes match the hash the store recorded when it projected that
+/// entry is such a write: the pass would find nothing to do, so it is skipped
+/// rather than run once per write. Anything else — an edit, an unknown file, a
+/// deletion, a full request — runs the pass.
+async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, request: &mut MemorySyncRequest) {
+    let changed = match std::mem::take(request) {
+        MemorySyncRequest::Idle => return,
+        MemorySyncRequest::Changed(paths) => Some(paths),
+        MemorySyncRequest::Full => None,
+    };
     // Synchronous SQLite + filesystem work, like `handle_update`: run it on a
     // blocking thread so it never stalls a tokio worker (PERF-1).
     let ctx = Arc::clone(ctx);
     let outcome = tokio::task::spawn_blocking(move || {
         let mut guard = ctx.blocking_lock();
+        if let Some(paths) = &changed {
+            let own = guard.as_ref().is_some_and(|ctx_ref| {
+                crate::core::memory_sync::changes_are_recorded_projections(ctx_ref, paths)
+            });
+            if own {
+                tracing::debug!(
+                    "Memory sync skipped: {} change(s) are the store's own projections",
+                    paths.len()
+                );
+                return None;
+            }
+        }
         crate::core::run_mutation(&mut guard, "memory sync", |ctx_ref| {
             crate::core::memory_sync::sync_memory_files(ctx_ref)
         })
@@ -1758,7 +1802,7 @@ async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, needs_sync: &mut b
             }
         }
         Ok(Some(Err(e))) => tracing::error!("Memory sync failed: {}", e),
-        Ok(None) => {} // ctx not initialized — nothing to do
+        Ok(None) => {} // ctx not initialized, or only the store's own writes — nothing to do
         Err(e) => tracing::error!("Memory sync task panicked: {}", e),
     }
 }
@@ -1772,13 +1816,13 @@ async fn flush_doc_update(
     ctx: &Arc<Mutex<Option<Context>>>,
     root: &Path,
     needs_update: &mut bool,
-    needs_memory_sync: &mut bool,
+    needs_memory_sync: &mut MemorySyncRequest,
 ) {
     if !*needs_update {
         return;
     }
     *needs_update = false;
-    *needs_memory_sync = false;
+    *needs_memory_sync = MemorySyncRequest::Idle;
     // `handle_update` is fully synchronous (SQLite writes, filesystem walks, and —
     // via auto-embed/memory-backfill — ONNX inference). Run it on a blocking thread
     // and take the lock there (`blocking_lock`), so it never blocks the tokio worker

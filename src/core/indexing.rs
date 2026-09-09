@@ -177,6 +177,10 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
 /// - `.mdkb/reindex-queue.jsonl` — the file-based reindex queue; the daemon now
 ///   uses an in-process channel, so it has no writer.
 /// - dead `[models]` embedding keys — the embedder is fixed to all-MiniLM-L6-v2.
+///
+/// Runs against `.mdkb/` itself, not the namespaced store: every artifact listed
+/// here is a legacy of the project-level store, and a namespace never had them
+/// (see the module docs of `core::code` for why the code index is shared too).
 fn housekeeping(root: &Path) {
     let mdkb_dir = root.join(".mdkb");
 

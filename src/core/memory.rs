@@ -10,7 +10,10 @@ use std::path::Path;
 
 use crate::core::Context;
 use crate::core::indexing::with_transaction;
-use crate::core::memory_sync::{archive_entry_on_disk, generate_memory_index, project_entry};
+use crate::core::memory_sync::{
+    archive_after_delete, archive_entry_on_disk, generate_memory_index, project_after_write,
+    project_entry,
+};
 use crate::error::{Error, ErrorKind, Result};
 use crate::store::memory::{self, EntryStatus, EntryType, MemoryEntry};
 use serde::Deserialize;
@@ -122,12 +125,7 @@ pub fn handle_memory_add(
     // leaving it to the next sync — is what keeps the write and the hash that
     // describes it in step; a file written without its hash reads back as an
     // unexplained local edit.
-    if let Err(e) = project_entry(ctx, &persisted, now) {
-        tracing::warn!("Failed to save entry to disk: {e}");
-    }
-    if let Err(e) = generate_memory_index(ctx) {
-        tracing::warn!("Failed to regenerate memory index: {e}");
-    }
+    project_after_write(ctx, &persisted.id, now);
 
     // Embed (or re-embed) so CLI/bridge writes are searchable by vector like the
     // MCP path. A cold model or embed failure leaves the entry pending — never
@@ -229,13 +227,7 @@ pub fn handle_memory_warmup(ctx: &Context, limit: usize) -> Result<Vec<String>> 
 pub fn handle_memory_rm(ctx: &Context, id: &str) -> Result<bool> {
     let deleted = memory::delete_entry(&ctx.conn, id)?;
     if deleted {
-        // Archive from disk and regenerate index
-        if let Err(e) = archive_entry_on_disk(ctx, id) {
-            tracing::warn!("Failed to archive entry on disk: {e}");
-        }
-        if let Err(e) = generate_memory_index(ctx) {
-            tracing::warn!("Failed to regenerate memory index: {e}");
-        }
+        archive_after_delete(ctx, id);
     }
     Ok(deleted)
 }

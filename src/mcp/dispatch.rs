@@ -626,8 +626,14 @@ pub async fn memory_delete_impl(
 
     let mut ctx_guard = handle.ctx.lock().await;
     let deleted = run_handle_memory_mutation(&mut ctx_guard, "memory delete", |ctx| {
-        memory::delete_entry(&ctx.conn, id)
-            .map_err(|e| mcp_store_error("Failed to delete memory entry", e))
+        let deleted = memory::delete_entry(&ctx.conn, id)
+            .map_err(|e| mcp_store_error("Failed to delete memory entry", e))?;
+        if deleted {
+            // Same door as `mdkb memory rm`: a file left in `entries/` would be
+            // re-imported by the next reconciliation.
+            crate::core::memory_sync::archive_after_delete(ctx, id);
+        }
+        Ok(deleted)
     })?;
 
     Ok(if deleted {
@@ -1048,8 +1054,13 @@ pub async fn memory_write_impl(
         let result = write_single_memory(&ctx.conn, input);
         close_context_on_reported_corruption(&mut ctx_guard, "memory write dry run", result)
     } else {
+        let id = input.id;
         run_handle_memory_mutation(&mut ctx_guard, "memory write", |ctx| {
-            write_single_memory(&ctx.conn, input)
+            let output = write_single_memory(&ctx.conn, input)?;
+            // Same door as `mdkb memory add`: the file exists the moment the
+            // row does, instead of at the next sync.
+            crate::core::memory_sync::project_after_write(ctx, id, chrono::Utc::now().timestamp());
+            Ok(output)
         })
     }
 }
@@ -1140,6 +1151,13 @@ pub async fn memory_write_batch_impl(
                     dry_run,
                 },
             )?;
+            if !dry_run {
+                crate::core::memory_sync::project_after_write(
+                    ctx,
+                    &entry.id,
+                    chrono::Utc::now().timestamp(),
+                );
+            }
             results.push(result);
         }
 
@@ -2849,9 +2867,11 @@ pub fn append_hook_log(path: &std::path::Path, line: &str) {
     }
 }
 
-/// Append one line to `.mdkb/hook-events.jsonl`; also `.mdkb/hook-slow.jsonl`
-/// when elapsed exceeds the configured budget. Best-effort — silently drops on
-/// I/O failure. Designed to run inside `spawn_blocking`.
+/// Append one line to `hook-events.jsonl` in the store the hook ran against;
+/// also `hook-slow.jsonl` when elapsed exceeds the configured budget. The store,
+/// not `.mdkb/` — a namespaced process writes nothing outside its namespace,
+/// telemetry included. Best-effort — silently drops on I/O failure. Designed to
+/// run inside `spawn_blocking`.
 fn log_hook_event(
     root: std::path::PathBuf,
     event: &str,
@@ -2868,7 +2888,7 @@ fn log_hook_event(
     })
     .to_string();
     line.push('\n');
-    let mdkb_dir = root.join(".mdkb");
+    let mdkb_dir = crate::store::namespace::store_dir(&root).unwrap_or_else(|_| root.join(".mdkb"));
     append_hook_log(&mdkb_dir.join("hook-events.jsonl"), &line);
     if elapsed_ms > slow_threshold_ms {
         append_hook_log(&mdkb_dir.join("hook-slow.jsonl"), &line);
@@ -3266,15 +3286,22 @@ pub async fn hook_session_start_impl(
                 .map(|c| c.name)
                 .collect();
             let drift_banner = format_projection_drift_banner(ctx)?;
+            // The store this session opened — in a namespace, not `.mdkb/`.
+            // The quarantine banner must describe it, not the default store.
+            let store_dir = ctx
+                .db_path
+                .parent()
+                .map_or_else(|| handle.root.join(".mdkb"), std::path::Path::to_path_buf);
             Ok((
                 due_lines,
                 entries,
                 doc_count,
                 collection_names,
                 drift_banner,
+                store_dir,
             ))
         });
-    let (due_lines, entries, doc_count, collection_names, drift_banner) = match startup_data {
+    let (due_lines, entries, doc_count, collection_names, drift_banner, store_dir) = match startup_data {
         Some(Ok(data)) => data,
         Some(Err(error)) => {
             tracing::warn!("hook.session_start warmup failed: {error}");
@@ -3289,7 +3316,7 @@ pub async fn hook_session_start_impl(
     // Data-loss banner: surface any outstanding autoheal quarantine loudly,
     // computed before the empty-warmup early return so a freshly-rebuilt (empty)
     // store still gets the warning instead of silence.
-    let quarantine_banner = format_quarantine_banner(&handle.root.join(".mdkb"), doc_count);
+    let quarantine_banner = format_quarantine_banner(&store_dir, doc_count);
 
     // mdkb owns handoff injection: pull the newest handoff's full body out for a
     // dedicated block and drop ALL handoffs from the ranked compact list — a
