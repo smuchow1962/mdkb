@@ -90,6 +90,25 @@ pub enum Command {
         /// Only look at paths starting with this. Omit to sweep the repository
         #[arg(short, long)]
         file: Option<String>,
+
+        /// Review mode: report only clusters touching what this ref changed, still scored against the whole index
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Report files that change together but have no edge between them
+    Coupling {
+        /// Fewest shared commits before a pair counts. Omit for the built-in floor
+        #[arg(long = "min-cochanges")]
+        min_cochanges: Option<usize>,
+
+        /// How far back to read history, in git's own wording. Omit for the last year
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Which revision to walk. Omit to walk the current branch
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
     },
 
     /// Search documents, memory, or code symbols

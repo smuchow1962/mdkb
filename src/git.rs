@@ -104,6 +104,182 @@ pub fn find_existing_store(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Refuse a revision that git would read as an option.
+///
+/// Every ref this module accepts reaches git as its own argv token, so no
+/// shell quoting is involved and no metacharacter can escape. The one value
+/// that still misbehaves is a leading `-`: as a bare token, `--upload-pack=…`
+/// is parsed as a flag rather than the revision it claims to be. Rejecting it
+/// here means git is never invoked at all with such a value.
+fn reject_option_like_ref(git_ref: &str, subcommand: &str) -> crate::error::Result<()> {
+    if git_ref.starts_with('-') {
+        return Err(crate::error::Error::other(format!(
+            "refusing to pass '{git_ref}' to {subcommand}: a ref starting with '-' would be \
+             read as an option, not a revision"
+        )));
+    }
+    Ok(())
+}
+
+/// The files that differ between `git_ref` and the working tree, including
+/// files git is not tracking yet.
+///
+/// Two commands, because one cannot answer this. `git diff --name-only <ref>`
+/// covers tracked work whether or not it is committed — which is the point,
+/// since at review time the change is usually still in the working tree. But
+/// it says nothing about an untracked file, and a brand-new file duplicating
+/// code that already exists is exactly the finding review mode is for: the
+/// author has no memory of the repository, which is why they wrote it twice.
+/// `git ls-files --others --exclude-standard` adds those, and honours
+/// `.gitignore` so build output never enters the set.
+///
+/// Three failures are deliberately errors rather than an empty list, because
+/// an empty list here silently means "your change duplicates nothing":
+/// a ref git cannot resolve, a `root` that is not in a git repository, and git
+/// itself failing to run. An empty list is returned only when git succeeded and
+/// genuinely reported no changed paths.
+pub fn changed_files(root: &Path, git_ref: &str) -> crate::error::Result<Vec<String>> {
+    use crate::error::Error;
+
+    reject_option_like_ref(git_ref, "git diff")?;
+
+    if find_git_root(root).is_none() {
+        return Err(Error::other(format!(
+            "{} is not in a git repository, so there is no '{git_ref}' to compare against",
+            root.display()
+        )));
+    }
+
+    let run = |args: &[&str], label: &str| -> crate::error::Result<Vec<String>> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .map_err(|e| Error::other(format!("cannot run {label}: {e}")))?;
+        if !output.status.success() {
+            return Err(Error::other(format!(
+                "{label} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    };
+
+    // The trailing `--` is what keeps a revision and a pathspec apart: without
+    // it, a ref that happens to name an existing file is ambiguous and git
+    // says so instead of answering.
+    let mut files = run(&["diff", "--name-only", git_ref, "--"], "git diff")?;
+    files.extend(run(
+        &["ls-files", "--others", "--exclude-standard"],
+        "git ls-files",
+    )?);
+    files.sort_unstable();
+    files.dedup();
+    Ok(files)
+}
+
+/// Per-commit lists of files touched, or the absence of usable history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoChangeHistory {
+    /// One entry per commit inside the window, newest first, holding the
+    /// paths that commit's `--name-only` diff listed.
+    Commits(Vec<Vec<String>>),
+    /// No git repository at `root`, or one with no commits yet. Not an error:
+    /// a project with no history has nothing for co-change to measure, and a
+    /// brand-new `mdkb init` must not fail here.
+    NoHistory,
+}
+
+/// Ask git which files changed together, commit by commit, inside `since`.
+///
+/// `git_ref` scopes the walk to a revision or range (`main`, `HEAD~500..HEAD`);
+/// `None` walks the current branch, exactly like a bare `git log`. It is
+/// always passed to git as its own argv token — never interpolated into a
+/// shell string — and is rejected here, before git ever runs, when it starts
+/// with `-`: passed as a second token, such a value would be read by git as an
+/// option rather than the revision it claims to be.
+///
+/// `since` is a git approxidate (`"12 months ago"`), embedded in a single
+/// `--since=<value>` token so it cannot be split into a separate flag either.
+pub fn co_change_history(
+    root: &Path,
+    git_ref: Option<&str>,
+    since: &str,
+) -> crate::error::Result<CoChangeHistory> {
+    use crate::error::Error;
+
+    if let Some(r) = git_ref {
+        reject_option_like_ref(r, "git log")?;
+    }
+
+    // No git repository at all is the common case for a fresh `mdkb init` on
+    // a project that predates version control here — report it the same way
+    // as an initialized repo with zero commits, rather than shelling out to
+    // find out.
+    if find_git_root(root).is_none() {
+        return Ok(CoChangeHistory::NoHistory);
+    }
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(root).arg("log");
+    if let Some(r) = git_ref {
+        cmd.arg(r);
+    }
+    cmd.arg(format!("--since={since}"))
+        .args(["--name-only", "--pretty=format:%H"]);
+
+    let output = cmd
+        .output()
+        .map_err(|e| Error::other(format!("cannot run git log: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // git's own wording for an unborn branch — the one failure this
+        // function swallows rather than propagates.
+        if stderr.contains("does not have any commits yet") {
+            return Ok(CoChangeHistory::NoHistory);
+        }
+        return Err(Error::other(format!("git log failed: {}", stderr.trim())));
+    }
+
+    Ok(CoChangeHistory::Commits(parse_name_only_log(
+        &String::from_utf8_lossy(&output.stdout),
+    )))
+}
+
+/// Split `git log --name-only --pretty=format:%H` output into per-commit file
+/// groups, newest first.
+///
+/// A line is a commit hash when it is exactly 40 hex characters — `%H` is the
+/// only thing this function's caller ever prints on its own line, so nothing
+/// else can collide with it.
+fn parse_name_only_log(stdout: &str) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut in_commit = false;
+    for line in stdout.lines() {
+        if line.len() == 40 && line.chars().all(|c| c.is_ascii_hexdigit()) {
+            if in_commit {
+                groups.push(std::mem::take(&mut current));
+            }
+            in_commit = true;
+            continue;
+        }
+        if !line.is_empty() {
+            current.push(line.to_string());
+        }
+    }
+    if in_commit {
+        groups.push(current);
+    }
+    groups
+}
+
 /// Walk up from `start` (inclusive) looking for a git repository root — a
 /// directory containing `.git` (a directory for a normal repo, a file for a
 /// secondary worktree). Returns the nearest such directory, or `None`.
@@ -748,5 +924,286 @@ mod tests {
         // repo, so the guard stays out of the way — it refuses containers, not
         // ordinary non-git projects.
         assert_eq!(resolve_project_root(&drifted, None), Some(drifted));
+    }
+
+    // ── co-change history ───────────────────────────────────────────────────
+
+    /// A commit's author/committer date, fixed rather than "now", so a test
+    /// asserting on `--since` cannot flap depending on when it happens to run.
+    fn commit_file(root: &Path, rel: &str, contents: &str, date: &str) {
+        std::fs::write(root.join(rel), contents).unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["add", rel])
+            .output()
+            .unwrap();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-m", &format!("touch {rel}")])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn commit_files(root: &Path, rels: &[&str], date: &str) {
+        for rel in rels {
+            std::fs::write(root.join(rel), "x").unwrap();
+        }
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("add")
+            .args(rels)
+            .output()
+            .unwrap();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-m", "touch several files"])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["init", "-q", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn changed_files_rejects_a_ref_starting_with_dash_before_running_git() {
+        // Same proof as the co-change case: a root that cannot exist, so a
+        // rejection that needed git to run would fail with a different error.
+        let bogus_root = Path::new("/definitely/does/not/exist/anywhere");
+
+        let err = changed_files(bogus_root, "--upload-pack=evil").unwrap_err();
+
+        assert!(err.to_string().contains("--upload-pack=evil"), "{err}");
+        assert!(err.to_string().contains("git diff"), "{err}");
+    }
+
+    #[test]
+    fn changed_files_reports_an_unknown_ref_as_an_error_not_an_empty_list() {
+        // The distinction the whole feature rests on: an empty list means
+        // "your change duplicated nothing", so a typo in the ref must never
+        // produce one.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "a.rs", "x", "2026-06-01T12:00:00");
+
+        let result = changed_files(tmp.path(), "no-such-branch");
+
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    #[test]
+    fn changed_files_errors_outside_a_git_repository() {
+        let tmp = TempDir::new().unwrap();
+
+        let err = changed_files(tmp.path(), "HEAD").unwrap_err();
+
+        assert!(err.to_string().contains("not in a git repository"), "{err}");
+    }
+
+    #[test]
+    fn changed_files_lists_what_a_ref_changed_including_the_working_tree() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "a.rs", "x", "2026-06-01T12:00:00");
+        commit_file(tmp.path(), "b.rs", "y", "2026-06-02T12:00:00");
+        // Uncommitted, and it must still be listed: at review time the change
+        // under review is usually not committed yet.
+        std::fs::write(tmp.path().join("c.rs"), "z").unwrap();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["add", "c.rs"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let mut files = changed_files(tmp.path(), "HEAD~1").unwrap();
+        files.sort();
+
+        assert_eq!(files, vec!["b.rs".to_string(), "c.rs".to_string()]);
+    }
+
+    /// The case `git diff` alone gets wrong, and the one review mode most
+    /// needs: a file so new git is not tracking it yet. A duplicate written
+    /// into a brand-new file is the archetypal finding — and `.gitignore` must
+    /// still be honoured, or every build artefact enters the review.
+    #[test]
+    fn changed_files_includes_untracked_files_but_not_ignored_ones() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), ".gitignore", "target/\n", "2026-06-01T12:00:00");
+        std::fs::write(tmp.path().join("new.rs"), "z").unwrap();
+        std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+        std::fs::write(tmp.path().join("target/build.rs"), "z").unwrap();
+
+        let files = changed_files(tmp.path(), "HEAD").unwrap();
+
+        assert_eq!(
+            files,
+            vec!["new.rs".to_string()],
+            "untracked in, ignored out: {files:?}"
+        );
+    }
+
+    #[test]
+    fn changed_files_is_empty_when_the_ref_is_the_working_tree() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "a.rs", "x", "2026-06-01T12:00:00");
+
+        // Nothing changed since HEAD: an empty list, and not an error. This is
+        // the one case where empty is the honest answer.
+        assert_eq!(changed_files(tmp.path(), "HEAD").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn co_change_history_reports_no_history_when_there_is_no_git_repo() {
+        let tmp = TempDir::new().unwrap();
+
+        let history = co_change_history(tmp.path(), None, "12 months ago").unwrap();
+
+        assert_eq!(history, CoChangeHistory::NoHistory);
+    }
+
+    #[test]
+    fn co_change_history_reports_no_history_for_an_unborn_branch() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        // A freshly `git init`ed repo has no commits — `git log` itself would
+        // fail with "does not have any commits yet", which this must not
+        // surface as an error.
+        let history = co_change_history(tmp.path(), None, "12 months ago").unwrap();
+
+        assert_eq!(history, CoChangeHistory::NoHistory);
+    }
+
+    #[test]
+    fn co_change_history_groups_files_by_commit() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_files(tmp.path(), &["a.rs", "b.rs"], "2026-06-01T12:00:00");
+        commit_file(tmp.path(), "c.rs", "y", "2026-06-02T12:00:00");
+
+        let history = co_change_history(tmp.path(), None, "5 years ago").unwrap();
+
+        let CoChangeHistory::Commits(groups) = history else {
+            panic!("expected commits, got {history:?}");
+        };
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        // Newest first.
+        assert_eq!(groups[0], vec!["c.rs".to_string()]);
+        let mut second = groups[1].clone();
+        second.sort();
+        assert_eq!(second, vec!["a.rs".to_string(), "b.rs".to_string()]);
+    }
+
+    #[test]
+    fn co_change_history_respects_the_since_window() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_files(tmp.path(), &["old_a.rs", "old_b.rs"], "2019-01-01T12:00:00");
+        commit_files(tmp.path(), &["new_a.rs", "new_b.rs"], "2026-06-01T12:00:00");
+
+        let history = co_change_history(tmp.path(), None, "1 years ago").unwrap();
+
+        let CoChangeHistory::Commits(groups) = history else {
+            panic!("expected commits, got {history:?}");
+        };
+        assert_eq!(
+            groups.len(),
+            1,
+            "the 2019 commit must be outside the window: {groups:?}"
+        );
+        let mut files = groups[0].clone();
+        files.sort();
+        assert_eq!(files, vec!["new_a.rs".to_string(), "new_b.rs".to_string()]);
+    }
+
+    #[test]
+    fn co_change_history_rejects_a_ref_starting_with_dash_before_running_git() {
+        // A path that does not even exist: if the rejection needed git to run
+        // first, this would fail with a filesystem/git error instead of the
+        // dash-specific one, proving the check happens before the process is
+        // spawned.
+        let bogus_root = Path::new("/definitely/does/not/exist/anywhere");
+
+        let err =
+            co_change_history(bogus_root, Some("--upload-pack=evil"), "12 months ago").unwrap_err();
+
+        assert!(err.to_string().contains("--upload-pack=evil"), "{err}");
+    }
+
+    #[test]
+    fn co_change_history_reports_an_unknown_ref_as_an_error_not_no_history() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "a.rs", "x", "2026-06-01T12:00:00");
+
+        let result = co_change_history(tmp.path(), Some("no-such-branch"), "12 months ago");
+
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    #[test]
+    fn co_change_history_walks_an_explicit_ref() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "a.rs", "x", "2026-06-01T12:00:00");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["branch", "feature"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let history = co_change_history(tmp.path(), Some("feature"), "5 years ago").unwrap();
+
+        assert_eq!(
+            history,
+            CoChangeHistory::Commits(vec![vec!["a.rs".to_string()]])
+        );
     }
 }

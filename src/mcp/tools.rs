@@ -44,6 +44,10 @@ pub struct SearchParams {
     /// Minimum confidence threshold 0.0-1.0 when scope is "memory". Entries below this are excluded. Omit or 0.0 = no filter.
     #[serde(default)]
     pub min_confidence: Option<f64>,
+
+    /// Git ref when scope is "duplicates": report only clusters touching what changed since it, still scored against the whole index. Use it to ask what the current change duplicated.
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 fn default_limit() -> usize {

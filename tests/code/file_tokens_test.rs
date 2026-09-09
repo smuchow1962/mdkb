@@ -86,6 +86,7 @@ pub struct UniqueGreeterStruct {
             threshold: None,
             file: None,
             min_confidence: None,
+            since: None,
         }))
         .await
         .expect("search scope=symbols");

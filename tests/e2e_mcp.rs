@@ -2155,6 +2155,7 @@ async fn test_memory_search_repeated_get_ranks_above_untouched() {
             threshold: None,
             file: None,
             min_confidence: None,
+            since: None,
         }))
         .await
         .expect("search scope=memory");

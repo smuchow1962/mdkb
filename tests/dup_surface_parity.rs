@@ -123,6 +123,7 @@ fn params(scope: &str, file: Option<&str>) -> SearchParams {
         threshold: None,
         file: file.map(str::to_string),
         min_confidence: None,
+        since: None,
     }
 }
 
@@ -131,9 +132,10 @@ async fn both_surfaces_report_the_same_clusters_for_the_same_repository() {
     let repo = Repo::new();
 
     let cli = String::from_utf8_lossy(&run(&["dup"], &repo.root).stdout).into_owned();
-    let (mcp, count) = mdkb::mcp::dispatch::search_impl(&repo.handle(), &params("duplicates", None))
-        .await
-        .expect("duplicates scope");
+    let (mcp, count) =
+        mdkb::mcp::dispatch::search_impl(&repo.handle(), &params("duplicates", None))
+            .await
+            .expect("duplicates scope");
 
     // The fixture must actually find something, or equality is the equality of
     // two empty reports and this test cannot fail.
@@ -141,7 +143,10 @@ async fn both_surfaces_report_the_same_clusters_for_the_same_repository() {
         cli.contains("total") && cli.contains("aggregate"),
         "the fixture pair must cluster; CLI said:\n{cli}"
     );
-    assert_eq!(count, 1, "one cluster, from the one copy-paste pair:\n{mcp}");
+    assert_eq!(
+        count, 1,
+        "one cluster, from the one copy-paste pair:\n{mcp}"
+    );
     assert_eq!(
         mcp, cli,
         "the two surfaces must render the same audit, byte for byte"
@@ -166,6 +171,98 @@ async fn the_file_option_scopes_both_surfaces_the_same_way() {
         "the CLI must have honoured the same narrowing:\n{cli}"
     );
     assert_eq!(mcp, cli, "and both must say so identically");
+}
+
+/// Review mode across both surfaces, on a real git history.
+///
+/// `src/b.rs` is committed; `src/a.rs` is the change under review. The cluster
+/// must survive, because what `a.rs` duplicated is precisely the code that did
+/// not change — a candidate filter would have dropped it. Both surfaces must
+/// say so identically.
+#[tokio::test]
+async fn review_mode_scopes_both_surfaces_to_what_the_ref_changed() {
+    let repo = Repo::new();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo.root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "src/b.rs"]);
+    git(&["commit", "-q", "-m", "b"]);
+
+    // `src/a.rs` is now the only path `git diff --name-only HEAD` reports.
+    let cli =
+        String::from_utf8_lossy(&run(&["dup", "--since", "HEAD"], &repo.root).stdout).into_owned();
+    let mut p = params("duplicates", None);
+    p.since = Some("HEAD".to_string());
+    let (mcp, count) = mdkb::mcp::dispatch::search_impl(&repo.handle(), &p)
+        .await
+        .expect("duplicates scope");
+
+    assert_eq!(
+        count, 1,
+        "the cluster touches the changed file and must survive:\n{mcp}"
+    );
+    assert!(
+        cli.contains("aggregate"),
+        "and the unchanged member is still reported — that is the finding:\n{cli}"
+    );
+    assert_eq!(mcp, cli, "both surfaces must narrow identically");
+}
+
+/// The other half of the same contract: a ref that changed nothing reports
+/// nothing, rather than falling back to the whole-repository sweep.
+#[tokio::test]
+async fn review_mode_reports_nothing_when_the_ref_changed_nothing() {
+    let repo = Repo::new();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo.root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "src/a.rs", "src/b.rs"]);
+    git(&["commit", "-q", "-m", "both"]);
+
+    let cli =
+        String::from_utf8_lossy(&run(&["dup", "--since", "HEAD"], &repo.root).stdout).into_owned();
+    let mut p = params("duplicates", None);
+    p.since = Some("HEAD".to_string());
+    let (mcp, count) = mdkb::mcp::dispatch::search_impl(&repo.handle(), &p)
+        .await
+        .expect("duplicates scope");
+
+    assert_eq!(count, 0, "nothing changed, so nothing is under review:\n{mcp}");
+    assert!(
+        !cli.contains("aggregate"),
+        "and the CLI must not fall back to the full sweep:\n{cli}"
+    );
+    assert_eq!(mcp, cli);
 }
 
 #[tokio::test]

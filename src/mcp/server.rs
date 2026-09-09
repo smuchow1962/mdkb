@@ -2918,6 +2918,7 @@ mod tests {
                 kind: None,
                 file: None,
                 min_confidence: None,
+                since: None,
                 threshold: None,
                 root: None,
             }))
@@ -2974,6 +2975,7 @@ mod tests {
                 kind: None,
                 file: None,
                 min_confidence: None,
+                since: None,
                 threshold: None,
                 root: None,
             }))
@@ -3245,6 +3247,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
+                    since: None,
                     threshold: None,
                     root: None,
                 })),
@@ -3274,6 +3277,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
+                    since: None,
                     threshold: None,
                     root: None,
                 })),
@@ -3302,6 +3306,7 @@ if (require.main === module) {
                     kind: Some("struct".to_string()),
                     file: None,
                     min_confidence: None,
+                    since: None,
                     threshold: None,
                     root: None,
                 })),
@@ -3337,6 +3342,7 @@ if (require.main === module) {
                     threshold: None,
                     root: None,
                     min_confidence: None,
+                    since: None,
                 })),
             )
             .await
@@ -3364,6 +3370,7 @@ if (require.main === module) {
                     kind: Some("invalid_kind".to_string()),
                     file: None,
                     min_confidence: None,
+                    since: None,
                     threshold: None,
                     root: None,
                 })),
@@ -3390,6 +3397,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
+                    since: None,
                     threshold: None,
                     root: None,
                 })),
@@ -3504,6 +3512,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
+                    since: None,
                     threshold: None,
                     root: None,
                 })),
@@ -3554,6 +3563,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
+                    since: None,
                     threshold: None,
                     root: None,
                 })),
@@ -3573,6 +3583,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
+                    since: None,
                     threshold: None,
                     root: None,
                 })),
@@ -3626,6 +3637,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
+                    since: None,
                     threshold: None,
                     root: None,
                 })),
@@ -4194,6 +4206,7 @@ if (require.main === module) {
                 threshold: None,
                 file: None,
                 min_confidence: None,
+                since: None,
             }))
             .await;
 
@@ -4280,6 +4293,7 @@ if (require.main === module) {
                 threshold: None,
                 file: None,
                 min_confidence: None,
+                since: None,
             })),
         )
         .await
@@ -4351,6 +4365,7 @@ if (require.main === module) {
                 threshold: None,
                 file: None,
                 min_confidence: None,
+                since: None,
             })),
         )
         .await
@@ -4419,6 +4434,7 @@ if (require.main === module) {
                 threshold: None,
                 file: None,
                 min_confidence: None,
+                since: None,
             })),
         )
         .await

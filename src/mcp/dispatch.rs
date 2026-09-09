@@ -1429,22 +1429,24 @@ pub async fn search_impl(
             // so it does not take the code-index guard the other code scopes
             // need. It does take the memory connection, for the ignore-list.
             let mut ctx_guard = handle.ctx.lock().await;
-            let report = crate::core::run_guarded_read(&mut ctx_guard, "duplication audit", |ctx| {
-                crate::core::dup::handle_dup(
-                    &handle.root,
-                    Some(&ctx.conn),
-                    &handle.config,
-                    &crate::core::dup::DupOverrides {
-                        threshold: params.threshold,
-                        min_nodes: None,
-                        // An empty query sweeps the repository; `file` is what
-                        // narrows it, matching `mdkb dup --file`.
-                        file: params.file.clone(),
-                    },
-                )
-            })
-            .ok_or_else(|| mcp_error("Database not initialized"))?
-            .map_err(|e| mcp_error(format!("Duplication audit failed: {e}")))?;
+            let report =
+                crate::core::run_guarded_read(&mut ctx_guard, "duplication audit", |ctx| {
+                    crate::core::dup::handle_dup(
+                        &handle.root,
+                        Some(&ctx.conn),
+                        &handle.config,
+                        &crate::core::dup::DupOverrides {
+                            threshold: params.threshold,
+                            min_nodes: None,
+                            // An empty query sweeps the repository; `file` is what
+                            // narrows it, matching `mdkb dup --file`.
+                            file: params.file.clone(),
+                            since: params.since.clone(),
+                        },
+                    )
+                })
+                .ok_or_else(|| mcp_error("Database not initialized"))?
+                .map_err(|e| mcp_error(format!("Duplication audit failed: {e}")))?;
 
             Ok((report.markdown, report.clusters))
         }
@@ -7523,6 +7525,7 @@ mod tests {
             threshold: None,
             file: None,
             min_confidence: None,
+            since: None,
         }
     }
 

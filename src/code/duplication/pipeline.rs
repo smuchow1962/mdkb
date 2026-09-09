@@ -36,6 +36,16 @@ pub struct DupOptions {
     pub similarity_threshold: f32,
     /// Only look at paths starting with this. `None` sweeps the repository.
     pub file: Option<String>,
+    /// Review mode: report only clusters that touch one of these paths.
+    ///
+    /// Deliberately NOT a candidate filter like `file`. The question review
+    /// mode asks is "what did *my change* duplicate", and the code it
+    /// duplicated is by definition code the change did not touch — narrowing
+    /// the candidate set first would remove the very symbols the answer is
+    /// made of. So the whole index is fingerprinted and clustered as usual,
+    /// and only the report is narrowed, to clusters with at least one member
+    /// in this set.
+    pub changed: Option<HashSet<String>>,
 }
 
 impl Default for DupOptions {
@@ -46,6 +56,7 @@ impl Default for DupOptions {
             hamming_threshold: super::body::SIMHASH_HAMMING_THRESHOLD,
             similarity_threshold: 0.70,
             file: None,
+            changed: None,
         }
     }
 }
@@ -126,6 +137,17 @@ pub fn scan_duplication(
         )?);
     }
 
+    // Review narrowing runs before the ignore-list, so `ignored` counts what
+    // was suppressed among the clusters actually being reported rather than
+    // across the whole repository.
+    if let Some(changed) = &options.changed {
+        clusters.retain(|c| {
+            c.members
+                .iter()
+                .any(|m| changed.contains(m.file_path.as_str()))
+        });
+    }
+
     let before = clusters.len();
     if let Some(memory) = memory {
         clusters = filter_ignored(memory, clusters)?;
@@ -171,8 +193,10 @@ fn structural_cluster(group: &[usize], scan: &Scan) -> Cluster {
     let mut widest = 0;
     for (n, &i) in group.iter().enumerate() {
         for &j in &group[n + 1..] {
-            widest =
-                widest.max(hamming(scan.fingerprints[i].simhash, scan.fingerprints[j].simhash));
+            widest = widest.max(hamming(
+                scan.fingerprints[i].simhash,
+                scan.fingerprints[j].simhash,
+            ));
         }
     }
     Cluster {
@@ -206,7 +230,12 @@ fn semantic_clusters(
     let pairs: HashMap<(usize, usize), f32> = scored
         .iter()
         .filter(|&&(i, j, _)| {
-            suppression_for(&scan.fingerprints[i], &scan.fingerprints[j], scan.suppressed).is_none()
+            suppression_for(
+                &scan.fingerprints[i],
+                &scan.fingerprints[j],
+                scan.suppressed,
+            )
+            .is_none()
         })
         .map(|&(i, j, score)| (ordered(i, j), score))
         .collect();
@@ -273,12 +302,10 @@ fn bodies_of(
                 loaded = Some((path.to_string(), read_file(path)));
             }
             let body = match &loaded {
-                Some((_, Some(source))) => super::body::body_text(
-                    source,
-                    s.candidate.line_start,
-                    s.candidate.line_end,
-                )
-                .unwrap_or_default(),
+                Some((_, Some(source))) => {
+                    super::body::body_text(source, s.candidate.line_start, s.candidate.line_end)
+                        .unwrap_or_default()
+                }
                 _ => "",
             };
             (s.body_hash.clone(), body.to_string())
@@ -456,6 +483,66 @@ mod tests {
         assert!(out.clusters.is_empty(), "one symbol resembles nothing");
     }
 
+    /// The distinction between review mode and `--file`, and the whole reason
+    /// they are two options: `src/b.rs` was NOT changed, and the cluster must
+    /// still be reported, because what `src/a.rs` duplicated is exactly the
+    /// code that did not change. `--file` narrows the candidates and would
+    /// have found nothing here (proved by the test above); this narrows only
+    /// the report.
+    #[test]
+    fn review_mode_keeps_a_cluster_whose_other_member_did_not_change() {
+        let (conn, sources) = two_copies();
+        let dup = DupDb::in_memory().unwrap();
+        let opts = DupOptions {
+            min_nodes: 5,
+            changed: Some(HashSet::from(["src/a.rs".to_string()])),
+            ..DupOptions::default()
+        };
+
+        let out =
+            scan_duplication(&conn, None, &dup, None, &mut files(&sources), &opts, 1).unwrap();
+
+        assert_eq!(out.considered, 2, "the whole index is still fingerprinted");
+        assert_eq!(out.clusters.len(), 1, "the cluster touches src/a.rs");
+        assert_eq!(out.clusters[0].members.len(), 2, "both members reported");
+    }
+
+    #[test]
+    fn review_mode_drops_a_cluster_the_change_never_touched() {
+        let (conn, sources) = two_copies();
+        let dup = DupDb::in_memory().unwrap();
+        let opts = DupOptions {
+            min_nodes: 5,
+            changed: Some(HashSet::from(["src/untouched.rs".to_string()])),
+            ..DupOptions::default()
+        };
+
+        let out =
+            scan_duplication(&conn, None, &dup, None, &mut files(&sources), &opts, 1).unwrap();
+
+        assert_eq!(out.considered, 2, "still fingerprinted, just not reported");
+        assert!(out.clusters.is_empty(), "no member is in the changed set");
+    }
+
+    /// An empty changed set is "the ref changed nothing", not "no filter". The
+    /// `Option` carries that distinction, and getting it backwards would make
+    /// a clean working tree report the entire repository's duplication.
+    #[test]
+    fn review_mode_with_an_empty_change_set_reports_nothing() {
+        let (conn, sources) = two_copies();
+        let dup = DupDb::in_memory().unwrap();
+        let opts = DupOptions {
+            min_nodes: 5,
+            changed: Some(HashSet::new()),
+            ..DupOptions::default()
+        };
+
+        let out =
+            scan_duplication(&conn, None, &dup, None, &mut files(&sources), &opts, 1).unwrap();
+
+        assert!(out.clusters.is_empty());
+    }
+
     #[test]
     fn an_accepted_cluster_is_counted_and_dropped() {
         let (conn, sources) = two_copies();
@@ -488,9 +575,7 @@ mod tests {
     }
 
     fn accept(memory: &Connection, cluster_hash: &str) {
-        use crate::store::memory::{
-            EntryStatus, EntryType, MemoryEntry, SourceType, add_entry,
-        };
+        use crate::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
         let now = chrono::Utc::now().timestamp();
         add_entry(
             memory,
@@ -553,7 +638,10 @@ mod tests {
                     }\n";
         (
             conn,
-            vec![("src/a.rs", wrapper.to_string()), ("src/b.rs", open.to_string())],
+            vec![
+                ("src/a.rs", wrapper.to_string()),
+                ("src/b.rs", open.to_string()),
+            ],
         )
     }
 

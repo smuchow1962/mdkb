@@ -331,17 +331,26 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         Some(&ctx.conn),
                         &ctx.config_path,
                         &mdkb::core::dup::DupOverrides {
-                            file: file.clone().or_else(|| {
-                                (!query.is_empty()).then(|| query.clone())
-                            }),
+                            file: file
+                                .clone()
+                                .or_else(|| (!query.is_empty()).then(|| query.clone())),
                             ..Default::default()
                         },
                     )?;
                     print!("{}", report.markdown);
                 }
+                Some("coupling") => {
+                    // Same shape as `duplicates` above: a sweep, not a query,
+                    // so there is nothing to pass the query text to.
+                    let report = mdkb::core::coupling::handle_coupling(
+                        &cwd,
+                        &mdkb::core::coupling::CouplingOverrides::default(),
+                    )?;
+                    print!("{}", report.markdown);
+                }
                 Some(invalid) => {
                     eprintln!(
-                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols, duplicates. Omit for docs+memory.",
+                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols, duplicates, coupling. Omit for docs+memory.",
                         invalid
                     );
                     std::process::exit(1);
@@ -352,6 +361,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             threshold,
             min_nodes,
             file,
+            since,
         } => {
             // Read-only, and tolerant of a repository nobody has indexed: the
             // report says so and exits 0. An audit that has nothing to audit is
@@ -365,6 +375,24 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     threshold,
                     min_nodes,
                     file,
+                    since,
+                },
+            )?;
+            print!("{}", report.markdown);
+        }
+        Command::Coupling {
+            min_cochanges,
+            since,
+            git_ref,
+        } => {
+            // Read-only, and tolerant the same way `dup` is: a repository with
+            // no index, or no history to read, is reported and exits 0.
+            let report = mdkb::core::coupling::handle_coupling(
+                &cwd,
+                &mdkb::core::coupling::CouplingOverrides {
+                    min_cochanges,
+                    since,
+                    git_ref,
                 },
             )?;
             print!("{}", report.markdown);

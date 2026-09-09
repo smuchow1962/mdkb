@@ -21,6 +21,8 @@ pub struct DupOverrides {
     pub threshold: Option<f32>,
     pub min_nodes: Option<u32>,
     pub file: Option<String>,
+    /// Review mode: a git ref whose changed files the report is narrowed to.
+    pub since: Option<String>,
 }
 
 /// The audit, ready to print.
@@ -85,12 +87,21 @@ pub fn handle_dup(
     let dup = DupDb::open(root.join(".mdkb/dup.sqlite"))
         .map_err(|e| Error::other(format!("cannot open the duplication cache: {e}")))?;
 
+    // A ref git cannot resolve is an error here, not an empty report: an empty
+    // report reads as "your change duplicated nothing", which is the one
+    // answer a typo must never be able to produce.
+    let changed = match &overrides.since {
+        Some(git_ref) => Some(crate::git::changed_files(root, git_ref)?.into_iter().collect()),
+        None => None,
+    };
+
     let settings = &config.code.duplication;
     let options = DupOptions {
         min_nodes: overrides.min_nodes.unwrap_or(settings.min_nodes),
         hamming_threshold: settings.hamming_threshold,
         similarity_threshold: overrides.threshold.unwrap_or(settings.similarity_threshold),
         file: overrides.file.clone(),
+        changed,
         ..DupOptions::default()
     };
 
@@ -125,12 +136,8 @@ pub fn handle_dup(
 
     let markdown = render(&outcome.clusters, &mut |candidate| {
         let source = read_indexed(&repo, &candidate.file_path)?;
-        crate::code::duplication::body::body_text(
-            &source,
-            candidate.line_start,
-            candidate.line_end,
-        )
-        .map(str::to_string)
+        crate::code::duplication::body::body_text(&source, candidate.line_start, candidate.line_end)
+            .map(str::to_string)
     });
 
     Ok(DupReport {
@@ -162,12 +169,21 @@ mod tests {
     fn a_repository_with_no_code_index_is_reported_not_refused() {
         let root = tempfile::tempdir().unwrap();
 
-        let report = handle_dup(root.path(), None, &Config::default(), &DupOverrides::default())
-            .unwrap();
+        let report = handle_dup(
+            root.path(),
+            None,
+            &Config::default(),
+            &DupOverrides::default(),
+        )
+        .unwrap();
 
         assert!(!report.indexed);
         assert_eq!(report.clusters, 0);
-        assert!(report.markdown.contains("No code index"), "{}", report.markdown);
+        assert!(
+            report.markdown.contains("No code index"),
+            "{}",
+            report.markdown
+        );
         assert!(
             report.markdown.contains("mdkb code index"),
             "and says what to do about it: {}",
@@ -199,8 +215,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         empty_index(root.path());
 
-        let report =
-            handle_dup(root.path(), None, &structural_only(), &DupOverrides::default()).unwrap();
+        let report = handle_dup(
+            root.path(),
+            None,
+            &structural_only(),
+            &DupOverrides::default(),
+        )
+        .unwrap();
 
         // The file exists — `mdkb init` made it — so existence cannot be the
         // test. "No clusters found" here would answer a question nobody asked.
@@ -231,8 +252,13 @@ mod tests {
         .unwrap();
         drop(code);
 
-        let report =
-            handle_dup(root.path(), None, &structural_only(), &DupOverrides::default()).unwrap();
+        let report = handle_dup(
+            root.path(),
+            None,
+            &structural_only(),
+            &DupOverrides::default(),
+        )
+        .unwrap();
 
         assert!(report.indexed, "{}", report.markdown);
         assert_eq!(report.clusters, 0);
@@ -252,6 +278,7 @@ mod tests {
             threshold: Some(0.9),
             min_nodes: Some(3),
             file: Some("src/a.rs".into()),
+            since: None,
         };
 
         let options = DupOptions {
@@ -267,7 +294,10 @@ mod tests {
         assert_eq!(options.file.as_deref(), Some("src/a.rs"));
         // And an option left off keeps the configured value.
         let none = DupOverrides::default();
-        assert_eq!(none.min_nodes.unwrap_or(settings.min_nodes), settings.min_nodes);
+        assert_eq!(
+            none.min_nodes.unwrap_or(settings.min_nodes),
+            settings.min_nodes
+        );
     }
 
     #[test]

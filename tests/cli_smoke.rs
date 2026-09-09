@@ -254,6 +254,84 @@ fn smoke_dup_without_a_code_index() {
     );
 }
 
+/// Review mode's one failure that must never be silent.
+///
+/// An empty duplication report reads as "your change duplicated nothing". A
+/// ref git cannot resolve must therefore be an error, not an empty report —
+/// otherwise a typo in the ref is indistinguishable from a clean review.
+///
+/// The repository is indexed first on purpose: without an index `dup` reports
+/// that instead, and this test would pass for the wrong reason.
+#[test]
+fn smoke_dup_since_an_unknown_ref_fails_rather_than_reporting_nothing() {
+    let repo = Repo::new();
+    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+
+    let out = run(&["dup", "--since", "no-such-ref-anywhere"], &repo.root);
+
+    assert!(
+        !out.status.success(),
+        "an unresolvable ref must not report an empty audit: {}",
+        stdout(&out)
+    );
+}
+
+/// A ref beginning with `-` never reaches git.
+///
+/// On this surface clap refuses it first, which is the outer of two guards;
+/// the inner one — `reject_option_like_ref`, which protects the MCP path where
+/// no argument parser is involved — is pinned by the unit tests in `git.rs`.
+#[test]
+fn smoke_dup_since_rejects_an_option_like_ref() {
+    let repo = Repo::new();
+    let out = run(&["dup", "--since", "--upload-pack=evil"], &repo.root);
+    assert!(!out.status.success(), "must refuse: {}", stdout(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--upload-pack"),
+        "and must name what it refused: {stderr}"
+    );
+}
+
+/// `mdkb coupling` before anyone ran `mdkb code index`.
+///
+/// Same contract as `dup`: nothing to correlate is not a failure. The tempdir
+/// is not a git repository either, so this also pins that a missing history
+/// exits 0 rather than surfacing git's own error.
+#[test]
+fn smoke_coupling_without_a_code_index() {
+    let repo = Repo::new();
+    let out = run(&["coupling"], &repo.root);
+    assert_ok(&out, "coupling without a code index");
+    let text = stdout(&out);
+    assert!(text.contains("Hidden Coupling"), "coupling said: {text}");
+    assert!(
+        text.contains("No code index") || text.contains("No git history"),
+        "and must name what is missing: {text}"
+    );
+}
+
+/// The three overrides must reach the handler, not just parse. A bad `--ref`
+/// is the one that proves it: the default path never names a revision, so an
+/// unreachable one can only fail if the flag was actually threaded through.
+#[test]
+fn smoke_coupling_accepts_its_overrides() {
+    let repo = Repo::new();
+    let out = run(
+        &[
+            "coupling",
+            "--min-cochanges",
+            "3",
+            "--since",
+            "1 year ago",
+            "--ref",
+            "HEAD",
+        ],
+        &repo.root,
+    );
+    assert_ok(&out, "coupling with every override");
+}
+
 /// The scope spelling is the same audit as the subcommand, on the CLI too —
 /// `search --scope duplicates` exists because that is how MCP asks for it.
 #[test]
@@ -1288,6 +1366,7 @@ fn smoke_help_all_subcommands() {
         &["embed", "--help"],
         &["search", "--help"],
         &["dup", "--help"],
+        &["coupling", "--help"],
         &["get", "--help"],
         &["mget", "--help"],
         &["stats", "--help"],
