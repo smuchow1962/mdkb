@@ -461,6 +461,18 @@ fn smoke_collection_add_remove() {
     let out = run(&["collection", "rename", "notes", "notes2"], &repo.root);
     assert_ok(&out, "collection rename");
 
+    let out = run(
+        &["collection", "update", "notes2", "-p", "**/*.markdown"],
+        &repo.root,
+    );
+    assert_ok(&out, "collection update");
+    let listed = run(&["collection", "list"], &repo.root);
+    assert!(
+        stdout(&listed).contains("**/*.markdown"),
+        "collection update must change the stored pattern, got: {}",
+        stdout(&listed)
+    );
+
     let out = run(&["collection", "remove", "notes2"], &repo.root);
     assert_ok(&out, "collection remove");
 }

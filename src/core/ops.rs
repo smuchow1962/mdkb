@@ -717,6 +717,13 @@ pub fn handle_vsearch(
     limit: usize,
     collection: Option<&str>,
 ) -> Result<Vec<SearchResult>> {
+    // An empty query has no meaning to rank against: embedding it would return
+    // whichever documents happen to sit nearest the empty string. The FTS paths
+    // answer the same input with no rows, so this one does too.
+    if query_text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
     // Use cached service to avoid reloading
     let service = crate::llm::get_cached_service()?;
 

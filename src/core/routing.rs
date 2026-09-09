@@ -56,6 +56,7 @@ pub fn routing_for(command: &Command) -> Routing {
         Command::Collection(c) => match c {
             CollectionCommand::List => Routing::Read,
             CollectionCommand::Add { .. }
+            | CollectionCommand::Update { .. }
             | CollectionCommand::Remove { .. }
             | CollectionCommand::Rename { .. } => Routing::Mutation,
         },
@@ -190,6 +191,15 @@ pub fn mutation_request(
                 path,
                 pattern,
             } => M::CollectionAdd {
+                name: name.clone(),
+                path: path.clone(),
+                pattern: pattern.clone(),
+            },
+            CollectionCommand::Update {
+                name,
+                pattern,
+                path,
+            } => M::CollectionUpdate {
                 name: name.clone(),
                 path: path.clone(),
                 pattern: pattern.clone(),

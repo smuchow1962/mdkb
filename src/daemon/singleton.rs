@@ -100,7 +100,11 @@ pub fn acquire_singleton_lock(path: &Path) -> Result<LockGuard, AcquireError> {
             file,
             path: path.to_path_buf(),
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(AcquireError::AlreadyHeld),
+        // Same classifier as the store's live-lock probe: contention is a
+        // platform-specific error code, not one kind (see `is_lock_contention`).
+        Err(e) if crate::store::mutation_lock::is_lock_contention(&e) => {
+            Err(AcquireError::AlreadyHeld)
+        }
         Err(e) => Err(AcquireError::Io(e)),
     }
 }

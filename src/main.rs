@@ -19,7 +19,8 @@ use mdkb::cli::CodeCommand;
 use mdkb::cli::daemon as daemon_cli;
 use mdkb::cli::handlers::{
     EmbedResult, EvolutionHistoryEntry, handle_collection_add, handle_collection_list,
-    handle_collection_remove, handle_collection_rename, handle_current, handle_embed,
+    handle_collection_remove, handle_collection_rename, handle_collection_update,
+    handle_current, handle_embed,
     handle_eval_judge, handle_eval_recall, handle_evolve_corrects, handle_evolve_extends,
     handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
@@ -32,7 +33,6 @@ use mdkb::cli::handlers::{
     handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_prune_sessions,
     handle_superseded_by, parse_retention_secs,
 };
-#[cfg(unix)]
 use mdkb::cli::hook_client;
 use mdkb::cli::hook_logic;
 use mdkb::cli::journal::JournalImportResult;
@@ -68,11 +68,53 @@ fn main() -> Result<()> {
     } else {
         tokio::runtime::Builder::new_current_thread()
     };
-    let rt = builder
-        .enable_all()
-        .build()
-        .map_err(|e| mdkb::Error::other(format!("build tokio runtime: {e}")))?;
-    rt.block_on(run())
+    run_on_sized_stack(move || {
+        let rt = builder
+            .enable_all()
+            .build()
+            .map_err(|e| mdkb::Error::other(format!("build tokio runtime: {e}")))?;
+        rt.block_on(run())
+    })
+}
+
+/// Stack for the thread every invocation actually runs on.
+///
+/// The main thread's stack is sized by the platform, not by this program:
+/// 8 MiB on Linux and macOS, 1 MiB on Windows (the MSVC linker default).
+/// Measured on macOS aarch64 debug (2026-09-08): building the clap command
+/// tree needs between 768 KiB and 896 KiB on its own — and every invocation
+/// builds it, in `Cli::parse_args`, with `mdkb schema` building it a second
+/// time on top of the `run_cli` frame. That fits under 8 MiB with room to
+/// spare and sits on the 1 MiB Windows budget, which is why debug builds of
+/// `mdkb schema` aborted there with 0xC00000FD while release builds — whose
+/// frames are far smaller — survived (issue #6).
+///
+/// The recursive `command_to_json` walk was the suspect; it is not. The same
+/// measurement shows it adds nothing detectable on top of the clap build, so
+/// rewriting it iteratively would have fixed nothing.
+///
+/// 8 MiB is what Unix already handed us, so sizing the stack here changes no
+/// platform's behavior — it only stops the platform from deciding.
+const WORK_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Run `work` on a thread with [`WORK_STACK_BYTES`] of stack, returning its
+/// result.
+///
+/// A panic inside `work` is re-raised here rather than converted, so the
+/// process still aborts with the usual panic output and exit code instead of
+/// reporting a thread-plumbing error in its place.
+fn run_on_sized_stack<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("mdkb-main".to_string())
+        .stack_size(WORK_STACK_BYTES)
+        .spawn(work)
+        .map_err(|e| mdkb::Error::other(format!("spawn worker thread: {e}")))?
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
 
 /// True iff the invocation is a long-lived server (`serve` or `mcp`) that
@@ -228,6 +270,22 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 } => {
                     handle_collection_add(&ctx, &name, &path, &pattern)?;
                     println!("Added collection '{name}'");
+                }
+                CollectionCommand::Update {
+                    name,
+                    pattern,
+                    path,
+                } => {
+                    let updated = handle_collection_update(
+                        &ctx,
+                        &name,
+                        path.as_deref(),
+                        pattern.as_deref(),
+                    )?;
+                    println!(
+                        "{}",
+                        collection_updated_line(&name, &updated.path, &updated.pattern)
+                    );
                 }
                 CollectionCommand::Remove { name } => {
                     if handle_collection_remove(&ctx, &name)? {
@@ -1298,7 +1356,6 @@ MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<n
             DaemonCommand::Restart => daemon_cli::handle_restart().await?,
         },
         Command::Hook(hook_cmd) => {
-            #[cfg(unix)]
             match hook_cmd {
                 HookCommand::SessionStart => dispatch_hook("hook.session_start").await?,
                 HookCommand::UserPromptSubmit => dispatch_hook("hook.user_prompt_submit").await?,
@@ -1335,13 +1392,6 @@ MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<n
                     hook_client::call_status(root).await?;
                 }
             }
-            #[cfg(not(unix))]
-            {
-                let _ = hook_cmd;
-                return Err(mdkb::Error::other(
-                    "Hook commands require Unix domain sockets",
-                ));
-            }
         }
     }
 
@@ -1354,7 +1404,6 @@ MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<n
 /// live here once: `None` from the resolver means no directory here may hold a
 /// store (a container of repos, or `$HOME`), and `.mdkbignore` is the repo's own
 /// opt-out. Either way the hook exits quietly — hosts require exit 0.
-#[cfg(unix)]
 async fn dispatch_hook(method: &str) -> Result<()> {
     let input = hook_logic::read_stdin_best_effort();
     let event = hook_logic::parse_event(&input);
@@ -1747,6 +1796,10 @@ fn print_routed_result(
             Command::Collection(CollectionCommand::Rename { old_name, new_name }),
             R::CollectionRenamed,
         ) => println!("Renamed collection '{old_name}' to '{new_name}'"),
+        (
+            Command::Collection(CollectionCommand::Update { name, .. }),
+            R::CollectionUpdated { path, pattern },
+        ) => println!("{}", collection_updated_line(name, path, pattern)),
         (Command::Memory(MemoryCommand::Add { id, .. }), R::MemoryAdded) => {
             println!("Added memory entry '{id}'");
         }
@@ -3688,9 +3741,9 @@ async fn run_daemon() -> Result<()> {
     }
 
     // Wait for SIGINT or SIGTERM, or for the self-retirement above.
+    let mut signals = ShutdownSignals::install()?;
     tokio::select! {
-        r = wait_for_shutdown_signal() => {
-            r?;
+        _ = signals.next() => {
             tracing::info!("mdkb daemon received shutdown signal");
         }
         () = shutdown.cancelled() => {
@@ -3699,6 +3752,25 @@ async fn run_daemon() -> Result<()> {
     }
 
     shutdown.cancel();
+
+    // Draining a long mutation can take minutes, and tokio never unregisters a
+    // signal handler — the default "terminate now" disposition does not come
+    // back after the first signal, so a second one has to be handled here or it
+    // goes nowhere and SIGKILL is the operator's only remaining option.
+    //
+    // It has to end the process, not merely stop the wait: `Runtime::drop` waits
+    // for `spawn_blocking` work that already started, which is the very write
+    // being interrupted. SQLite's WAL makes that safe — an interrupted writer is
+    // recovered on the next open, exactly as after a SIGKILL — so the honest
+    // action is to unlink what shutdown would have unlinked and exit.
+    let exit_base = base_dir.clone();
+    tokio::spawn(async move {
+        let signum = signals.next().await;
+        tracing::warn!("mdkb daemon received a second signal; exiting without finishing the write");
+        ipc_server::unlink_sockets(&exit_base);
+        std::process::exit(128 + signum);
+    });
+
     let served = match ipc_task.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(mdkb::Error::other(format!("ipc server: {e}"))),
@@ -3715,6 +3787,17 @@ async fn run_daemon() -> Result<()> {
 fn stdin_is_not_tty() -> bool {
     use std::io::IsTerminal;
     !std::io::stdin().is_terminal()
+}
+
+/// What `mdkb collection update` reports, for the direct and the daemon-routed
+/// path alike.
+///
+/// The new path and pattern are echoed because the command takes either flag on
+/// its own: printing only what was passed would leave the operator guessing
+/// what the collection now covers. The reminder to re-run `update` is the one
+/// non-obvious step — the row changed, the index has not.
+fn collection_updated_line(name: &str, path: &str, pattern: &str) -> String {
+    format!("Updated collection '{name}' -> {path}, {pattern} (run `mdkb update` to reconcile)")
 }
 
 /// Serialize a clap `Command` into a machine-readable JSON description
@@ -3746,28 +3829,47 @@ fn command_to_json(cmd: &clap::Command) -> serde_json::Value {
     })
 }
 
-/// Wait for the first of SIGINT or SIGTERM.
+/// The process shutdown signals, kept alive past the first one.
+///
+/// Tokio never unregisters a signal handler once installed, so the default
+/// "terminate now" disposition does not come back after the first SIGINT. An
+/// operator whose second Ctrl-C is swallowed can only stop a draining daemon
+/// with SIGKILL — so the second signal has to be awaited explicitly here and
+/// turned into an abort for `ipc_server::serve`'s drain.
+/// Gated with `run_daemon`, its only caller: the daemon is a unix-socket
+/// singleton, so there is no process to signal off Unix.
 #[cfg(unix)]
-async fn wait_for_shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
+struct ShutdownSignals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+/// Signal numbers, kept so a second one can exit with the code a shell expects
+/// (`128 + signum`) instead of inventing one.
+#[cfg(unix)]
+const SIGINT: i32 = 2;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn install() -> Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate())
-            .map_err(|e| mdkb::Error::other(format!("sigterm handler: {e}")))?;
-        let mut int = signal(SignalKind::interrupt())
-            .map_err(|e| mdkb::Error::other(format!("sigint handler: {e}")))?;
-        tokio::select! {
-            _ = term.recv() => {},
-            _ = int.recv() => {},
-        }
-        Ok(())
+        Ok(Self {
+            term: signal(SignalKind::terminate())
+                .map_err(|e| mdkb::Error::other(format!("sigterm handler: {e}")))?,
+            int: signal(SignalKind::interrupt())
+                .map_err(|e| mdkb::Error::other(format!("sigint handler: {e}")))?,
+        })
     }
 
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(|e| mdkb::Error::other(format!("signal handler: {e}")))
+    /// Wait for the next SIGINT or SIGTERM, returning which arrived. May be
+    /// awaited repeatedly — that is the point of holding the streams.
+    async fn next(&mut self) -> i32 {
+        tokio::select! {
+            _ = self.term.recv() => SIGTERM,
+            _ = self.int.recv() => SIGINT,
+        }
     }
 }
 
@@ -3919,5 +4021,33 @@ mod tests {
             err.to_string().contains("--socket"),
             "error must name the flag that selected the proxy: {err}"
         );
+    }
+
+    /// Burn `frames` stack frames of 64 KiB each, defeating optimization so the
+    /// frames are really allocated. Returns the depth reached.
+    // The large stack array is the measurement, not an oversight: moving it to
+    // the heap would leave the frames empty and the test would prove nothing.
+    #[allow(clippy::large_stack_arrays)]
+    fn burn_stack(frames: usize) -> usize {
+        let mut block = [0u8; 64 * 1024];
+        std::hint::black_box(&mut block);
+        if frames == 0 { 0 } else { 1 + burn_stack(frames - 1) }
+    }
+
+    #[test]
+    fn the_work_thread_has_more_stack_than_any_platform_default_guarantees() {
+        // Proves: `run_on_sized_stack` really hands the work a stack of its own
+        // size, not whichever one the thread it was called from happened to
+        // have. 4 MiB is over Windows' 1 MiB main-thread default and over the
+        // 2 MiB Rust gives a spawned thread — including the harness thread this
+        // test runs on — so the same recursion outside the helper would abort.
+        //
+        // Issue #6: debug builds of `mdkb schema` died at 0xC00000FD on
+        // Windows because the platform, not this program, sized the stack the
+        // clap builder ran on. Deleting the helper makes this test abort on
+        // every platform, which is the point of measuring it here rather than
+        // trusting one host's default.
+        let depth = crate::run_on_sized_stack(|| Ok(burn_stack(64))).unwrap();
+        assert_eq!(depth, 64, "the whole 4 MiB recursion must complete");
     }
 }

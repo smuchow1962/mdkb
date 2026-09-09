@@ -451,9 +451,58 @@ fn update_all_collections(
     result: &mut UpdateResult,
 ) -> Result<()> {
     for coll in collections {
-        update_collection(ctx, root, config, coll, force, result)?;
+        update_collection(ctx, root, config, coll, collections, force, result)?;
     }
     Ok(())
+}
+
+/// A collection registered on a directory strictly inside `outer`'s, paired
+/// with its compiled pattern.
+///
+/// One file belongs to one collection: the most specific path wins. Without
+/// this the `_root` convention — `**/*.md` from the project root — would index
+/// every document `docs/` already holds a second time, and each would appear
+/// twice in every search result. That is the regression that made `_root`
+/// non-recursive in the first place; the rule replaces the workaround, so a
+/// fresh project indexes its whole tree (issue #8) and a hand-registered
+/// `mdkb collection add notes notes/` no longer duplicates into `_root`
+/// either.
+///
+/// Equal paths do not qualify. Two collections deliberately registered on the
+/// same directory with different patterns are the user's own arrangement, and
+/// neither of them is the more specific one.
+struct NarrowerCollection {
+    base: PathBuf,
+    matcher: globset::GlobMatcher,
+}
+
+fn narrower_collections(
+    root: &Path,
+    outer: &Collection,
+    all: &[Collection],
+) -> Vec<NarrowerCollection> {
+    let outer_base = root.join(&outer.path);
+    all.iter()
+        .filter(|other| other.name != outer.name)
+        .filter_map(|other| {
+            let base = root.join(&other.path);
+            // Strictly inside: a path equal to the outer one is not narrower.
+            if base == outer_base || !base.starts_with(&outer_base) {
+                return None;
+            }
+            let matcher = compile_collection_matcher(&other.pattern).ok()?;
+            Some(NarrowerCollection { base, matcher })
+        })
+        .collect()
+}
+
+/// Whether `path` is already claimed by a collection rooted deeper than the one
+/// currently walking.
+fn claimed_by_a_narrower_collection(path: &Path, narrower: &[NarrowerCollection]) -> bool {
+    narrower.iter().any(|other| {
+        path.strip_prefix(&other.base)
+            .is_ok_and(|rel| other.matcher.is_match(rel))
+    })
 }
 /// Update a single collection by scanning for file changes.
 fn update_collection(
@@ -461,6 +510,7 @@ fn update_collection(
     root: &Path,
     config: &Config,
     collection: &Collection,
+    all_collections: &[Collection],
     force: bool,
     result: &mut UpdateResult,
 ) -> Result<()> {
@@ -521,6 +571,7 @@ fn update_collection(
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+    let narrower = narrower_collections(root, collection, all_collections);
     let discovered = walk_files(
         WalkOptions {
             root: &base_path,
@@ -529,9 +580,10 @@ fn update_collection(
         },
         |path| {
             // Accept any file whose path relative to base_path matches the
-            // collection's glob pattern.
+            // collection's glob pattern and that no collection rooted deeper
+            // already owns.
             match path.strip_prefix(&base_path) {
-                Ok(rel) => glob.is_match(rel),
+                Ok(rel) => glob.is_match(rel) && !claimed_by_a_narrower_collection(path, &narrower),
                 Err(_) => false,
             }
         },
@@ -855,20 +907,35 @@ pub(crate) fn index_specified_files(
             continue;
         }
 
-        // Find which collection this file belongs to
-        let matched = matchers.iter().find_map(|(coll, matcher, canonical_base)| {
-            let relative = canonical_file
-                .strip_prefix(canonical_base)
-                .ok()?
-                .to_string_lossy()
-                .to_string();
+        // Find which collection this file belongs to.
+        //
+        // The most specific base path wins, matching the rule the full walk
+        // applies (`claimed_by_a_narrower_collection`). Taking the first match
+        // instead would hand `docs/guide.md` to whichever of `docs` and the
+        // repo-wide `_root` happened to be listed first, so `mdkb update
+        // --files` and a full `mdkb update` could disagree about the same file
+        // and index it under two collections over time.
+        //
+        // Two collections rooted at the same path are a misconfiguration that
+        // depth cannot settle; the lower name wins so the answer is at least the
+        // same on every run rather than following the listing order.
+        let matched = matchers
+            .iter()
+            .filter_map(|(coll, matcher, canonical_base)| {
+                let relative = canonical_file
+                    .strip_prefix(canonical_base)
+                    .ok()?
+                    .to_string_lossy()
+                    .to_string();
 
-            if matcher.is_match(&relative) {
-                Some((*coll, relative))
-            } else {
-                None
-            }
-        });
+                matcher
+                    .is_match(&relative)
+                    .then(|| (canonical_base.as_os_str().len(), *coll, relative))
+            })
+            .max_by(|(a_len, a_coll, _), (b_len, b_coll, _)| {
+                a_len.cmp(b_len).then_with(|| b_coll.name.cmp(&a_coll.name))
+            })
+            .map(|(_, coll, relative)| (coll, relative));
 
         let Some((collection, relative)) = matched else {
             continue;

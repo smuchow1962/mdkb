@@ -5,6 +5,7 @@
 //! question; its default `SubstringJudge` is deterministic and API-free, with
 //! an LLM-backed judge pluggable as an alternate `Judge` impl.
 
+pub mod embedding_gap;
 pub mod fixture;
 pub mod judge;
 pub mod recall;

@@ -897,6 +897,9 @@ pub fn search_entries_by_type(
     limit: usize,
 ) -> Result<Vec<MemoryEntry>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
+    if crate::store::search::fts_query_is_empty(&fts_query) {
+        return Ok(Vec::new());
+    }
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
         "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at, m.due_at
@@ -933,6 +936,9 @@ pub fn search_entries_fts(
     fts_query: &str,
     limit: usize,
 ) -> Result<Vec<MemoryEntry>> {
+    if crate::store::search::fts_query_is_empty(fts_query) {
+        return Ok(Vec::new());
+    }
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
         "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at, m.due_at
@@ -966,6 +972,9 @@ fn bm25_search_with_rowid(
     fts_query: &str,
     limit: usize,
 ) -> Result<Vec<(i64, MemoryEntry)>> {
+    if crate::store::search::fts_query_is_empty(fts_query) {
+        return Ok(Vec::new());
+    }
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
         "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at, m.due_at
@@ -1141,6 +1150,13 @@ pub fn search_entries_hybrid_fts(
     recency_half_life_secs: i64,
 ) -> Result<Vec<MemoryEntry>> {
     use crate::store::{hybrid, vectors};
+
+    // An empty expression is not a query, so neither leg runs: the vector leg
+    // would otherwise rank the whole corpus against the embedding of an empty
+    // string and return arbitrary entries.
+    if crate::store::search::fts_query_is_empty(fts_query) {
+        return Ok(Vec::new());
+    }
 
     // BM25 search (get more for fusion)
     let bm25_results = bm25_search_with_rowid(conn, fts_query, limit * 2)?;
@@ -2071,6 +2087,69 @@ mod tests {
         assert_eq!(retrieved.tags, vec!["auth", "security"]);
         assert_eq!(retrieved.access_count, 1); // Incremented by get_entry
         assert_eq!(retrieved.expires_at, None); // No TTL
+    }
+
+    #[test]
+    fn empty_memory_query_returns_no_rows_instead_of_an_fts5_parser_error() {
+        // Issue #9, memory half: every MATCH site shares the contract — an
+        // expression with no terms matches nothing and raises nothing. The
+        // store holds one entry, so an empty result proves the guard rather
+        // than an empty index.
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        add_entry(
+            &conn,
+            &MemoryEntry {
+                id: "findable".to_string(),
+                title: "Findable entry".to_string(),
+                content: "content that a real query would match".to_string(),
+                entry_type: EntryType::Topic,
+                tags: vec![],
+                status: EntryStatus::Active,
+                created_at: now,
+                updated_at: now,
+                superseded_by: None,
+                access_count: 0,
+                last_accessed: None,
+                source_path: None,
+                confirmations: 0,
+                last_confirmed_at: None,
+                source_type: SourceType::UserStatement,
+                expires_at: None,
+                due_at: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            search_entries(&conn, "findable", 5).unwrap().len(),
+            1,
+            "control: a real term still matches"
+        );
+
+        for text in ["", "   ", "\t"] {
+            assert!(
+                search_entries(&conn, text, 5)
+                    .unwrap_or_else(|e| panic!("search_entries({text:?}) must not error: {e}"))
+                    .is_empty(),
+                "search_entries({text:?}) must match nothing"
+            );
+            assert!(
+                search_entries_by_type(&conn, text, "topic", 5)
+                    .unwrap_or_else(|e| panic!(
+                        "search_entries_by_type({text:?}) must not error: {e}"
+                    ))
+                    .is_empty(),
+                "search_entries_by_type({text:?}) must match nothing"
+            );
+            assert!(
+                search_entries_hybrid(&conn, text, None, 5, 0.0, 0)
+                    .unwrap_or_else(|e| panic!(
+                        "search_entries_hybrid({text:?}) must not error: {e}"
+                    ))
+                    .is_empty(),
+                "search_entries_hybrid({text:?}) must match nothing"
+            );
+        }
     }
 
     /// Byte-exact state of the FTS5 shadow table, so a rewrite is detectable

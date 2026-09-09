@@ -2,7 +2,8 @@
 
 pub mod daemon;
 pub mod handlers;
-#[cfg(unix)]
+// Portable: only the daemon socket transport inside is unix-gated. Hooks run
+// their work in-process everywhere else (issue #7).
 pub mod hook_client;
 pub mod hook_logic;
 pub mod journal;
@@ -556,6 +557,23 @@ pub enum CollectionCommand {
         /// Glob pattern for files
         #[arg(short, long, default_value = "**/*.md")]
         pattern: String,
+    },
+
+    /// Change a collection's path or pattern in place, without dropping it
+    Update {
+        /// Collection name
+        name: String,
+
+        /// New glob pattern for files (unchanged when omitted). Documents that
+        /// still match keep their index entry and embedding.
+        #[arg(short, long)]
+        pattern: Option<String>,
+
+        /// New path to directory (unchanged when omitted). Document paths are
+        /// stored against the old base, so the next `update` re-indexes and
+        /// re-embeds the collection's contents.
+        #[arg(long)]
+        path: Option<String>,
     },
 
     /// Remove a collection

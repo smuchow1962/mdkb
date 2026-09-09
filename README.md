@@ -383,6 +383,10 @@ mdkb graph neighbors project.md --depth 2    # adjacent entities, undirected
 mdkb graph path project.md guide.md          # shortest path between two entities
 ```
 
+**[docs/graph.md](docs/graph.md)** — how edges are created, how references
+resolve, what each query is for, and when to reach for the graph instead of
+search.
+
 ### Memory
 
 ```bash

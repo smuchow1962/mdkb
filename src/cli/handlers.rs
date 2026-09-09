@@ -12,7 +12,8 @@ pub use crate::core::code::{
 };
 pub use crate::core::graph::{
     CollectionInfo, handle_collection_add, handle_collection_list, handle_collection_remove,
-    handle_collection_rename, handle_evolve_corrects, handle_evolve_extends,
+    handle_collection_rename, handle_collection_update, handle_evolve_corrects,
+    handle_evolve_extends,
     handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_graph_backlinks, handle_graph_dangling, handle_graph_hubs, handle_graph_links,
     handle_graph_neighbors, handle_graph_path, handle_superseded_by,
@@ -820,6 +821,108 @@ mod tests {
     }
 
     #[test]
+    fn updating_a_pattern_keeps_the_documents_it_still_matches() {
+        // Issue #11: the only way to fix a wrong pattern was `remove` + `add`,
+        // and `documents.collection` cascades on delete — so correcting one
+        // glob threw away every indexed document and forced a full re-embed of
+        // the collection. In place, the rows survive and the next update
+        // reconciles: the newly matched file arrives, the rest is untouched.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::write(temp.path().join("README.md"), "# Root").unwrap();
+        std::fs::create_dir(temp.path().join("notes")).unwrap();
+        std::fs::write(temp.path().join("notes/idea.md"), "# Idea").unwrap();
+
+        handle_collection_add(&ctx, "papers", ".", "*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+        let before = documents::list_documents(&ctx.conn, "papers").unwrap();
+        assert_eq!(before.len(), 1, "the narrow pattern matched only the root");
+        let kept_id = before[0].id;
+
+        handle_collection_update(&ctx, "papers", None, Some("**/*.md")).unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        assert_eq!(
+            indexed_paths(&ctx, "papers"),
+            vec!["README.md".to_string(), "notes/idea.md".to_string()],
+            "the wider pattern must pick up the nested file"
+        );
+        assert!(
+            documents::list_documents(&ctx.conn, "papers")
+                .unwrap()
+                .iter()
+                .any(|d| d.id == kept_id),
+            "the already-indexed document must keep its row — a new id means it \
+             was dropped and re-created, which is the re-embed this avoids"
+        );
+    }
+
+    #[test]
+    fn moving_a_collections_path_re_indexes_it_rather_than_keeping_the_rows() {
+        // The counterpart to the test above, and the limit of what `collection
+        // update` saves. A document is keyed by its path *relative to the
+        // collection's base*, so moving the base does not carry the old rows
+        // over: only a name that happens to exist under both survives, and even
+        // then it now describes a different file. Everything else is reconciled
+        // away and the new base is indexed — and embedded — from scratch.
+        // Pinned here so the "keeps its documents" claim stays honest.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::create_dir(temp.path().join("old")).unwrap();
+        std::fs::write(temp.path().join("old/paper.md"), "# Paper").unwrap();
+        std::fs::create_dir(temp.path().join("new")).unwrap();
+        std::fs::write(temp.path().join("new/draft.md"), "# Draft").unwrap();
+
+        handle_collection_add(&ctx, "papers", "old", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+        assert_eq!(indexed_paths(&ctx, "papers"), vec!["paper.md".to_string()]);
+
+        handle_collection_update(&ctx, "papers", Some("new"), None).unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        assert_eq!(
+            indexed_paths(&ctx, "papers"),
+            vec!["draft.md".to_string()],
+            "the old base's document is reconciled away, not carried over"
+        );
+    }
+
+    #[test]
+    fn updating_a_collection_validates_its_new_path_and_pattern() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+        handle_collection_add(&ctx, "docs", "./docs", "**/*.md").unwrap();
+
+        assert!(
+            handle_collection_update(&ctx, "docs", Some("../secret"), None).is_err(),
+            "a retarget out of the root is the same traversal `add` refuses"
+        );
+        assert!(
+            handle_collection_update(&ctx, "docs", None, Some("[")).is_err(),
+            "an uncompilable glob must be refused here, not at the next update"
+        );
+        assert!(
+            handle_collection_update(&ctx, "missing", None, Some("**/*.md")).is_err(),
+            "there is nothing to update on a collection that is not registered"
+        );
+        assert!(
+            handle_collection_update(&ctx, "docs", None, None).is_err(),
+            "an update naming no field is a mistake, not a no-op success"
+        );
+
+        let unchanged = crate::store::collections::get_collection(&ctx.conn, "docs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.path, "./docs");
+        assert_eq!(unchanged.pattern, "**/*.md");
+    }
+
+    #[test]
     fn test_handle_collection_add_blocks_dotdot_traversal() {
         let temp = setup_temp_dir();
         handle_init(temp.path()).unwrap();
@@ -1586,6 +1689,152 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p.contains('/')),
             "_root '*.md' must be non-recursive — nested files leaked: {paths:?}"
+        );
+    }
+
+    /// Relative paths indexed under `collection`, sorted.
+    fn indexed_paths(ctx: &Context, collection: &str) -> Vec<String> {
+        let mut paths: Vec<String> = documents::list_documents(&ctx.conn, collection)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.relative_path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn a_fresh_project_indexes_markdown_below_the_root() {
+        // Issue #8: `init` registered the `_root` convention with `*.md`, so a
+        // repo whose markdown lives in subdirectories indexed almost nothing —
+        // 2 of 438 files in the report. The pattern is now `**/*.md`, the
+        // default everywhere else in the tool.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::write(temp.path().join("README.md"), "# Root").unwrap();
+        std::fs::create_dir_all(temp.path().join("reports/2026")).unwrap();
+        std::fs::write(temp.path().join("reports/2026/q1.md"), "# Q1").unwrap();
+
+        handle_update(&ctx, temp.path()).unwrap();
+
+        assert_eq!(
+            indexed_paths(&ctx, "_root"),
+            vec!["README.md".to_string(), "reports/2026/q1.md".to_string()],
+            "_root must index the whole markdown tree, not only its top level"
+        );
+    }
+
+    #[test]
+    fn a_document_belongs_to_the_collection_with_the_most_specific_path() {
+        // The other half of issue #8. `_root` covering `**/*.md` from the
+        // project root overlaps every collection registered below it, and
+        // indexing each independently put the same file in two collections —
+        // twice in every search result. That duplication is why `_root` was
+        // made non-recursive; the ownership rule replaces the workaround.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::write(temp.path().join("README.md"), "# Root").unwrap();
+        std::fs::create_dir(temp.path().join("docs")).unwrap();
+        std::fs::write(temp.path().join("docs/guide.md"), "# Guide").unwrap();
+
+        // `docs/` is a convention collection, registered by the update itself.
+        handle_update(&ctx, temp.path()).unwrap();
+
+        assert_eq!(
+            indexed_paths(&ctx, "docs"),
+            vec!["guide.md".to_string()],
+            "the nested collection keeps its own document"
+        );
+        assert_eq!(
+            indexed_paths(&ctx, "_root"),
+            vec!["README.md".to_string()],
+            "_root must not claim a document a deeper collection already owns"
+        );
+    }
+
+    #[test]
+    fn a_document_leaves_the_outer_collection_when_a_narrower_one_appears() {
+        // Registering a collection under a directory `_root` already indexed
+        // has to move those documents, not duplicate them: the outer walk stops
+        // discovering them and the reconcile pass removes the rows it left
+        // behind.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::create_dir(temp.path().join("notes")).unwrap();
+        std::fs::write(temp.path().join("README.md"), "# Root").unwrap();
+        std::fs::write(temp.path().join("notes/idea.md"), "# Idea").unwrap();
+
+        handle_update(&ctx, temp.path()).unwrap();
+        assert!(
+            indexed_paths(&ctx, "_root").contains(&"notes/idea.md".to_string()),
+            "before: _root owns it, because nothing narrower exists"
+        );
+
+        handle_collection_add(&ctx, "notes", "notes", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        assert_eq!(indexed_paths(&ctx, "notes"), vec!["idea.md".to_string()]);
+        assert_eq!(
+            indexed_paths(&ctx, "_root"),
+            vec!["README.md".to_string()],
+            "_root must release a document the new collection now owns"
+        );
+    }
+
+    #[test]
+    fn update_files_agrees_with_the_full_walk_about_who_owns_a_file() {
+        // `mdkb update --files` resolved a path by taking the FIRST collection
+        // whose pattern matched, which is registration order. With a repo-wide
+        // `_root` that made targeted and full updates disagree about the same
+        // file, so it could end up indexed under both over time.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::write(temp.path().join("README.md"), "# Root").unwrap();
+        std::fs::create_dir(temp.path().join("docs")).unwrap();
+        std::fs::write(temp.path().join("docs/guide.md"), "# Guide").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        handle_update_files(&ctx, temp.path(), &["docs/guide.md".to_string()]).unwrap();
+
+        assert_eq!(indexed_paths(&ctx, "docs"), vec!["guide.md".to_string()]);
+        assert_eq!(
+            indexed_paths(&ctx, "_root"),
+            vec!["README.md".to_string()],
+            "a targeted reindex must pick the same owner the full walk does"
+        );
+    }
+
+    #[test]
+    fn two_collections_at_the_same_depth_resolve_to_the_same_owner_every_run() {
+        // Depth cannot separate two collections rooted at the same path, so the
+        // rule needs a tie-break or `mdkb update --files` answers by registration
+        // order — the very thing the depth rule exists to stop.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::create_dir(temp.path().join("docs")).unwrap();
+        std::fs::write(temp.path().join("docs/guide.md"), "# Guide").unwrap();
+
+        // Registered in reverse alphabetical order, so listing order and name
+        // order disagree and the assertion can tell which one decided.
+        handle_collection_add(&ctx, "zeta", "docs", "**/*.md").unwrap();
+        handle_collection_add(&ctx, "alpha", "docs", "**/*.md").unwrap();
+
+        handle_update_files(&ctx, temp.path(), &["docs/guide.md".to_string()]).unwrap();
+
+        assert_eq!(indexed_paths(&ctx, "alpha"), vec!["guide.md".to_string()]);
+        assert!(
+            indexed_paths(&ctx, "zeta").is_empty(),
+            "a tie must be broken by name, not by the order collections were added"
         );
     }
 

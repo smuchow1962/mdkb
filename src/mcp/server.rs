@@ -1951,7 +1951,17 @@ const OOD_SCORE_THRESHOLD: f64 = 0.3;
 ///
 /// Returns `None` when results are strong enough to be useful.
 /// Returns a hint string when results are absent or weak — to be appended to output.
-pub(super) fn ood_hint(result_count: usize, top_score: Option<f64>) -> Option<&'static str> {
+pub(super) fn ood_hint(
+    query: &str,
+    result_count: usize,
+    top_score: Option<f64>,
+) -> Option<&'static str> {
+    // An empty query returns no rows by contract (it carries no term to match),
+    // so it lands here — where the generic advice is worse than none: it sends
+    // the caller to Grep for a query it never supplied.
+    if query.trim().is_empty() {
+        return Some("\n> The query is empty. Pass search terms — an empty query matches nothing.");
+    }
     if result_count == 0 {
         return Some(
             "\n> No results. mdkb is semantic search — it won't match literal strings. \
@@ -2204,9 +2214,27 @@ mod tests {
 
     #[test]
     fn test_ood_hint_zero_results() {
-        let hint = ood_hint(0, None);
+        let hint = ood_hint("rust async runtime", 0, None);
         assert!(hint.is_some());
         assert!(hint.unwrap().contains("No results"));
+    }
+
+    /// An empty query returns no rows by contract (issue #9), so it reaches the
+    /// zero-results branch — where the standard advice is actively wrong: it
+    /// tells the caller to reach for Grep over a query it never supplied.
+    #[test]
+    fn an_empty_query_is_named_as_such_instead_of_being_blamed_on_semantic_search() {
+        for query in ["", "   ", "\t\n"] {
+            let hint = ood_hint(query, 0, None).expect("an empty query must be reported");
+            assert!(
+                hint.contains("query is empty"),
+                "expected the empty-query hint for {query:?}, got: {hint}"
+            );
+            assert!(
+                !hint.contains("Grep"),
+                "an empty query must not be blamed on literal-string matching: {hint}"
+            );
+        }
     }
 
     #[test]
@@ -2240,13 +2268,13 @@ mod tests {
     #[test]
     fn test_ood_hint_zero_results_with_score() {
         // score is irrelevant when count is 0
-        let hint = ood_hint(0, Some(0.9));
+        let hint = ood_hint("rust async runtime", 0, Some(0.9));
         assert!(hint.is_some());
     }
 
     #[test]
     fn test_ood_hint_low_score() {
-        let hint = ood_hint(3, Some(0.1));
+        let hint = ood_hint("rust async runtime", 3, Some(0.1));
         assert!(hint.is_some());
         assert!(hint.unwrap().contains("Low-confidence"));
     }
@@ -2254,26 +2282,26 @@ mod tests {
     #[test]
     fn test_ood_hint_score_at_threshold_is_low() {
         // score exactly at threshold (< 0.3) → hint
-        let hint = ood_hint(1, Some(0.29));
+        let hint = ood_hint("rust async runtime", 1, Some(0.29));
         assert!(hint.is_some());
     }
 
     #[test]
     fn test_ood_hint_score_above_threshold_no_hint() {
-        let hint = ood_hint(3, Some(0.5));
+        let hint = ood_hint("rust async runtime", 3, Some(0.5));
         assert!(hint.is_none());
     }
 
     #[test]
     fn test_ood_hint_good_results_no_hint() {
-        let hint = ood_hint(5, Some(0.85));
+        let hint = ood_hint("rust async runtime", 5, Some(0.85));
         assert!(hint.is_none());
     }
 
     #[test]
     fn test_ood_hint_results_no_score_no_hint() {
         // memory search passes None score — only triggers on zero count
-        let hint = ood_hint(2, None);
+        let hint = ood_hint("rust async runtime", 2, None);
         assert!(hint.is_none());
     }
 
