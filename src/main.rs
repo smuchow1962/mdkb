@@ -464,7 +464,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             // Resolve the three facts here so the mode decision itself stays
             // a pure, unit-tested function (`resolve_mcp_run_mode`) — the
             // command arm only carries them across.
-            let no_daemon = std::env::var_os("MDKB_NO_DAEMON").is_some();
+            let no_daemon = !mdkb::core::routing::daemon_serves_this_process();
             match resolve_mcp_run_mode(no_daemon, cfg!(unix), socket)? {
                 McpRunMode::InProcess => {
                     // Same wire protocol as the proxy path; the only
@@ -1077,6 +1077,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} daemon status                                      # is it running, and against which store
 {0} daemon restart                                     # after upgrading the binary
 MDKB_NO_DAEMON=1 {0} <cmd>                             # run in-process instead, for debugging
+MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<name>/ instead; test runners get `test` unasked
 
 # Naming
 {0} surface                                            # each MCP tool next to its CLI equivalent
@@ -3584,6 +3585,15 @@ async fn run_daemon() -> Result<()> {
     use mdkb::mcp::dispatch::DispatchContext;
     use mdkb::metrics::UsageMetrics;
     use tokio_util::sync::CancellationToken;
+
+    // The daemon is the sole writer of the DEFAULT store for every process on
+    // the machine. Started from a test environment it would inherit the
+    // namespace and redirect everyone's writes into it.
+    if let Some(name) = mdkb::store::namespace::active()? {
+        return Err(mdkb::Error::other(format!(
+            "refusing to start the daemon in namespace '{name}': the daemon serves the default store only"
+        )));
+    }
 
     let lock_path = default_lock_path();
 

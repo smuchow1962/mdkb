@@ -17,6 +17,26 @@
   set a real run archives. Help text and the cheatsheet now describe what the
   command does rather than a guarantee it could not keep.
 
+### Added
+
+- **Store namespaces, so a consumer's test suite cannot pollute the store its
+  sessions warm up from.** `MDKB_NAMESPACE=<name>` points a process at
+  `.mdkb/namespaces/<name>/` — its own index, projection and locks — which no
+  read of the default store can see and the store-level `.gitignore` never
+  commits. A process carrying a test runner's marker (`NODE_TEST_CONTEXT`,
+  `VITEST`, `JEST_WORKER_ID`, `PYTEST_CURRENT_TEST`) is routed to the `test`
+  namespace without asking; `MDKB_NAMESPACE=default` opts back out. Namespaced
+  processes never use the daemon, and the daemon refuses to start in one. The
+  file watcher reconciles the projection of the store it opened, namespaced or
+  not. Motivated by three `wiz-bridge-test-<timestamp>` entries and a `retest-001`
+  found active in a live store.
+
+- **Warmup eligibility is an allow-list.** The pool admits topics, problems,
+  decisions and priors (the last only for the reserved confidence-gated slot).
+  Handoffs, reminders and net-refuted entries (`corrections > confirmations`)
+  never compete for a slot; the newest handoff and due reminders still arrive
+  through their own queries.
+
 ## 3.8.0 (2026-08-29)
 
 Seventy-two commits, most of them in the code index. 3.7.18 was prepared but

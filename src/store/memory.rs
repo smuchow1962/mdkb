@@ -1590,8 +1590,10 @@ fn due_reminder_lines(conn: &Connection, now: i64) -> Result<Vec<String>> {
 
 /// Warmup candidates as structured entries (priors INCLUDED) plus the
 /// pre-rendered due-reminder lines. Standard entries are ordered by
-/// `access_count DESC`, exclude reminders, and carry the confidence-relevant
-/// columns so callers can apply a confidence floor / reserved-prior policy.
+/// `access_count DESC`, admit only durable types and priors (never a
+/// reminder, a handoff or a net-refuted entry), and carry the
+/// confidence-relevant columns so callers can apply a confidence floor /
+/// reserved-prior policy.
 ///
 /// The hook layer ranks and truncates these; `get_warmup_index` formats the
 /// non-prior subset into the legacy string contract.
@@ -1667,15 +1669,22 @@ pub fn get_warmup_entries(
         .saturating_mul(WARMUP_POOL_FACTOR)
         .min(WARMUP_POOL_HARD_CAP);
 
-    let mut stmt = conn.prepare(
+    // Eligibility is an allow-list. Durable knowledge competes for the slots;
+    // a prior enters only for the reserved confidence-gated slot the ranker
+    // keeps for it. Reminders arrive through `due_reminder_lines`, the newest
+    // handoff through `newest_handoff_for_scope`, and an entry the record
+    // says is wrong (net-refuted) is not taught as if it were right.
+    let eligible = EntryType::sql_list(|t| t.is_durable() || *t == EntryType::Prior);
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
          FROM memory_entries
          WHERE status = 'active'
-         AND entry_type != 'reminder'
+         AND entry_type IN ({eligible})
+         AND corrections <= confirmations
          AND (expires_at IS NULL OR expires_at > ?2)
          ORDER BY access_count DESC
-         LIMIT ?1",
-    )?;
+         LIMIT ?1"
+    ))?;
 
     let entries: Vec<MemoryEntry> = stmt
         .query_map(params![pool as i64, now], row_to_entry)?
@@ -3402,6 +3411,41 @@ mod tests {
         assert_eq!(
             real,
             vec!["decision-expired".to_string(), "prior-old".to_string()]
+        );
+    }
+
+    /// Warmup slots are paid for on every turn of every session. Only durable
+    /// knowledge competes for them; a prior enters solely for the reserved
+    /// confidence-gated slot. Handoffs are injected by their own query,
+    /// reminders by the due list, and an entry the record says is wrong
+    /// (net-refuted) must not be taught as if it were right.
+    #[test]
+    fn warmup_pool_admits_only_durable_entries_and_priors() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let seed = |id: &str, entry_type: EntryType| {
+            seed_for_prune(&conn, id, entry_type, now, None, None, None);
+        };
+        seed("topic-ok", EntryType::Topic);
+        seed("problem-ok", EntryType::Problem);
+        seed("decision-ok", EntryType::Decision);
+        seed("prior-ok", EntryType::Prior);
+        seed("handoff-no", EntryType::Handoff);
+        seed("reminder-no", EntryType::Reminder);
+        seed("topic-refuted", EntryType::Topic);
+        conn.execute(
+            "UPDATE memory_entries SET confirmations = 1, corrections = 3 WHERE id = 'topic-refuted'",
+            [],
+        )
+        .unwrap();
+
+        let (_due, pool) = get_warmup_entries(&conn, 50).unwrap();
+        let mut ids: Vec<&str> = pool.iter().map(|e| e.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["decision-ok", "prior-ok", "problem-ok", "topic-ok"],
+            "handoffs, reminders and net-refuted entries never compete for a warmup slot"
         );
     }
 

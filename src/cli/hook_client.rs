@@ -239,7 +239,7 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
     params["root"] = json!(root.display().to_string());
     let daemon_required = hook_requires_daemon(&root);
 
-    if std::env::var_os("MDKB_NO_DAEMON").is_some() {
+    if !crate::core::routing::daemon_serves_this_process() {
         if daemon_required {
             tracing::warn!(
                 "hook {method}: MDKB_NO_DAEMON ignored because hooks.daemon_required is true"
@@ -344,7 +344,7 @@ async fn run(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<(
     };
     params["root"] = json!(root.display().to_string());
 
-    if std::env::var_os("MDKB_NO_DAEMON").is_some() {
+    if !crate::core::routing::daemon_serves_this_process() {
         return run_in_process(method, params, &root).await;
     }
 

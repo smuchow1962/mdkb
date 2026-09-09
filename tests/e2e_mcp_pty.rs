@@ -639,3 +639,83 @@ fn test_mcp_search_special_characters() {
         text
     );
 }
+
+// =============================================================================
+// Namespace Tests
+// =============================================================================
+
+/// A namespaced MCP session (`MDKB_NAMESPACE`, or a test runner's marker in the
+/// environment) writes to `.mdkb/namespaces/<name>/` and leaves the default
+/// store alone — index and projection both. The second half is the one that
+/// proves isolation: a consumer test that drives the MCP server must not be
+/// able to leave a row or a file the default store's sessions would warm up
+/// from.
+///
+/// An MCP write is DB-only; the projection is written by reconciliation (the
+/// daemon's watcher, `mdkb update`, or `mdkb memory sync`), so the test runs
+/// `memory sync` in the same namespace to materialize it.
+#[test]
+fn test_mcp_namespaced_session_projects_under_the_namespace_only() {
+    let mut harness = McpTestHarness::with_env(&[("MDKB_NAMESPACE", "test")]);
+    harness.initialize();
+
+    let write_result = harness.call_tool(
+        "memory_write",
+        json!({
+            "id": "namespaced-mcp-entry",
+            "title": "Namespaced MCP entry",
+            "content": "# Scratch\n\nWritten by a namespaced MCP session.",
+            "entry_type": "topic",
+            "tags": ["test"]
+        }),
+    );
+    assert!(
+        write_result["result"].is_object(),
+        "memory_write should succeed: {write_result}"
+    );
+
+    let cli = |args: &[&str], env: &[(&str, &str)]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"));
+        cmd.args(args)
+            .current_dir(&harness.root)
+            .env("MDKB_NO_DAEMON", "1");
+        for (key, val) in env {
+            cmd.env(key, val);
+        }
+        cmd.output().expect("spawn mdkb")
+    };
+
+    // Half one: the write is in the namespaced store and projects there.
+    let out = cli(&["memory", "sync"], &[("MDKB_NAMESPACE", "test")]);
+    assert!(out.status.success(), "namespaced memory sync must succeed");
+    let namespaced = harness
+        .root
+        .join(".mdkb/namespaces/test/memory/entries/namespaced-mcp-entry.md");
+    assert!(
+        namespaced.is_file(),
+        "projection must land in the namespaced store: {}",
+        namespaced.display()
+    );
+
+    // Half two: the default store — created by `init`, still present — holds
+    // neither the row nor the file.
+    let default_file = harness
+        .root
+        .join(".mdkb/memory/entries/namespaced-mcp-entry.md");
+    assert!(
+        !default_file.exists(),
+        "the default store's projection must stay untouched: {}",
+        default_file.display()
+    );
+    assert!(
+        harness.root.join(".mdkb/index.sqlite").is_file(),
+        "the default store still exists; the write simply never reached it"
+    );
+    let out = cli(&["memory", "list", "--format", "json"], &[]);
+    assert!(out.status.success(), "default memory list must succeed");
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !listed.contains("namespaced-mcp-entry"),
+        "the default index must not hold the namespaced row: {listed}"
+    );
+}

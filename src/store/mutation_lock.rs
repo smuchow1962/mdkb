@@ -169,8 +169,16 @@ pub fn acquire_writer(db_path: &Path, operation: &str) -> Result<MutationGuard> 
 }
 
 /// Admit a direct CLI writer using the same lock as daemon-owned writers.
+///
+/// The lock lives in the store the write goes to, so a namespaced writer never
+/// contends with — or is mistaken for — a writer on the default store. A
+/// namespace that does not exist yet is created here, because its first write
+/// is what brings it into being.
 pub fn acquire_direct_cli(root: &Path) -> Result<MutationGuard> {
-    let mdkb_dir = root.join(".mdkb");
+    let mdkb_dir = crate::store::namespace::store_dir(root)?;
+    if !mdkb_dir.is_dir() && crate::store::namespace::active()?.is_some() {
+        std::fs::create_dir_all(&mdkb_dir)?;
+    }
     if !mdkb_dir.is_dir() {
         return Err(ErrorKind::DatabaseNotFound {
             path: mdkb_dir.join("index.sqlite"),

@@ -16,12 +16,15 @@ use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::error::{Error, ErrorKind, Result};
-use crate::store::{schema, vectors};
+use crate::store::{namespace, schema, vectors};
 
 /// Context for CLI operations.
 pub struct Context {
     /// Database connection.
     pub conn: Connection,
+    /// Project root, the parent of `.mdkb/`. Held rather than derived from
+    /// `db_path`, because a namespaced store sits two levels deeper.
+    root: PathBuf,
     /// Config path.
     pub config_path: PathBuf,
     /// Database path.
@@ -194,9 +197,13 @@ impl Context {
     }
 
     fn open_impl(root: &Path, writer_admitted: bool) -> Result<Self> {
-        let mdkb_dir = root.join(".mdkb");
+        let mdkb_dir = namespace::store_dir(root)?;
 
-        if !mdkb_dir.exists() {
+        if namespace::active()?.is_some() {
+            // A namespace is created by its first write: nobody runs `init`
+            // for a scratch store. Idempotent, so an existing one is untouched.
+            ensure_store_layout(&mdkb_dir)?;
+        } else if !mdkb_dir.exists() {
             return Err(ErrorKind::DatabaseNotFound {
                 path: mdkb_dir.join("index.sqlite"),
             }
@@ -338,6 +345,7 @@ impl Context {
 
         Ok(Self {
             conn,
+            root: root.to_path_buf(),
             config_path,
             db_path,
             rebuilt_from_corruption,
@@ -371,7 +379,7 @@ impl Context {
     /// reader has no business renaming files underneath the daemon.
     pub fn open_read_only(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        let mdkb_dir = root.join(".mdkb");
+        let mdkb_dir = namespace::store_dir(root)?;
         if !mdkb_dir.exists() {
             return Err(ErrorKind::DatabaseNotFound {
                 path: mdkb_dir.join("index.sqlite"),
@@ -418,6 +426,7 @@ impl Context {
 
         Ok(Self {
             conn,
+            root: root.to_path_buf(),
             config_path,
             db_path,
             rebuilt_from_corruption: false,
@@ -459,12 +468,8 @@ impl Context {
     /// Initialize a new mdkb directory.
     pub fn init(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        let mdkb_dir = root.join(".mdkb");
-
-        // Create directory if needed
-        if !mdkb_dir.exists() {
-            std::fs::create_dir_all(&mdkb_dir)?;
-        }
+        let mdkb_dir = namespace::store_dir(root)?;
+        ensure_store_layout(&mdkb_dir)?;
 
         // Auto-init can be entered concurrently by several hook/MCP processes.
         // Derive every sidecar from the canonical store identity and serialize
@@ -479,14 +484,6 @@ impl Context {
         let db_path = mdkb_dir.join("index.sqlite");
         let _writer_guard = crate::store::mutation_lock::acquire_writer(&db_path, "init-schema")?;
         let _init_guard = crate::store::mutation_lock::acquire(&db_path, "init-schema")?;
-
-        // Create memory directories
-        let memory_dir = mdkb_dir.join("memory");
-        std::fs::create_dir_all(memory_dir.join("entries"))?;
-        std::fs::create_dir_all(memory_dir.join("archive"))?;
-        // Split the store into the derived part git must never see and the
-        // durable entry projection it should track.
-        ensure_store_gitignore(&memory_dir)?;
 
         // Create default config
         let config = Config::default();
@@ -507,6 +504,7 @@ impl Context {
 
         Ok(Self {
             conn,
+            root: root.to_path_buf(),
             config_path,
             db_path,
             rebuilt_from_corruption: false,
@@ -517,16 +515,24 @@ impl Context {
 
     /// Get the project root directory (parent of `.mdkb/`).
     pub fn root(&self) -> &Path {
-        self.db_path
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("db_path must be inside .mdkb/")
+        &self.root
     }
 
     /// Get the memory directory path.
     pub fn memory_dir(&self) -> PathBuf {
         self.db_path.parent().unwrap().join("memory")
     }
+}
+
+/// Create the directories a store needs before anything is written to it: the
+/// store itself, the memory projection and its archive, and the store-level
+/// `.gitignore` that splits the derived part git must never see from the
+/// durable entry projection it should track. Idempotent.
+fn ensure_store_layout(mdkb_dir: &Path) -> Result<()> {
+    let memory_dir = mdkb_dir.join("memory");
+    std::fs::create_dir_all(memory_dir.join("entries"))?;
+    std::fs::create_dir_all(memory_dir.join("archive"))?;
+    ensure_store_gitignore(&memory_dir)
 }
 
 /// An allow-list, not a deny-list: everything under the store is derived,

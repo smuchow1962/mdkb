@@ -11,8 +11,13 @@ fn bin() -> PathBuf {
 }
 
 fn run(args: &[&str], cwd: &Path) -> Output {
+    run_env(args, cwd, &[])
+}
+
+fn run_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Output {
     Command::new(bin())
         .args(args)
+        .envs(env.iter().copied())
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -99,6 +104,105 @@ impl Repo {
 
         Repo { _dir: dir, root }
     }
+}
+
+// ── Namespaces ──────────────────────────────────────────────────────
+
+/// Write one entry under `env`, then prove the default store never sees it
+/// while the namespaced store does. This is the whole contract: a consumer's
+/// test suite cannot pollute the store its sessions warm up from.
+fn assert_namespaced_write_is_invisible_to_the_default_store(env: &[(&str, &str)], id: &str) {
+    let repo = Repo::new();
+    let title = format!("Namespaced {id}");
+
+    let out = run_env(
+        &["memory", "add", id, "-t", &title, "-c", "throwaway"],
+        &repo.root,
+        env,
+    );
+    assert_ok(&out, "namespaced memory add");
+
+    // The write landed in its own store, under the project's .mdkb/.
+    assert!(
+        repo.root
+            .join(".mdkb/namespaces/test/index.sqlite")
+            .is_file(),
+        "namespaced write must create .mdkb/namespaces/test/index.sqlite"
+    );
+
+    // The default store is untouched: not listed, not warmed up, not shown.
+    for args in [
+        ["memory", "list", "--format", "json"].as_slice(),
+        ["memory", "warmup"].as_slice(),
+    ] {
+        let out = run(args, &repo.root);
+        assert_ok(&out, &format!("default-store `{}`", args.join(" ")));
+        assert!(
+            !stdout(&out).contains(id),
+            "default-store `{}` must not surface {id}: {}",
+            args.join(" "),
+            stdout(&out)
+        );
+    }
+    let out = run(&["memory", "show", id], &repo.root);
+    assert!(
+        !out.status.success(),
+        "default-store `memory show {id}` must not find a namespaced entry"
+    );
+    let out = run_env(
+        &["hook", "session-start"],
+        &repo.root,
+        &[("MDKB_NO_DAEMON", "1")],
+    );
+    assert_hook_output_valid(&out, "session-start");
+    assert!(
+        !stdout(&out).contains(id),
+        "SessionStart warmup must not surface a namespaced entry: {}",
+        stdout(&out)
+    );
+
+    // Reads under the same namespace see the entry, so the consumer's own
+    // round-trip test still passes.
+    let out = run_env(&["memory", "show", id], &repo.root, env);
+    assert_ok(&out, "namespaced memory show");
+    assert!(stdout(&out).contains(&title));
+}
+
+#[test]
+fn smoke_explicit_namespace_isolates_writes_from_the_default_store() {
+    assert_namespaced_write_is_invisible_to_the_default_store(
+        &[("MDKB_NAMESPACE", "test")],
+        "explicit-namespace-entry",
+    );
+}
+
+/// A consumer test suite does not opt in. `node --test` (the runner the wiz
+/// bridge tests use) marks its children with NODE_TEST_CONTEXT; mdkb reads that
+/// and routes the write to the test namespace on its own.
+#[test]
+fn smoke_test_runner_environment_selects_the_test_namespace_unasked() {
+    assert_namespaced_write_is_invisible_to_the_default_store(
+        &[("NODE_TEST_CONTEXT", "child-v8")],
+        "auto-namespace-entry",
+    );
+}
+
+#[test]
+fn smoke_namespace_name_is_validated() {
+    let repo = Repo::new();
+    let out = run_env(
+        &["memory", "add", "x", "-t", "x", "-c", "x"],
+        &repo.root,
+        &[("MDKB_NAMESPACE", "../escape")],
+    );
+    assert!(
+        !out.status.success(),
+        "a namespace that walks out of .mdkb/namespaces must be refused"
+    );
+    assert!(
+        !repo.root.join(".mdkb/escape").exists() && !repo.root.join("escape").exists(),
+        "a refused namespace must create nothing"
+    );
 }
 
 // ── Top-level commands ──────────────────────────────────────────────

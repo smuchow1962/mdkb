@@ -834,7 +834,7 @@ pub enum GetResult {
 /// Handle `mdkb init` command.
 pub fn handle_init(root: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
-    let mdkb_dir = root.join(".mdkb");
+    let mdkb_dir = crate::store::namespace::store_dir(root)?;
 
     if mdkb_dir.exists() {
         return Err(Error::other(format!(
