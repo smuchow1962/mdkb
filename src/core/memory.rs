@@ -240,7 +240,8 @@ pub fn handle_memory_rm(ctx: &Context, id: &str) -> Result<bool> {
     Ok(deleted)
 }
 /// Handle `mdkb memory prune` command.
-/// Archives entries not accessed within the given number of days.
+/// Archives expired entries and lifecycle entries unread for `days`; durable
+/// types are never archived for age (see `memory::prune_entries`).
 pub fn handle_memory_prune(ctx: &Context, days: u32, dry_run: bool) -> Result<Vec<String>> {
     let pruned = memory::prune_entries(&ctx.conn, days, dry_run)?;
     if !dry_run && !pruned.is_empty() {

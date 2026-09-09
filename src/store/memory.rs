@@ -279,6 +279,29 @@ impl EntryType {
         Self::Handoff,
     ];
 
+    /// Durable knowledge, as opposed to a lifecycle record.
+    ///
+    /// A topic, problem or decision stays true until something supersedes or
+    /// refutes it; its age says nothing about its worth, and `search` — the
+    /// dominant read path — deliberately never records an access, so absence of
+    /// a recorded access says nothing either. Only an explicit `expires_at`
+    /// retires one. A reminder, prior or handoff is about a moment, and age is
+    /// exactly the signal that retires it.
+    pub fn is_durable(&self) -> bool {
+        matches!(self, Self::Topic | Self::Problem | Self::Decision)
+    }
+
+    /// SQL `IN (...)` list of the wire names of every type for which `pred`
+    /// holds, so a query filtering on a type class cannot drift from the enum.
+    fn sql_list(pred: impl Fn(&EntryType) -> bool) -> String {
+        Self::ALL
+            .iter()
+            .filter(|t| pred(t))
+            .map(|t| format!("'{}'", t.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Wire/storage form of the entry type.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -1754,26 +1777,49 @@ fn archive_ids(conn: &Connection, ids: &[String], now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Prune entries not accessed in the given number of days.
-/// Marks entries as archived rather than deleting them.
-/// Returns the list of pruned entry IDs.
+/// Archive what the store no longer needs: every entry past its `expires_at`,
+/// plus lifecycle entries (reminder, prior, handoff) older than `days` that
+/// nothing has read since.
+///
+/// Durable types (topic, problem, decision) are never archived for age or
+/// absence of use. `search` does not record an access — `SearchMemoryConfig`
+/// keeps SELECT idempotent on purpose — so `last_accessed` is NULL for an
+/// entry consulted daily and an entry consulted never; a prune keyed on it
+/// would archive the most valuable knowledge in the store first. Only an
+/// explicit TTL retires them.
+///
+/// Two lifecycle exceptions: the newest handoff is the next session's thread
+/// (the same rule as `archive_expired`), and a reminder not yet past its
+/// `due_at` has simply not happened yet.
+///
+/// Archives rather than deletes. With `dry_run` nothing is written and the
+/// returned ids are exactly what a real run would archive.
 pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<String>> {
     let now = Utc::now().timestamp();
     let cutoff = now - (i64::from(days) * 24 * 60 * 60);
 
     conn.execute("SAVEPOINT prune_entries", [])?;
     let result = (|| -> Result<Vec<String>> {
-        let mut stmt = conn.prepare(
+        let lifecycle = EntryType::sql_list(|t| !t.is_durable());
+        let mut stmt = conn.prepare(&format!(
             r#"
             SELECT id FROM memory_entries
             WHERE status = 'active'
             AND (
-                (last_accessed IS NULL AND created_at < ?1)
-                OR (last_accessed IS NOT NULL AND last_accessed < ?1)
-                OR (expires_at IS NOT NULL AND expires_at < ?2)
+                (expires_at IS NOT NULL AND expires_at < ?2)
+                OR (
+                    entry_type IN ({lifecycle})
+                    AND COALESCE(last_accessed, created_at) < ?1
+                    AND (due_at IS NULL OR due_at < ?1)
+                    AND id IS NOT (
+                        SELECT id FROM memory_entries
+                        WHERE entry_type = 'handoff' AND status = 'active'
+                        ORDER BY updated_at DESC LIMIT 1
+                    )
+                )
             )
-            "#,
-        )?;
+            "#
+        ))?;
 
         let ids: Vec<String> = stmt
             .query_map(params![cutoff, now], |row| row.get(0))?
@@ -2925,6 +2971,7 @@ mod tests {
 
     #[test]
     fn test_prune_entries_stale_by_last_accessed() {
+        // Age retires lifecycle types only, so the stale entry is a prior.
         let conn = setup_db();
         let now = Utc::now().timestamp();
         let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
@@ -2934,7 +2981,7 @@ mod tests {
             id: "stale".to_string(),
             title: "Stale entry".to_string(),
             content: "Content".to_string(),
-            entry_type: EntryType::Problem,
+            entry_type: EntryType::Prior,
             tags: vec![],
             status: EntryStatus::Active,
             created_at: old_time,
@@ -2963,6 +3010,7 @@ mod tests {
 
     #[test]
     fn test_prune_entries_stale_by_created_at() {
+        // Age retires lifecycle types only, so the stale entry is a prior.
         let conn = setup_db();
         let now = Utc::now().timestamp();
         let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
@@ -2972,7 +3020,7 @@ mod tests {
             id: "never-used".to_string(),
             title: "Never used entry".to_string(),
             content: "Content".to_string(),
-            entry_type: EntryType::Decision,
+            entry_type: EntryType::Prior,
             tags: vec![],
             status: EntryStatus::Active,
             created_at: old_time,
@@ -2997,6 +3045,7 @@ mod tests {
 
     #[test]
     fn test_prune_entries_dry_run() {
+        // Age retires lifecycle types only, so the stale entry is a prior.
         let conn = setup_db();
         let now = Utc::now().timestamp();
         let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
@@ -3005,7 +3054,7 @@ mod tests {
             id: "stale-dry".to_string(),
             title: "Stale entry dry run".to_string(),
             content: "Content".to_string(),
-            entry_type: EntryType::Topic,
+            entry_type: EntryType::Prior,
             tags: vec![],
             status: EntryStatus::Active,
             created_at: old_time,
@@ -3069,6 +3118,8 @@ mod tests {
 
     #[test]
     fn test_prune_excludes_from_warmup() {
+        // Priors are the one lifecycle type that competes for a warmup slot,
+        // so they are where an age-based prune is visible in the pool.
         let conn = setup_db();
         let now = Utc::now().timestamp();
         let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
@@ -3078,7 +3129,7 @@ mod tests {
             id: "recent".to_string(),
             title: "Recent".to_string(),
             content: "Content".to_string(),
-            entry_type: EntryType::Topic,
+            entry_type: EntryType::Prior,
             tags: vec![],
             status: EntryStatus::Active,
             created_at: now,
@@ -3100,7 +3151,7 @@ mod tests {
             id: "stale".to_string(),
             title: "Stale".to_string(),
             content: "Content".to_string(),
-            entry_type: EntryType::Topic,
+            entry_type: EntryType::Prior,
             tags: vec![],
             status: EntryStatus::Active,
             created_at: old_time,
@@ -3117,17 +3168,241 @@ mod tests {
         };
         add_entry(&conn, &stale).unwrap();
 
+        let pool_ids = |conn: &Connection| -> Vec<String> {
+            let (_due, pool) = get_warmup_entries(conn, 50).unwrap();
+            pool.into_iter().map(|e| e.id).collect()
+        };
+
         // Before prune: both in warmup
-        let warmup = get_warmup_index(&conn, 50).unwrap();
-        assert_eq!(warmup.len(), 2);
+        assert_eq!(pool_ids(&conn).len(), 2);
 
         // Prune
         prune_entries(&conn, 30, false).unwrap();
 
         // After prune: only recent in warmup
-        let warmup = get_warmup_index(&conn, 50).unwrap();
-        assert_eq!(warmup.len(), 1);
-        assert!(warmup[0].contains("recent"));
+        assert_eq!(pool_ids(&conn), vec!["recent".to_string()]);
+    }
+
+    /// Seed one active entry with only the fields prune reasons about.
+    fn seed_for_prune(
+        conn: &Connection,
+        id: &str,
+        entry_type: EntryType,
+        created_at: i64,
+        last_accessed: Option<i64>,
+        expires_at: Option<i64>,
+        due_at: Option<i64>,
+    ) {
+        add_entry(
+            conn,
+            &MemoryEntry {
+                id: id.to_string(),
+                title: id.to_string(),
+                content: "Content".to_string(),
+                entry_type,
+                tags: vec![],
+                status: EntryStatus::Active,
+                created_at,
+                updated_at: created_at,
+                superseded_by: None,
+                access_count: 0,
+                last_accessed,
+                source_path: None,
+                confirmations: 0,
+                last_confirmed_at: None,
+                source_type: SourceType::UserStatement,
+                expires_at,
+                due_at,
+            },
+        )
+        .unwrap();
+    }
+
+    /// `search` is the dominant read path and never writes `last_accessed`,
+    /// so "not accessed in N days" is NULL for every entry however often it
+    /// was consulted. Durable knowledge must therefore never be reclaimed on
+    /// that signal: only an explicit TTL retires a topic, problem or decision.
+    #[test]
+    fn prune_spares_durable_types_however_old_and_unread() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let ancient = now - 400 * 24 * 60 * 60;
+
+        seed_for_prune(
+            &conn,
+            "topic-unread",
+            EntryType::Topic,
+            ancient,
+            None,
+            None,
+            None,
+        );
+        seed_for_prune(
+            &conn,
+            "problem-read-long-ago",
+            EntryType::Problem,
+            ancient,
+            Some(ancient),
+            None,
+            None,
+        );
+        seed_for_prune(
+            &conn,
+            "decision-unread",
+            EntryType::Decision,
+            ancient,
+            None,
+            None,
+            None,
+        );
+        seed_for_prune(
+            &conn,
+            "topic-with-ttl",
+            EntryType::Topic,
+            ancient,
+            None,
+            Some(now - 60),
+            None,
+        );
+
+        let pruned = prune_entries(&conn, 90, false).unwrap();
+        assert_eq!(
+            pruned,
+            vec!["topic-with-ttl".to_string()],
+            "only the durable entry that was given a TTL is reclaimed"
+        );
+        for id in ["topic-unread", "problem-read-long-ago", "decision-unread"] {
+            assert_eq!(
+                get_entry_without_tracking(&conn, id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                EntryStatus::Active,
+                "{id} must survive an age-based prune"
+            );
+        }
+    }
+
+    /// Lifecycle types are the ones age says something about: a prior that
+    /// nobody re-observed, a handoff nobody picked up, a reminder long past
+    /// due. Two exceptions keep the prune from destroying what it exists to
+    /// tidy: the newest handoff is the next session's thread, and a reminder
+    /// that is not yet due has simply not happened.
+    #[test]
+    fn prune_archives_aged_lifecycle_types_but_spares_the_newest_handoff_and_undue_reminders() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let day = 24 * 60 * 60;
+        let old = now - 100 * day;
+
+        seed_for_prune(
+            &conn,
+            "prior-stale",
+            EntryType::Prior,
+            old,
+            None,
+            None,
+            None,
+        );
+        seed_for_prune(
+            &conn,
+            "handoff-old",
+            EntryType::Handoff,
+            old,
+            None,
+            None,
+            None,
+        );
+        seed_for_prune(
+            &conn,
+            "handoff-newest",
+            EntryType::Handoff,
+            old + day,
+            None,
+            None,
+            None,
+        );
+        seed_for_prune(
+            &conn,
+            "reminder-long-overdue",
+            EntryType::Reminder,
+            old,
+            None,
+            None,
+            Some(old),
+        );
+        seed_for_prune(
+            &conn,
+            "reminder-not-yet-due",
+            EntryType::Reminder,
+            old,
+            None,
+            None,
+            Some(now + 30 * day),
+        );
+        seed_for_prune(
+            &conn,
+            "prior-read-recently",
+            EntryType::Prior,
+            old,
+            Some(now - day),
+            None,
+            None,
+        );
+
+        let mut pruned = prune_entries(&conn, 90, false).unwrap();
+        pruned.sort();
+        assert_eq!(
+            pruned,
+            vec![
+                "handoff-old".to_string(),
+                "prior-stale".to_string(),
+                "reminder-long-overdue".to_string(),
+            ]
+        );
+    }
+
+    /// `--dry-run` is the operator's only preview. It must name exactly the
+    /// set a real run archives, and must archive nothing itself.
+    #[test]
+    fn prune_dry_run_lists_exactly_what_a_real_run_archives() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let old = now - 100 * 24 * 60 * 60;
+
+        seed_for_prune(&conn, "topic-old", EntryType::Topic, old, None, None, None);
+        seed_for_prune(&conn, "prior-old", EntryType::Prior, old, None, None, None);
+        seed_for_prune(
+            &conn,
+            "decision-expired",
+            EntryType::Decision,
+            now,
+            None,
+            Some(now - 1),
+            None,
+        );
+
+        let mut preview = prune_entries(&conn, 90, true).unwrap();
+        preview.sort();
+        assert_eq!(count_entries(&conn).unwrap(), 3);
+        for id in ["topic-old", "prior-old", "decision-expired"] {
+            assert_eq!(
+                get_entry_without_tracking(&conn, id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                EntryStatus::Active,
+                "dry run must not archive {id}"
+            );
+        }
+
+        let mut real = prune_entries(&conn, 90, false).unwrap();
+        real.sort();
+        assert_eq!(preview, real, "the preview and the real run must agree");
+        assert_eq!(
+            real,
+            vec!["decision-expired".to_string(), "prior-old".to_string()]
+        );
     }
 
     #[test]
@@ -3200,6 +3475,7 @@ mod tests {
 
     #[test]
     fn test_prune_does_not_archive_entry_inserted_after_select() {
+        // Age retires lifecycle types only, so the stale entry is a prior.
         // Simulates TOCTOU: an entry inserted with a stale timestamp after the SELECT
         // snapshot is taken must not be archived, because it wasn't in the SELECT result.
         let conn = setup_db();
@@ -3211,7 +3487,7 @@ mod tests {
             id: "stale-toctou".to_string(),
             title: "Stale".to_string(),
             content: "Content".to_string(),
-            entry_type: EntryType::Problem,
+            entry_type: EntryType::Prior,
             tags: vec![],
             status: EntryStatus::Active,
             created_at: old_time,
@@ -3237,7 +3513,7 @@ mod tests {
             id: "late-insert".to_string(),
             title: "Late insert".to_string(),
             content: "Content".to_string(),
-            entry_type: EntryType::Problem,
+            entry_type: EntryType::Prior,
             tags: vec![],
             status: EntryStatus::Active,
             created_at: old_time,

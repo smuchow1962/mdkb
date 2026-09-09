@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`mdkb memory prune` no longer archives durable knowledge for want of a
+  signal nothing writes.** It selected every active entry whose
+  `last_accessed` was older than `--days`, or NULL with an old `created_at`.
+  `search` — the dominant read path — deliberately records no access, so
+  `last_accessed` was NULL for 41 of 41 entries in a live store, and
+  `prune --days 90` would have archived every topic, problem and decision older
+  than 90 days regardless of how often it was consulted. Topics, problems and
+  decisions are now retired only by an explicit `--ttl`; age applies to
+  reminders, priors and handoffs alone, sparing the newest handoff (the next
+  session's thread) and reminders not yet due. `--dry-run` lists exactly the
+  set a real run archives. Help text and the cheatsheet now describe what the
+  command does rather than a guarantee it could not keep.
+
 ## 3.8.0 (2026-08-29)
 
 Seventy-two commits, most of them in the code index. 3.7.18 was prepared but

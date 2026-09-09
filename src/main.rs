@@ -1071,7 +1071,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} stats                                              # index health, hooks, mining, sessions
 {0} compact                                            # vacuum both databases
 {0} compact --prune-sessions --older-than 90d --export dir  # hard-delete archived transcripts (exports first)
-{0} memory prune --older-than 90d                      # archive entries nothing has read
+{0} memory prune --days 90 --dry-run                   # preview: expired entries + reminders/priors/handoffs unread for 90d
 
 # Daemon (the daemon owns every write; the CLI routes mutations to it)
 {0} daemon status                                      # is it running, and against which store
@@ -2288,12 +2288,12 @@ fn format_prune_result(pruned: &[String], days: u32, dry_run: bool, format: Outp
         OutputFormat::Markdown | OutputFormat::Text => {
             if pruned.is_empty() {
                 println!(
-                    "No entries to prune (all entries accessed within {} days).",
+                    "No entries to prune (nothing expired, no lifecycle entry unread for {} days).",
                     days
                 );
             } else if dry_run {
                 println!(
-                    "Would archive {} entries not accessed in {} days:",
+                    "Would archive {} entries (expired, or lifecycle entries unread for {} days):",
                     pruned.len(),
                     days
                 );
@@ -2302,7 +2302,7 @@ fn format_prune_result(pruned: &[String], days: u32, dry_run: bool, format: Outp
                 }
             } else {
                 println!(
-                    "Archived {} entries not accessed in {} days:",
+                    "Archived {} entries (expired, or lifecycle entries unread for {} days):",
                     pruned.len(),
                     days
                 );

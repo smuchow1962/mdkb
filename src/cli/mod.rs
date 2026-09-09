@@ -796,13 +796,15 @@ pub enum MemoryCommand {
         skip_duplicates: bool,
     },
 
-    /// Archive unused memory entries
+    /// Archive expired entries and aged lifecycle entries (reminder, prior, handoff)
     Prune {
-        /// Days since last access to consider entry stale (default: 90)
+        /// Age in days after which an unread reminder, prior or handoff is archived.
+        /// Topics, problems and decisions are never archived for age: only their
+        /// --ttl retires them (default: 90)
         #[arg(short, long, default_value = "90")]
         days: u32,
 
-        /// Show what would be pruned without making changes
+        /// List exactly what would be archived without archiving anything
         #[arg(long)]
         dry_run: bool,
     },
