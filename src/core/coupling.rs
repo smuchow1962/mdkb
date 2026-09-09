@@ -57,7 +57,11 @@ pub struct CouplingOverrides {
 #[derive(Debug)]
 pub struct CouplingReport {
     pub markdown: String,
-    pub pairs: usize,
+    /// The ranked findings behind `markdown`.
+    ///
+    /// Carried rather than counted so a caller that wants JSON or CSV renders
+    /// the same pairs the prose was rendered from.
+    pub findings: Vec<CoupledPair>,
     /// False when there is no code index. The caller reports that and stops;
     /// it is not an error, it is a repository nobody has indexed yet.
     pub indexed: bool,
@@ -66,10 +70,17 @@ pub struct CouplingReport {
 /// One hidden-coupling finding: two files git says change together, that the
 /// code graph has no edge between.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CoupledPair {
-    file_a: String,
-    file_b: String,
-    cochanges: usize,
+pub struct CoupledPair {
+    pub file_a: String,
+    pub file_b: String,
+    pub cochanges: usize,
+}
+
+impl CouplingReport {
+    /// How many pairs the report names.
+    pub fn pairs(&self) -> usize {
+        self.findings.len()
+    }
 }
 
 /// Run the hidden-coupling audit over the repository at `root`.
@@ -80,7 +91,7 @@ pub fn handle_coupling(root: &Path, overrides: &CouplingOverrides) -> Result<Cou
             "# Hidden Coupling\n\nNo code index in {}. Run `mdkb code index` first.\n",
             root.display()
         ),
-        pairs: 0,
+        findings: Vec::new(),
         indexed: false,
     };
     if !code_path.exists() {
@@ -112,7 +123,7 @@ pub fn handle_coupling(root: &Path, overrides: &CouplingOverrides) -> Result<Cou
         CoChangeHistory::NoHistory => {
             return Ok(CouplingReport {
                 markdown: "# Hidden Coupling\n\nNo git history in this repository.\n".to_string(),
-                pairs: 0,
+                findings: Vec::new(),
                 indexed: true,
             });
         }
@@ -156,7 +167,7 @@ pub fn handle_coupling(root: &Path, overrides: &CouplingOverrides) -> Result<Cou
 
     Ok(CouplingReport {
         markdown: render(&hidden),
-        pairs: hidden.len(),
+        findings: hidden,
         indexed: true,
     })
 }
@@ -279,6 +290,36 @@ fn render(pairs: &[CoupledPair]) -> String {
             pair.file_b,
             pair.cochanges,
             if pair.cochanges == 1 { "" } else { "s" },
+        ));
+    }
+    out
+}
+
+/// The same findings as JSON.
+pub fn render_json(pairs: &[CoupledPair]) -> String {
+    let findings: Vec<serde_json::Value> = pairs
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "file_a": p.file_a,
+                "file_b": p.file_b,
+                "cochanges": p.cochanges,
+            })
+        })
+        .collect();
+    let value = serde_json::json!({ "pairs": pairs.len(), "findings": findings });
+    format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
+}
+
+/// The same findings as CSV, one row per pair.
+pub fn render_csv(pairs: &[CoupledPair]) -> String {
+    let mut out = String::from("file_a,file_b,cochanges\n");
+    for pair in pairs {
+        out.push_str(&format!(
+            "{},{},{}\n",
+            crate::code::duplication::report::csv_field(&pair.file_a),
+            crate::code::duplication::report::csv_field(&pair.file_b),
+            pair.cochanges,
         ));
     }
     out
@@ -437,7 +478,7 @@ mod tests {
         let report = handle_coupling(root.path(), &CouplingOverrides::default()).unwrap();
 
         assert!(!report.indexed);
-        assert_eq!(report.pairs, 0);
+        assert_eq!(report.pairs(), 0);
         assert!(
             report.markdown.contains("No code index"),
             "{}",
@@ -456,7 +497,7 @@ mod tests {
         let report = handle_coupling(root.path(), &CouplingOverrides::default()).unwrap();
 
         assert!(report.indexed);
-        assert_eq!(report.pairs, 0);
+        assert_eq!(report.pairs(), 0);
         assert!(
             report.markdown.contains("No git history"),
             "{}",
@@ -482,7 +523,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.pairs, 1, "{}", report.markdown);
+        assert_eq!(report.pairs(), 1, "{}", report.markdown);
         assert!(report.markdown.contains("src/a.rs"), "{}", report.markdown);
         assert!(report.markdown.contains("src/b.rs"), "{}", report.markdown);
         assert!(
@@ -518,7 +559,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.pairs, 0, "{}", report.markdown);
+        assert_eq!(report.pairs(), 0, "{}", report.markdown);
     }
 
     /// Requirement 1: co-changing files that DO have a call edge are ordinary
@@ -544,7 +585,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.pairs, 0, "{}", report.markdown);
+        assert_eq!(report.pairs(), 0, "{}", report.markdown);
         assert!(
             report.markdown.contains("No hidden coupling"),
             "{}",
@@ -570,7 +611,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.pairs, 0, "{}", report.markdown);
+        assert_eq!(report.pairs(), 0, "{}", report.markdown);
     }
 
     #[test]

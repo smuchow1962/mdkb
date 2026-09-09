@@ -207,7 +207,7 @@ full in-process server, sharing one daemon for file watching and indexing.
 
 | Tool | Description |
 |------|-------------|
-| `search` | Hybrid search across docs+memory (default), or scoped to `docs`, `memory`, `code`, `symbols`. `scope="memory"` accepts `min_confidence` to filter decayed entries |
+| `search` | Hybrid search across docs+memory (default), or scoped to `docs`, `memory`, `code`, `symbols`, `duplicates`. `scope="memory"` accepts `min_confidence` to filter decayed entries; `scope="duplicates"` accepts `since` for review mode |
 | `get` | Retrieve by ID, path, memory slug, glob pattern, or comma-separated list |
 | `code_graph` | Call graph queries: `calls`, `callers`, or `impact` (transitive) |
 | `graph` | Knowledge-graph queries over frontmatter + wikilink edges: `links` (outgoing), `backlinks` (incoming), `neighbors` (adjacent, each annotated with the `via` relation), or `path` (shortest path to `to`). Edge endpoints render as document paths, never numeric ids |
@@ -229,6 +229,7 @@ full in-process server, sharing one daemon for file watching and indexing.
 | `memory` | Full-text over memory entries |
 | `symbols` | Exact symbol lookup by name, filterable by `kind` and `file` |
 | `code` | Semantic code search across indexed symbols |
+| `duplicates` | Clusters of near-identical bodies. `since="<ref>"` narrows the report to clusters your change touched |
 
 ### Memory
 
@@ -369,6 +370,25 @@ mdkb code calls main
 mdkb code callers handle_get
 mdkb code impact init --depth 5
 ```
+
+Two audits read the same index. `dup` reports what the repository says twice;
+`coupling` reports files that change together in git history with no edge
+between them in the code graph.
+
+```bash
+mdkb dup                          # sweep the repository
+mdkb dup --file src/code/parsing  # scope the candidates
+mdkb dup --since HEAD             # review mode: only clusters your change touched
+mdkb coupling                     # 5+ shared commits over the last year
+mdkb coupling --since 6.months --min-cochanges 3
+mdkb dup --format json               # findings with their distance, for bucketing
+```
+
+Read `dup` knowing where its signal is: most of the lines it claims sit at
+exactly its threshold, and that bucket is mostly false positives. The clusters
+reported 0–3 bits apart are the trustworthy core. `--format json` carries
+`evidence.hamming` per cluster, which is how you bucket them yourself. See
+`CHANGES.md` for the measured distribution.
 
 ### Knowledge Graph
 

@@ -1448,7 +1448,7 @@ pub async fn search_impl(
                 .ok_or_else(|| mcp_error("Database not initialized"))?
                 .map_err(|e| mcp_error(format!("Duplication audit failed: {e}")))?;
 
-            Ok((report.markdown, report.clusters))
+            Ok((report.markdown.clone(), report.clusters()))
         }
         Some(invalid) => Err(mcp_error(format!(
             "Invalid scope: '{invalid}'. Valid: docs, memory, code, symbols, duplicates."

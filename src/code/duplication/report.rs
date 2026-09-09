@@ -49,6 +49,14 @@ impl Evidence {
             Self::Semantic { similarity } => format!("cosine {similarity:.3}"),
         }
     }
+
+    /// Which pass found the cluster, for the machine-readable surfaces.
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Structural { .. } => "structural",
+            Self::Semantic { .. } => "semantic",
+        }
+    }
 }
 
 /// A group of symbols reported as one finding.
@@ -183,7 +191,7 @@ pub fn render(
     }
 
     let mut out = String::from("# Duplication\n\n");
-    let total: u32 = clusters.iter().map(Cluster::duplicated_lines).sum();
+    let total = total_lines(clusters);
     out.push_str(&format!(
         "{} cluster{}, {total} duplicated line{}.\n",
         clusters.len(),
@@ -196,6 +204,124 @@ pub fn render(
         render_cluster(&mut out, n + 1, cluster, snippet);
     }
     out
+}
+
+/// The same findings as JSON.
+///
+/// No snippets: a machine-readable surface carries the `file:line` and the
+/// consumer reads the body itself, so this never touches the disk. It also
+/// carries `evidence.hamming`, which the prose report only spells out — that is
+/// what lets a caller bucket the findings by distance, and the distance is
+/// where the report's signal actually lives.
+pub fn render_json(clusters: &[Cluster]) -> String {
+    let findings: Vec<serde_json::Value> = clusters.iter().map(cluster_json).collect();
+    let value = serde_json::json!({
+        "clusters": clusters.len(),
+        "duplicated_lines": total_lines(clusters),
+        "findings": findings,
+    });
+    format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
+}
+
+fn cluster_json(cluster: &Cluster) -> serde_json::Value {
+    let evidence = match cluster.evidence {
+        Evidence::Structural { hamming } => serde_json::json!({
+            "kind": cluster.evidence.kind(),
+            "hamming": hamming,
+        }),
+        Evidence::Semantic { similarity } => serde_json::json!({
+            "kind": cluster.evidence.kind(),
+            "similarity": similarity,
+        }),
+    };
+    let members: Vec<serde_json::Value> = cluster
+        .members
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "file": m.file_path,
+                // 1-based, as in the prose report. The stored rows are 0-based
+                // tree-sitter rows; a consumer opening an editor at the number
+                // it was given must land on the symbol.
+                "line_start": m.line_start + 1,
+                "line_end": m.line_end + 1,
+                "name": m.name,
+                "module": m.module_path,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "hash": cluster.cluster_hash(),
+        "name": cluster.members.first().map(|c| c.name.as_str()),
+        "copies": cluster.members.len(),
+        "module_spread": cluster.module_spread(),
+        "file_spread": cluster.file_spread(),
+        "visibility": visibility_label(cluster.reach()),
+        "duplicated_lines": cluster.duplicated_lines(),
+        "evidence": evidence,
+        "members": members,
+    })
+}
+
+/// The same findings as CSV, one row per member.
+///
+/// Per member rather than per cluster because the cluster columns repeat
+/// cheaply and a spreadsheet can group them, while a per-cluster row would have
+/// to fold the locations into one cell — which is where CSV stops being
+/// readable by anything.
+pub fn render_csv(clusters: &[Cluster]) -> String {
+    let mut out = String::from(
+        "cluster_hash,cluster_name,copies,module_spread,file_spread,visibility,\
+         duplicated_lines,evidence,hamming,similarity,file,line_start,line_end,symbol\n",
+    );
+    for cluster in clusters {
+        let (hamming, similarity) = match cluster.evidence {
+            Evidence::Structural { hamming } => (hamming.to_string(), String::new()),
+            Evidence::Semantic { similarity } => (String::new(), format!("{similarity:.3}")),
+        };
+        let name = cluster.members.first().map_or("", |c| c.name.as_str());
+        for member in &cluster.members {
+            let symbol = match &member.module_path {
+                Some(module) => format!("{module}::{}", member.name),
+                None => member.name.to_string(),
+            };
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                cluster.cluster_hash(),
+                csv_field(name),
+                cluster.members.len(),
+                cluster.module_spread(),
+                cluster.file_spread(),
+                visibility_label(cluster.reach()),
+                cluster.duplicated_lines(),
+                cluster.evidence.kind(),
+                hamming,
+                similarity,
+                csv_field(&member.file_path),
+                member.line_start + 1,
+                member.line_end + 1,
+                csv_field(&symbol),
+            ));
+        }
+    }
+    out
+}
+
+/// A field quoted only when it has to be.
+///
+/// A path may legally hold a comma or a quote, and one such path would shift
+/// every column to its right for the rest of the row — a corruption a reader
+/// has no way to notice.
+pub fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn total_lines(clusters: &[Cluster]) -> u32 {
+    clusters.iter().map(Cluster::duplicated_lines).sum()
 }
 
 fn render_cluster(
@@ -727,6 +853,157 @@ mod tests {
         assert_eq!(fence_tag("src/a.rs"), "rust");
         assert_eq!(fence_tag("notes.xyz"), "");
         assert_eq!(fence_tag("Makefile"), "");
+    }
+
+    // --- the machine-readable surfaces ---
+
+    /// The reason JSON exists at all: the prose spells the distance out in a
+    /// sentence, and a caller that wants to bucket findings by it — where the
+    /// report's signal actually lives — cannot parse a sentence.
+    #[test]
+    fn json_carries_the_distance_so_a_caller_can_bucket_on_it() {
+        let near = Cluster {
+            members: vec![
+                member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 3),
+                member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
+            ],
+            evidence: Evidence::Structural { hamming: 0 },
+        };
+        let at_the_cut = Cluster {
+            members: vec![
+                member(3, "c", "src/c.rs", Some("gamma"), Visibility::Private, 3),
+                member(4, "d", "src/d.rs", Some("delta"), Visibility::Private, 3),
+            ],
+            evidence: Evidence::Structural { hamming: 6 },
+        };
+
+        let out = render_json(&[near, at_the_cut]);
+        let value: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+
+        let findings = value["findings"].as_array().unwrap();
+        assert_eq!(value["clusters"], 2);
+        let distances: Vec<u64> = findings
+            .iter()
+            .map(|f| f["evidence"]["hamming"].as_u64().unwrap())
+            .collect();
+        assert_eq!(distances, vec![0, 6], "both buckets are distinguishable");
+        assert_eq!(findings[0]["evidence"]["kind"], "structural");
+        assert!(
+            findings[0]["evidence"].get("similarity").is_none(),
+            "a structural finding must not carry a cosine it never measured"
+        );
+    }
+
+    #[test]
+    fn json_reports_a_semantic_finding_as_a_cosine_and_no_hamming() {
+        let out = render_json(&[cluster(vec![
+            member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 3),
+            member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
+        ])]);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        let evidence = &value["findings"][0]["evidence"];
+        assert_eq!(evidence["kind"], "semantic");
+        assert!(evidence.get("hamming").is_none(), "{evidence}");
+        assert!((evidence["similarity"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+    }
+
+    /// Same 1-based display as the prose report: a consumer opening an editor
+    /// at the number it was handed must land on the symbol.
+    #[test]
+    fn json_line_numbers_match_what_the_prose_report_prints() {
+        let c = cluster(vec![
+            member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 3),
+            member(2, "parse", "src/b.rs", Some("beta"), Visibility::Public, 3),
+        ]);
+        let prose = render(std::slice::from_ref(&c), &mut |_| None);
+        let value: serde_json::Value = serde_json::from_str(&render_json(&[c])).unwrap();
+
+        assert!(prose.contains("`src/a.rs:11-13`"), "{prose}");
+        assert_eq!(value["findings"][0]["members"][0]["line_start"], 11);
+        assert_eq!(value["findings"][0]["members"][0]["line_end"], 13);
+    }
+
+    #[test]
+    fn csv_writes_one_row_per_member_under_a_repeated_cluster_key() {
+        let c = Cluster {
+            members: vec![
+                member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 3),
+                member(2, "parse", "src/b.rs", Some("beta"), Visibility::Public, 3),
+                member(3, "parse", "src/c.rs", Some("gamma"), Visibility::Public, 3),
+            ],
+            evidence: Evidence::Structural { hamming: 2 },
+        };
+        let hash = c.cluster_hash();
+
+        let out = render_csv(&[c]);
+        let rows: Vec<&str> = out.lines().collect();
+
+        assert_eq!(rows.len(), 4, "a header and three members:\n{out}");
+        assert!(rows[0].starts_with("cluster_hash,"), "{}", rows[0]);
+        for row in &rows[1..] {
+            assert!(row.starts_with(&format!("{hash},parse,3,")), "{row}");
+        }
+        assert!(rows[1].contains("src/a.rs,11,13,alpha::parse"), "{}", rows[1]);
+        assert!(rows[3].contains("src/c.rs"), "{}", rows[3]);
+    }
+
+    /// One comma in a path would shift every column to its right for the rest
+    /// of the row, and a reader has no way to notice.
+    #[test]
+    fn a_path_holding_a_comma_is_quoted_rather_than_shifting_the_columns() {
+        let c = cluster(vec![
+            member(1, "a", "src/od,d.rs", None, Visibility::Private, 3),
+            member(2, "b", "src/b.rs", None, Visibility::Private, 3),
+        ]);
+
+        let out = render_csv(&[c]);
+        let row = out.lines().nth(1).unwrap();
+
+        assert!(row.contains("\"src/od,d.rs\""), "{row}");
+        assert_eq!(
+            row.matches(',').count() - 1,
+            out.lines().next().unwrap().matches(',').count(),
+            "the quoted comma must not count as a separator:\n{out}"
+        );
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("plain"), "plain", "no gratuitous quoting");
+    }
+
+    #[test]
+    fn the_machine_readable_surfaces_agree_with_the_prose_on_the_totals() {
+        let clusters = vec![
+            cluster(vec![
+                member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+                member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 8),
+            ]),
+            cluster(vec![
+                member(3, "c", "src/c.rs", Some("gamma"), Visibility::Public, 6),
+                member(4, "d", "src/d.rs", Some("delta"), Visibility::Public, 4),
+            ]),
+        ];
+        let prose = render(&clusters, &mut |_| None);
+        let value: serde_json::Value = serde_json::from_str(&render_json(&clusters)).unwrap();
+
+        // 8 duplicated in the first cluster, 4 in the second.
+        assert!(prose.contains("2 clusters, 12 duplicated lines."), "{prose}");
+        assert_eq!(value["clusters"], 2);
+        assert_eq!(value["duplicated_lines"], 12);
+        assert_eq!(
+            render_csv(&clusters).lines().count(),
+            5,
+            "a header and four members"
+        );
+    }
+
+    #[test]
+    fn no_clusters_renders_an_empty_payload_in_every_machine_format() {
+        let value: serde_json::Value = serde_json::from_str(&render_json(&[])).unwrap();
+
+        assert_eq!(value["clusters"], 0);
+        assert_eq!(value["duplicated_lines"], 0);
+        assert!(value["findings"].as_array().unwrap().is_empty());
+        assert_eq!(render_csv(&[]).lines().count(), 1, "the header alone");
     }
 
     #[test]

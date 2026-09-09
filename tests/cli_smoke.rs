@@ -332,6 +332,68 @@ fn smoke_coupling_accepts_its_overrides() {
     assert_ok(&out, "coupling with every override");
 }
 
+/// `--format` is declared `global = true`, so every subcommand advertises it in
+/// its own `--help`. Both audits used to print their prose whatever was asked
+/// for — the flag parsed, was accepted, and was dropped. A flag a program
+/// accepts and ignores is worse than one it rejects.
+#[test]
+fn smoke_dup_honours_the_global_format_flag() {
+    let repo = Repo::new();
+    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+
+    let json = stdout(&run(&["dup", "--format", "json"], &repo.root));
+    let value: serde_json::Value = serde_json::from_str(json.trim())
+        .unwrap_or_else(|e| panic!("`dup --format json` must emit JSON ({e}), got: {json}"));
+    assert!(value["findings"].is_array(), "{value}");
+    assert!(value["clusters"].is_number(), "{value}");
+
+    let csv = stdout(&run(&["dup", "--format", "csv"], &repo.root));
+    assert!(
+        csv.starts_with("cluster_hash,cluster_name,"),
+        "`dup --format csv` must emit a CSV header, got: {csv}"
+    );
+
+    // text and markdown stay the prose report, which is markdown already.
+    let text = stdout(&run(&["dup"], &repo.root));
+    assert!(text.starts_with("# Duplication"), "{text}");
+    assert_eq!(text, stdout(&run(&["dup", "--format", "markdown"], &repo.root)));
+}
+
+#[test]
+fn smoke_coupling_honours_the_global_format_flag() {
+    let repo = Repo::new();
+    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+
+    let json = stdout(&run(&["coupling", "--format", "json"], &repo.root));
+    let value: serde_json::Value = serde_json::from_str(json.trim())
+        .unwrap_or_else(|e| panic!("`coupling --format json` must emit JSON ({e}), got: {json}"));
+    assert!(value["findings"].is_array(), "{value}");
+
+    let csv = stdout(&run(&["coupling", "--format", "csv"], &repo.root));
+    assert!(
+        csv.starts_with("file_a,file_b,cochanges"),
+        "`coupling --format csv` must emit a CSV header, got: {csv}"
+    );
+}
+
+/// `{"clusters": 0, "findings": []}` reads as "nothing is duplicated here",
+/// which is exactly the answer an unindexed repository must not be able to
+/// give. The prose is the honest payload in every format.
+#[test]
+fn smoke_dup_format_json_without_an_index_says_so_rather_than_returning_an_empty_list() {
+    let repo = Repo::new();
+
+    let out = run(&["dup", "--format", "json"], &repo.root);
+
+    assert_ok(&out, "dup --format json without a code index");
+    let text = stdout(&out);
+    assert!(text.contains("No code index"), "{text}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(text.trim()).is_err(),
+        "an empty JSON payload here would be a lie: {text}"
+    );
+}
+
 /// The scope spelling is the same audit as the subcommand, on the CLI too —
 /// `search --scope duplicates` exists because that is how MCP asks for it.
 #[test]

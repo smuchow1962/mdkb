@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 use crate::code::duplication::embed::{BodyEmbedder, get_dup_embedder};
 use crate::code::duplication::pipeline::{DupOptions, scan_duplication};
-use crate::code::duplication::report::render;
+use crate::code::duplication::report::{Cluster, render};
 use crate::code::duplication::store::DupDb;
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -29,12 +29,24 @@ pub struct DupOverrides {
 #[derive(Debug)]
 pub struct DupReport {
     pub markdown: String,
-    pub clusters: usize,
+    /// The ranked findings behind `markdown`.
+    ///
+    /// Carried rather than counted so a caller that wants JSON or CSV renders
+    /// the same findings the prose was rendered from, instead of a second
+    /// query that could disagree with it.
+    pub findings: Vec<Cluster>,
     pub considered: usize,
     pub ignored: usize,
     /// False when there is no code index. The caller reports that and stops;
     /// it is not an error, it is a repository nobody has indexed yet.
     pub indexed: bool,
+}
+
+impl DupReport {
+    /// How many clusters the report names.
+    pub fn clusters(&self) -> usize {
+        self.findings.len()
+    }
 }
 
 /// Run the duplication audit over the repository at `root`.
@@ -54,7 +66,7 @@ pub fn handle_dup(
             "# Duplication\n\nNo code index in {}. Run `mdkb code index` first.\n",
             root.display()
         ),
-        clusters: 0,
+        findings: Vec::new(),
         considered: 0,
         ignored: 0,
         indexed: false,
@@ -142,7 +154,7 @@ pub fn handle_dup(
 
     Ok(DupReport {
         markdown,
-        clusters: outcome.clusters.len(),
+        findings: outcome.clusters,
         considered: outcome.considered,
         ignored: outcome.ignored,
         indexed: true,
@@ -178,7 +190,7 @@ mod tests {
         .unwrap();
 
         assert!(!report.indexed);
-        assert_eq!(report.clusters, 0);
+        assert_eq!(report.clusters(), 0);
         assert!(
             report.markdown.contains("No code index"),
             "{}",
@@ -261,7 +273,7 @@ mod tests {
         .unwrap();
 
         assert!(report.indexed, "{}", report.markdown);
-        assert_eq!(report.clusters, 0);
+        assert_eq!(report.clusters(), 0);
         assert!(
             report.markdown.contains("No clusters found"),
             "{}",

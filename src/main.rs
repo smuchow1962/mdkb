@@ -378,7 +378,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     since,
                 },
             )?;
-            print!("{}", report.markdown);
+            print!("{}", render_dup(&report, cli.format));
         }
         Command::Coupling {
             min_cochanges,
@@ -395,7 +395,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     git_ref,
                 },
             )?;
-            print!("{}", report.markdown);
+            print!("{}", render_coupling(&report, cli.format));
         }
         Command::Get { id, lines } => {
             use mdkb::cli::handlers::GetResult;
@@ -3427,6 +3427,41 @@ fn report_find_truncation(found: &mdkb::cli::handlers::CodeFindResult) {
             found.symbols.len(),
             found.total,
         );
+    }
+}
+
+/// The duplication audit in the format the caller asked for.
+///
+/// A repository with no index prints its prose in every format, deliberately.
+/// `{"clusters": 0, "findings": []}` is indistinguishable from "nothing is
+/// duplicated here", which is the one answer an unindexed repository must not
+/// be able to give — the same reason `handle_dup` reports it instead of
+/// returning an empty list.
+fn render_dup(report: &mdkb::core::dup::DupReport, format: OutputFormat) -> String {
+    use mdkb::code::duplication::report::{render_csv, render_json};
+    if !report.indexed {
+        return report.markdown.clone();
+    }
+    match format {
+        OutputFormat::Json => render_json(&report.findings),
+        OutputFormat::Csv => render_csv(&report.findings),
+        // The prose report is markdown already, so `text` and `markdown` are
+        // one surface rather than two that could drift apart.
+        OutputFormat::Text | OutputFormat::Markdown => report.markdown.clone(),
+    }
+}
+
+/// The hidden-coupling audit in the format the caller asked for. Same
+/// unindexed rule as [`render_dup`].
+fn render_coupling(report: &mdkb::core::coupling::CouplingReport, format: OutputFormat) -> String {
+    use mdkb::core::coupling::{render_csv, render_json};
+    if !report.indexed {
+        return report.markdown.clone();
+    }
+    match format {
+        OutputFormat::Json => render_json(&report.findings),
+        OutputFormat::Csv => render_csv(&report.findings),
+        OutputFormat::Text | OutputFormat::Markdown => report.markdown.clone(),
     }
 }
 

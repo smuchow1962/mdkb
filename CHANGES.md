@@ -1,5 +1,143 @@
 # Changelog
 
+## Unreleased
+
+Two questions the index could not answer before: *what does this repository say
+twice?* and *what changes together without any edge saying why?*
+
+Read the duplication report knowing what it is worth. Measured on this
+repository, 68% of the lines it claims sit at exactly the threshold, and a
+hand-classified sample of that bucket was 5 false positives out of 8. The
+trustworthy core is the clusters at 0–3 bits apart. The numbers are under *The
+structural threshold* below, because a reader who does not have them will
+over-trust the headline.
+
+### Added
+
+- **`mdkb dup` reports duplicated code**, and `search scope="duplicates"` asks
+  the same question over MCP. One handler serves both surfaces, so the CLI and
+  the MCP server cannot disagree about the same repository, and there is no
+  thirteenth MCP tool: the audit is a scope on the search tool that already
+  exists. `--file` scopes the sweep, `--min-nodes` sets how big a body must be
+  to be worth comparing, `--threshold` overrides the semantic floor.
+- **Review mode: `mdkb dup --since <ref>`**, and `since` on the MCP search.
+  The whole-repository sweep is the audit; the daily question is narrower —
+  *what did **this change** duplicate against code that already existed?* The
+  distinction that makes it work is where the narrowing happens. `--file`
+  narrows the **candidates**, deciding what gets fingerprinted at all. Review
+  mode must not, because the code your change duplicated is by definition code
+  your change did not touch, so narrowing the candidates first deletes the very
+  symbols the answer is made of. The whole index is fingerprinted and clustered
+  as always, and only the **report** is narrowed, to clusters with at least one
+  member among the changed files. On this repository 709 clusters become 260
+  over 44 changed files, and the unchanged twin is still named in each one —
+  which is the finding. Two behaviours a test pins: an unresolvable ref is an
+  error and never an empty report, because an empty report reads as "your change
+  duplicated nothing"; and untracked files count, because `git diff --name-only`
+  lists tracked work only while a brand-new file duplicating existing code is
+  the archetypal finding.
+- **`mdkb coupling` reports files that change together with no edge between
+  them.** Two files with shared commits in git history and no
+  `Calls`/`Uses`/`Expands`/`Implements` edge in the code graph — an implicit
+  contract, a config kept in two places, a test that knows the implementation.
+  No new column and no new table: `git log --name-only` joined against the index
+  that already exists. Defaults are 5 shared commits over 12 months; `--ref`,
+  `--since` and `--min-cochanges` override them. Two filters decide whether the
+  output is a report or noise, both added because the unfiltered run produced
+  noise: only files the index parsed are paired, since a path with no symbols
+  can carry no edge by construction (without it, 51 of 61 pairs here were
+  `Cargo.lock` ↔ `Cargo.toml` and friends); and commits touching over 100 files
+  are dropped whole rather than truncated, because a repo-wide sweep is one
+  event and not evidence about any two of its files — it is also where the O(n²)
+  pair expansion would go, a 500-file commit alone contributing ~124,750 pairs.
+  15 pairs on this repository, in 0.11s of CPU after the index is open. CLI
+  only; there is no MCP scope for it yet.
+
+### Changed
+
+- **Duplication clusters use complete linkage.** Similarity is not transitive.
+  Union-find closed it transitively anyway, and on this repository that produced
+  one component of 3209 symbols across 241 modules whose widest pair sat 47 bits
+  apart against a threshold of 12 — half the report was noise. A member now
+  joins a group only if it is admissible with **every** member already in it, so
+  the group's diameter is bounded by the threshold by construction rather than
+  by hope. Seeding is ordered by simhash and not by row id, so editing a file
+  above a symbol cannot renumber the groups an ignore-list is keyed on. 21
+  clusters became 758; the widest pair went from 47 bits to 12; the largest
+  cluster from 3209 members to 26. 19 of the 21 pre-existing cluster hashes were
+  unchanged, so accepted-duplication decisions survived the fix — the two that
+  moved are the two that were out of contract.
+- **The structural threshold is 6 bits, was 12.** The clustering fix bounded the
+  groups but not the cut. At 12 bits, 497 of 706 clusters sat at exactly 12 and
+  another 105 at 11 — 85% of the mass pressed against the boundary. A threshold
+  that finds real duplication has its mass near 0; one whose mass sits on its
+  own cut is reporting whatever fits. Two competing explanations were tested and
+  one was ruled out: the share at the cut held at every body size (70% for
+  bodies over 100 AST nodes, 63% over 200), so it was the threshold and not an
+  entropy floor on small bodies. Reported lines halve, 38931 to 19200.
+
+  The distribution did **not** come off the boundary. Over the 652 structural
+  clusters of a full sweep at the shipped threshold:
+
+  | bits apart | clusters | lines claimed | share of lines |
+  |---:|---:|---:|---:|
+  | 0 | 47 | 1103 | 4.9% |
+  | 1–3 | 41 | 934 | 4.1% |
+  | 4 | 57 | 1269 | 5.6% |
+  | 5 | 119 | 3875 | 17.1% |
+  | **6 (the cut)** | **388** | **15456** | **68.3%** |
+
+  Halving the threshold moved the cliff; it did not remove it. The shape belongs
+  to simhash over shingles, not to the number 12, so 6 is an improvement and not
+  a settled answer. Hand-classifying a random sample says the same: 8 clusters
+  from the 6-bit bucket gave 1 clearly worth extracting, 2 true but marginal and
+  5 false positives, while 6 drawn from the 0-bit bucket were 6 for 6 genuine.
+  Treat the ≤3-bit clusters as the report's core.
+- **Thirteen language parsers share one parse-and-collect helper, and their
+  walks are data.** `mdkb dup` found the same four lines — parse, bail quietly
+  on unreadable source, allocate, hand over the root — written out 50 times.
+  They are now `CachingParser::collect`. Exactly 13 sites keep the old shape and
+  they are all `parse_symbols`, whose walk is a `&mut self` call that cannot be
+  made while `self.parser` is borrowed by `collect`: a real borrow conflict, one
+  per language. That alone reduced no duplication — 606 clusters before, 606
+  after — because the 13 `find_calls_impl` methods got shorter, not fewer.
+  `LanguageParser` now takes the walk as data instead: a plain `fn` pointer
+  returned by `calls_walk`, `uses_walk`, `defines_walk` and three siblings, with
+  the six `find_*` methods sharing one body in the trait. The trait stays object
+  safe, which it must, since it is used as `Box<dyn LanguageParser>`.
+  Duplication in `src/code/parsing` went from 7143 lines to 7051 at an unchanged
+  113 clusters, and the three clusters the work was started for are gone. It
+  shrank rather than vanished: a `calls_walk` cluster now stands where
+  `find_calls_impl` stood, over the same 11 modules, at 50 duplicated lines
+  against 80. Thirteen trait implementations must exist; what a refactor can
+  remove is how much each one has to say.
+
+### Fixed
+
+- **`mdkb dup` and `mdkb coupling` honour `--format`.** The flag is declared
+  `global = true`, so both commands advertised `json`, `csv` and `markdown` in
+  their own `--help` — and printed the prose report whatever was asked for. A
+  flag a program accepts and then ignores is worse than one it rejects. Both now
+  render the findings they already ranked: JSON carries `evidence.hamming`,
+  which the prose only spells out in a sentence, so a caller can bucket the
+  findings by distance — the thing the section above says a reader has to do.
+  CSV writes one row per member under a repeated cluster key, and quotes any
+  field holding a comma. `text` and `markdown` stay one surface, because the
+  prose report is markdown already. One deliberate exception: a repository with
+  no code index prints its prose in *every* format, since
+  `{"clusters": 0, "findings": []}` is indistinguishable from "nothing is
+  duplicated here" — the one answer an unindexed repository must not be able to
+  give.
+- **`mdkb init` no longer freezes its defaults into the config it writes.**
+  `Config` and all 20 of its sections are `#[serde(default)]`, so an absent key
+  takes the value in the code — but `init` was writing every default out as live
+  TOML, and a **present** key beats the code. Every store ever created was
+  pinned to whatever the defaults were on its creation date, which is why
+  lowering the duplication threshold reached nobody until this was found. `init`
+  now writes the same defaults commented out: the options stay discoverable, the
+  code stays the single place a default lives, and uncommenting a line is what
+  it looks like — a deliberate override.
+
 ## 3.8.0 (2026-08-29)
 
 Seventy-two commits, most of them in the code index. 3.7.18 was prepared but
