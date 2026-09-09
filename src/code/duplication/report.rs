@@ -102,7 +102,11 @@ impl Cluster {
     /// The widest, not the average: one `pub` copy of a private helper is
     /// already public API, and averaging would hide it behind its siblings.
     pub fn reach(&self) -> u8 {
-        self.members.iter().map(|c| reach(c.visibility)).max().unwrap_or(0)
+        self.members
+            .iter()
+            .map(|c| reach(c.visibility))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Lines that would go away if the cluster became one function.
@@ -110,7 +114,12 @@ impl Cluster {
     /// Every copy but the largest — the one that stays.
     pub fn duplicated_lines(&self) -> u32 {
         let total: u32 = self.members.iter().map(DupCandidate::lines).sum();
-        let kept = self.members.iter().map(DupCandidate::lines).max().unwrap_or(0);
+        let kept = self
+            .members
+            .iter()
+            .map(DupCandidate::lines)
+            .max()
+            .unwrap_or(0);
         total - kept
     }
 
@@ -199,12 +208,19 @@ fn render_cluster(
         .members
         .first()
         .map_or("(empty)", |c| c.name.as_str());
-    out.push_str(&format!("## {n}. `{name}` — {}\n\n", cluster.cluster_hash()));
+    out.push_str(&format!(
+        "## {n}. `{name}` — {}\n\n",
+        cluster.cluster_hash()
+    ));
     out.push_str(&format!(
         "{} copies across {} module{} · {} · {} duplicated lines · {}\n\n",
         cluster.members.len(),
         cluster.module_spread(),
-        if cluster.module_spread() == 1 { "" } else { "s" },
+        if cluster.module_spread() == 1 {
+            ""
+        } else {
+            "s"
+        },
         visibility_label(cluster.reach()),
         cluster.duplicated_lines(),
         cluster.evidence.describe(),
@@ -299,7 +315,10 @@ pub fn ignore_cluster(
 ) -> crate::error::Result<String> {
     let hash = cluster.cluster_hash();
     let id = ignore_entry_id(&hash);
-    let name = cluster.members.first().map_or("(empty)", |c| c.name.as_str());
+    let name = cluster
+        .members
+        .first()
+        .map_or("(empty)", |c| c.name.as_str());
     let locations = cluster.members.iter().fold(String::new(), |mut acc, m| {
         use std::fmt::Write;
         // Display is 1-based, as everywhere else the reader sees a line number.
@@ -341,8 +360,10 @@ pub fn is_ignored(conn: &rusqlite::Connection, cluster_hash: &str) -> crate::err
     let Some(entry) = crate::store::memory_graph::resolve_active_untracked(conn, &id)? else {
         return Ok(false);
     };
-    Ok(entry.entry_type == crate::store::memory::EntryType::Decision
-        && entry.tags.iter().any(|t| t == IGNORE_TAG))
+    Ok(
+        entry.entry_type == crate::store::memory::EntryType::Decision
+            && entry.tags.iter().any(|t| t == IGNORE_TAG),
+    )
 }
 
 /// Drop the clusters somebody already accepted.
@@ -368,7 +389,10 @@ fn elide(body: &str) -> String {
         out.push('\n');
     }
     if lines.len() > MAX_SNIPPET_LINES {
-        out.push_str(&format!("… {} more lines\n", lines.len() - MAX_SNIPPET_LINES));
+        out.push_str(&format!(
+            "… {} more lines\n",
+            lines.len() - MAX_SNIPPET_LINES
+        ));
     }
     out
 }
@@ -464,7 +488,11 @@ mod tests {
         };
 
         assert_eq!(ranked_with_public_on(true), "a");
-        assert_eq!(ranked_with_public_on(false), "c", "the winner follows the pub");
+        assert_eq!(
+            ranked_with_public_on(false),
+            "c",
+            "the winner follows the pub"
+        );
     }
 
     /// The widest member, not the average: one `pub` copy of a private helper
@@ -493,7 +521,14 @@ mod tests {
     #[test]
     fn the_cluster_hash_survives_a_reparse_that_reassigns_ids() {
         let before = [
-            member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+            member(
+                1,
+                "parse",
+                "src/a.rs",
+                Some("alpha"),
+                Visibility::Public,
+                10,
+            ),
             member(2, "parse", "src/b.rs", Some("beta"), Visibility::Public, 10),
         ];
         // Same code, reparsed: new ids, and the symbols moved down the file.
@@ -517,19 +552,37 @@ mod tests {
 
     #[test]
     fn the_cluster_hash_ignores_the_order_the_members_came_back_in() {
-        let a = member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 10);
+        let a = member(
+            1,
+            "parse",
+            "src/a.rs",
+            Some("alpha"),
+            Visibility::Public,
+            10,
+        );
         let b = member(2, "parse", "src/b.rs", Some("beta"), Visibility::Public, 10);
 
-        assert_eq!(
-            cluster_hash(&[a.clone(), b.clone()]),
-            cluster_hash(&[b, a])
-        );
+        assert_eq!(cluster_hash(&[a.clone(), b.clone()]), cluster_hash(&[b, a]));
     }
 
     #[test]
     fn different_members_hash_differently() {
-        let a = [member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 10)];
-        let b = [member(1, "parse", "src/a.rs", Some("beta"), Visibility::Public, 10)];
+        let a = [member(
+            1,
+            "parse",
+            "src/a.rs",
+            Some("alpha"),
+            Visibility::Public,
+            10,
+        )];
+        let b = [member(
+            1,
+            "parse",
+            "src/a.rs",
+            Some("beta"),
+            Visibility::Public,
+            10,
+        )];
 
         assert_ne!(cluster_hash(&a), cluster_hash(&b));
     }
@@ -538,8 +591,22 @@ mod tests {
     /// `("a", "b::c")` would concatenate to the same bytes.
     #[test]
     fn a_module_boundary_cannot_be_faked_by_a_name() {
-        let a = [member(1, "c", "src/a.rs", Some("a::b"), Visibility::Public, 10)];
-        let b = [member(1, "b::c", "src/a.rs", Some("a"), Visibility::Public, 10)];
+        let a = [member(
+            1,
+            "c",
+            "src/a.rs",
+            Some("a::b"),
+            Visibility::Public,
+            10,
+        )];
+        let b = [member(
+            1,
+            "b::c",
+            "src/a.rs",
+            Some("a"),
+            Visibility::Public,
+            10,
+        )];
 
         assert_ne!(cluster_hash(&a), cluster_hash(&b));
     }
@@ -630,7 +697,10 @@ mod tests {
         let out = render(&[c], &mut |_| None);
 
         assert!(!out.contains("```"), "no empty fence:\n{out}");
-        assert!(out.contains("`src/a.rs:11-13`"), "the location still:\n{out}");
+        assert!(
+            out.contains("`src/a.rs:11-13`"),
+            "the location still:\n{out}"
+        );
     }
 
     #[test]
@@ -770,7 +840,11 @@ mod tests {
         .unwrap();
         add_entry(
             &conn,
-            &decision("newer-decision", vec![IGNORE_TAG.to_string()], EntryType::Decision),
+            &decision(
+                "newer-decision",
+                vec![IGNORE_TAG.to_string()],
+                EntryType::Decision,
+            ),
         )
         .unwrap();
 
@@ -784,7 +858,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            get_entry_without_tracking(&conn, &id).unwrap().unwrap().status,
+            get_entry_without_tracking(&conn, &id)
+                .unwrap()
+                .unwrap()
+                .status,
             EntryStatus::Superseded,
             "the edge flipped the status"
         );
@@ -796,7 +873,12 @@ mod tests {
     fn a_cluster_nobody_accepted_is_not_filtered() {
         let conn = memory_db();
 
-        assert_eq!(filter_ignored(&conn, vec![ignored_cluster()]).unwrap().len(), 1);
+        assert_eq!(
+            filter_ignored(&conn, vec![ignored_cluster()])
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// Suppression fails open here for the same reason it does in the
@@ -808,7 +890,11 @@ mod tests {
         let c = ignored_cluster();
         let id = ignore_entry_id(&c.cluster_hash());
 
-        add_entry(&conn, &decision(&id, vec!["unrelated".into()], EntryType::Decision)).unwrap();
+        add_entry(
+            &conn,
+            &decision(&id, vec!["unrelated".into()], EntryType::Decision),
+        )
+        .unwrap();
         assert!(!is_ignored(&conn, &c.cluster_hash()).unwrap(), "wrong tag");
 
         crate::store::memory::update_entry(
@@ -856,15 +942,25 @@ mod tests {
         assert_eq!(id, ignore_entry_id(&c.cluster_hash()));
         let entry = get_entry_without_tracking(&ctx.conn, &id).unwrap().unwrap();
         assert_eq!(entry.entry_type, EntryType::Decision);
-        assert!(entry.tags.iter().any(|t| t == IGNORE_TAG), "{:?}", entry.tags);
+        assert!(
+            entry.tags.iter().any(|t| t == IGNORE_TAG),
+            "{:?}",
+            entry.tags
+        );
         assert_eq!(entry.status, EntryStatus::Active);
         assert_eq!(entry.source_type, SourceType::UserStatement);
         assert!(
-            entry.content.contains("Two adapters, deliberately not shared."),
+            entry
+                .content
+                .contains("Two adapters, deliberately not shared."),
             "the rationale:\n{}",
             entry.content
         );
-        assert!(entry.content.contains("src/a.rs:11"), "where:\n{}", entry.content);
+        assert!(
+            entry.content.contains("src/a.rs:11"),
+            "where:\n{}",
+            entry.content
+        );
         // And what it wrote is what the filter reads.
         assert!(is_ignored(&ctx.conn, &c.cluster_hash()).unwrap());
     }
@@ -877,13 +973,18 @@ mod tests {
     #[test]
     fn the_ignore_list_reuses_the_memory_store_rather_than_adding_to_it() {
         let source = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/code/duplication/report.rs"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/code/duplication/report.rs"),
         )
         .unwrap();
         let code = source.split("#[cfg(test)]").next().unwrap();
 
-        for sql in ["CREATE TABLE", "ALTER TABLE", "INSERT INTO", "UPDATE ", "memory_entries"] {
+        for sql in [
+            "CREATE TABLE",
+            "ALTER TABLE",
+            "INSERT INTO",
+            "UPDATE ",
+            "memory_entries",
+        ] {
             assert!(!code.contains(sql), "report.rs writes its own SQL: {sql}");
         }
     }

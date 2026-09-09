@@ -128,9 +128,7 @@ pub fn cluster<S: BuildHasher>(
     let mut groups: Vec<Vec<usize>> = uf
         .groups()
         .into_iter()
-        .flat_map(|component| {
-            dense_groups(&component, |i| fingerprints[i].simhash, &admissible)
-        })
+        .flat_map(|component| dense_groups(&component, |i| fingerprints[i].simhash, admissible))
         .collect();
     groups.sort_unstable_by_key(|g| g[0]);
     groups

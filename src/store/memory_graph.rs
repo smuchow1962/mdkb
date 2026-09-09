@@ -289,7 +289,10 @@ fn live(entry: Option<MemoryEntry>) -> Option<MemoryEntry> {
     if entry.status == memory::EntryStatus::Superseded {
         return None;
     }
-    if entry.expires_at.is_some_and(|exp| exp <= Utc::now().timestamp()) {
+    if entry
+        .expires_at
+        .is_some_and(|exp| exp <= Utc::now().timestamp())
+    {
         return None;
     }
     Some(entry)

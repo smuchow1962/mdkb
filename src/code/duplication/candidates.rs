@@ -261,7 +261,17 @@ mod tests {
     fn a_tier_1_call_edge_suppresses_the_pair() {
         let conn = db();
         sym(&conn, 1, "wrapper", "Function", 1, "src/a.rs", 0, 20, None);
-        sym(&conn, 2, "open", "Method", 1, "src/a.rs", 30, 50, Some("Store"));
+        sym(
+            &conn,
+            2,
+            "open",
+            "Method",
+            1,
+            "src/a.rs",
+            30,
+            50,
+            Some("Store"),
+        );
         conn.execute(
             "INSERT INTO code_relationships \
              (from_symbol_id, from_name, to_name, kind, file_id, to_qualifier) \
@@ -272,7 +282,10 @@ mod tests {
 
         let pairs = confident_call_pairs(&conn, MAX_SUPPRESSING_TIER).unwrap();
 
-        assert!(pairs.contains(&(1, 2)), "tier 1 is a placed edge: {pairs:?}");
+        assert!(
+            pairs.contains(&(1, 2)),
+            "tier 1 is a placed edge: {pairs:?}"
+        );
     }
 
     /// The raw cascade, so a test can show which tier an edge reached without
@@ -381,7 +394,17 @@ mod tests {
         let conn = db();
         // Owner plus matching qualifier, so the edge resolves at tier 1 and the
         // test cannot pass merely because the tier filter rejected it.
-        sym(&conn, 1, "recurse", "Method", 1, "src/a.rs", 0, 20, Some("T"));
+        sym(
+            &conn,
+            1,
+            "recurse",
+            "Method",
+            1,
+            "src/a.rs",
+            0,
+            20,
+            Some("T"),
+        );
         conn.execute(
             "INSERT INTO code_relationships \
              (from_symbol_id, from_name, to_name, kind, file_id, to_qualifier) \
@@ -390,7 +413,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(nearest_tiers(&conn), [(1, 1, 1)], "tier 1, and it is a loop");
+        assert_eq!(
+            nearest_tiers(&conn),
+            [(1, 1, 1)],
+            "tier 1, and it is a loop"
+        );
         assert!(
             confident_call_pairs(&conn, MAX_SUPPRESSING_TIER)
                 .unwrap()
@@ -404,7 +431,17 @@ mod tests {
         // Direction is irrelevant to suppression, so the caller must not have
         // to try both orders.
         let conn = db();
-        sym(&conn, 5, "callee", "Method", 1, "src/a.rs", 0, 20, Some("T"));
+        sym(
+            &conn,
+            5,
+            "callee",
+            "Method",
+            1,
+            "src/a.rs",
+            0,
+            20,
+            Some("T"),
+        );
         sym(&conn, 9, "caller", "Function", 1, "src/a.rs", 30, 50, None);
         conn.execute(
             "INSERT INTO code_relationships \
@@ -436,7 +473,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(nearest_tiers(&conn).is_empty(), "resolved_edges is Calls-only");
+        assert!(
+            nearest_tiers(&conn).is_empty(),
+            "resolved_edges is Calls-only"
+        );
         assert!(
             confident_call_pairs(&conn, MAX_SUPPRESSING_TIER)
                 .unwrap()

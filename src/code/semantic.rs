@@ -774,10 +774,7 @@ mod tests {
         let path = dir.path().join("truncated.bin");
         let store = VectorStore::open(&path).unwrap();
         store
-            .write_all(&[
-                (1, vec![0.5; EMBEDDING_DIM]),
-                (2, vec![0.5; EMBEDDING_DIM]),
-            ])
+            .write_all(&[(1, vec![0.5; EMBEDDING_DIM]), (2, vec![0.5; EMBEDDING_DIM])])
             .unwrap();
 
         // Cut the second entry away, leaving the header still claiming two.

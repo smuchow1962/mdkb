@@ -2000,14 +2000,7 @@ mod tests {
         let (here_file, caller) = file_with_function(&db, "caller", "here.php", "App\\Here");
         let local = function_in(&db, "run", (here_file, "here.php"), "App\\Here", 10);
         let (util_file, _) = file_with_function(&db, "unrelated", "util.php", "App\\Util");
-        let member = method_in(
-            &db,
-            "run",
-            "Util",
-            (util_file, "util.php"),
-            "App\\Util",
-            5,
-        );
+        let member = method_in(&db, "run", "Util", (util_file, "util.php"), "App\\Util", 5);
         db.insert_relationship(
             Some(caller),
             "caller",
@@ -2456,10 +2449,26 @@ mod tests {
             )
             .unwrap();
 
-        db.insert_relationship(Some(near), "near", "root", None, "Calls", near_file, (None, None))
-            .unwrap();
-        db.insert_relationship(Some(far), "far", "root", None, "Calls", far_file, (None, None))
-            .unwrap();
+        db.insert_relationship(
+            Some(near),
+            "near",
+            "root",
+            None,
+            "Calls",
+            near_file,
+            (None, None),
+        )
+        .unwrap();
+        db.insert_relationship(
+            Some(far),
+            "far",
+            "root",
+            None,
+            "Calls",
+            far_file,
+            (None, None),
+        )
+        .unwrap();
         db.insert_relationship(
             Some(shared),
             "shared",

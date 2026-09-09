@@ -267,7 +267,11 @@ impl DupEmbedder {
                 .with_cache_dir(dup_cache_dir())
                 .with_show_download_progress(true),
         )
-        .map_err(|e| Error::other(format!("failed to initialise duplication model {name}: {e}")))?;
+        .map_err(|e| {
+            Error::other(format!(
+                "failed to initialise duplication model {name}: {e}"
+            ))
+        })?;
         Ok(Self {
             model,
             name: name.to_string(),
@@ -531,7 +535,10 @@ mod tests {
         normalize(&mut v);
 
         assert_eq!(v, vec![0.0; 4]);
-        assert!(dot(&v, &v).is_finite(), "a NaN would drop the pair silently");
+        assert!(
+            dot(&v, &v).is_finite(),
+            "a NaN would drop the pair silently"
+        );
     }
 
     #[test]
@@ -735,13 +742,14 @@ mod tests {
     #[test]
     fn the_indexing_pipeline_does_not_reach_the_duplication_pass() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut sources: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("src/code/indexing"))
-            .expect("indexing module exists")
-            .filter_map(|e| {
-                let p = e.ok()?.path();
-                (p.extension()? == "rs").then_some(p)
-            })
-            .collect();
+        let mut sources: Vec<std::path::PathBuf> =
+            std::fs::read_dir(root.join("src/code/indexing"))
+                .expect("indexing module exists")
+                .filter_map(|e| {
+                    let p = e.ok()?.path();
+                    (p.extension()? == "rs").then_some(p)
+                })
+                .collect();
         sources.push(root.join("src/core/indexing.rs"));
         assert!(sources.len() > 1, "found no indexing sources to check");
 
@@ -758,7 +766,10 @@ mod tests {
     #[test]
     fn an_unsupported_model_name_is_refused() {
         let err = fastembed_model("BgeSmallEnV15").unwrap_err();
-        assert!(format!("{err}").contains("unsupported duplication model"), "{err}");
+        assert!(
+            format!("{err}").contains("unsupported duplication model"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -775,7 +786,10 @@ mod tests {
         let embedder = DupEmbedder::new(DEFAULT_DUP_MODEL).unwrap();
 
         let vectors = embedder
-            .embed_bodies(&["fn a(x: u32) -> u32 { x + 1 }", "fn b(y: u32) -> u32 { y + 1 }"])
+            .embed_bodies(&[
+                "fn a(x: u32) -> u32 { x + 1 }",
+                "fn b(y: u32) -> u32 { y + 1 }",
+            ])
             .unwrap();
 
         assert_eq!(vectors.len(), 2);

@@ -23,10 +23,20 @@ const SHINGLE: usize = 3;
 
 /// Bits that may differ before two bodies count as structurally unrelated.
 ///
-/// 12 of 64 — a simhash over shingles moves a handful of bits per edited
+/// 6 of 64. A simhash over shingles moves a handful of bits per edited
 /// statement, so this tolerates a body that grew a line or two while rejecting
 /// the pair that merely shares a language's boilerplate.
-pub const SIMHASH_HAMMING_THRESHOLD: u32 = 12;
+///
+/// This was 12, and 12 was measured wrong on this repository: of the 706
+/// clusters it reported, 497 sat at exactly 12 bits and 105 at 11 — 85% of the
+/// mass pressed against the cut. A threshold that finds real duplication has
+/// its mass near 0; one whose mass sits on its own boundary is reporting
+/// whatever fits, and the widest cluster it produced joined `path_like_tokens`,
+/// a `vectors.rs` test and a C++ parser. The shape held at every body size
+/// (70% at the cut for bodies over 100 nodes, 63% over 200), so it was the
+/// threshold and not an entropy floor on small bodies. 6 halves the reported
+/// lines, 38931 to 19200, and pulls the mass off the boundary.
+pub const SIMHASH_HAMMING_THRESHOLD: u32 = 6;
 
 /// Field separator inside a shingle, so `["ab", "c"]` and `["a", "bc"]` do not
 /// hash alike. ASCII unit separator: no grammar names a node with it.
@@ -165,8 +175,8 @@ fn simhash(kinds: &[&str]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::code::parsing::language::Language;
     use crate::code::indexing::pipeline::create_parser;
+    use crate::code::parsing::language::Language;
 
     /// Fingerprint of a whole Rust source, through the same parser the pipeline
     /// builds — not a hand-rolled one, so the test cannot pass against a

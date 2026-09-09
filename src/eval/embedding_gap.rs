@@ -175,7 +175,11 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
         norm_b += b[i] * b[i];
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < f32::EPSILON { 0.0 } else { dot / denom }
+    if denom < f32::EPSILON {
+        0.0
+    } else {
+        dot / denom
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +219,10 @@ mod tests {
         // No low pairs at all: the low mean has no population to average.
         let report = run_gap(&[GapCase::high("alpha beta", "alpha beta")], &bag_of_words);
 
-        assert!(report.gap.is_finite(), "an empty side must not poison the gap");
+        assert!(
+            report.gap.is_finite(),
+            "an empty side must not poison the gap"
+        );
         assert!(report.low_mean.abs() < f64::EPSILON);
     }
 
@@ -254,10 +261,7 @@ mod tests {
         // The failure the headline number exists to catch: high absolute scores
         // that carry no information, because nothing separates the populations.
         let flat = |_: &str| vec![1.0f32; 8];
-        let cases = vec![
-            GapCase::high("a", "b"),
-            GapCase::low("c", "d"),
-        ];
+        let cases = vec![GapCase::high("a", "b"), GapCase::low("c", "d")];
 
         let report = run_gap(&cases, &flat);
 
@@ -292,9 +296,8 @@ mod tests {
     fn gap_models() {
         use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-        let cache = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| {
-            format!("{}/.cache/fastembed", std::env::var("HOME").unwrap())
-        });
+        let cache = std::env::var("FASTEMBED_CACHE_DIR")
+            .unwrap_or_else(|_| format!("{}/.cache/fastembed", std::env::var("HOME").unwrap()));
         let cases = duplication_cases();
 
         // (label, model, truncate-to-dims). A truncated variant answers whether
@@ -314,7 +317,10 @@ mod tests {
             ),
         ];
 
-        println!("\n{:<32} {:>8} {:>10} {:>10}", "model", "gap", "high", "low");
+        println!(
+            "\n{:<32} {:>8} {:>10} {:>10}",
+            "model", "gap", "high", "low"
+        );
         for (label, model, truncate) in variants {
             let embedder = TextEmbedding::try_new(
                 InitOptions::new(model)

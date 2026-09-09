@@ -269,7 +269,8 @@ mod tests {
             fingerprint_candidates(&candidates, &dup, &mut files.reader(), MIN_BODY_NODES, 100)
                 .unwrap();
         // An embedding the second pass must not cost again.
-        dup.set_embedding(&first[0].body_hash, &[0.5, 0.25]).unwrap();
+        dup.set_embedding(&first[0].body_hash, &[0.5, 0.25])
+            .unwrap();
 
         let second =
             fingerprint_candidates(&candidates, &dup, &mut files.reader(), MIN_BODY_NODES, 999)

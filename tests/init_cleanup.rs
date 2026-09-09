@@ -68,17 +68,19 @@ fn update_warns_on_dead_models_keys() {
     let tmp = init_repo();
     let config = tmp.path().join(".mdkb/config.toml");
     let raw = std::fs::read_to_string(&config).unwrap();
-    // Insert the dead key INTO the existing [models] table (a second [models]
-    // table would be invalid TOML).
+    // Declare the table rather than patching one out of what `init` wrote:
+    // `init` writes its defaults commented out, so a rewrite of "[models]\n"
+    // matches inside "# [models]" and leaves the dead key at the document root,
+    // where nothing is looking for it and the warning never fires.
     assert!(
-        raw.contains("[models]"),
-        "init config has a [models] section"
+        !raw.lines().any(|l| l.trim_end() == "[models]"),
+        "init must not write a live [models] table; this fixture declares it"
     );
-    let patched = raw.replace(
-        "[models]\n",
-        "[models]\nembedding_repo = \"nomic-ai/whatever\"\n",
-    );
-    std::fs::write(&config, patched).unwrap();
+    std::fs::write(
+        &config,
+        format!("{raw}\n[models]\nembedding_repo = \"nomic-ai/whatever\"\n"),
+    )
+    .unwrap();
 
     let out = mdkb(&["update"], tmp.path());
     assert!(

@@ -488,10 +488,9 @@ impl Context {
         // durable entry projection it should track.
         ensure_store_gitignore(&memory_dir)?;
 
-        // Create default config
-        let config = Config::default();
-        let config_str = toml::to_string_pretty(&config)?;
-        std::fs::write(&config_path, config_str)?;
+        // Write the defaults commented out, so they stay discoverable without
+        // being frozen into this store. See `Config::commented_default_toml`.
+        std::fs::write(&config_path, Config::commented_default_toml()?)?;
 
         // Initialize sqlite-vec extension
         vectors::init_sqlite_vec();
@@ -566,6 +565,7 @@ pub(crate) fn ensure_store_gitignore(memory_dir: &Path) -> Result<()> {
 
 pub mod cli_mutation;
 pub mod code;
+pub mod coupling;
 pub mod dup;
 pub mod graph;
 pub mod indexing;

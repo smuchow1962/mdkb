@@ -880,6 +880,40 @@ impl Config {
         Ok(content)
     }
 
+    /// The same defaults, every line commented out.
+    ///
+    /// This is what `mdkb init` writes, and writing the live version instead is
+    /// a measured bug: `Config` and all 20 of its sections are
+    /// `#[serde(default)]`, so a key absent from the file takes the value in
+    /// the code — but a key *present* takes the file's. Materialising every
+    /// default froze them at whatever they were the day a store was created.
+    /// Lowering `code.duplication.hamming_threshold` from 12 to 6 reached no
+    /// existing store for exactly this reason: the 12 was already on disk.
+    ///
+    /// Commented out, the file still shows every option and its shipped value —
+    /// which is why `init` writes one at all — while the code stays the single
+    /// place a default lives. Uncommenting a line is then what it looks like:
+    /// a deliberate override, not an accident of creation date.
+    pub fn commented_default_toml() -> Result<String> {
+        let mut out = String::from(
+            "# mdkb configuration.\n\
+             #\n\
+             # Every line below is the shipped default, commented out. Leave it\n\
+             # commented and the value follows the code as mdkb is upgraded;\n\
+             # uncomment a line to pin that one setting to a value of your own.\n\n",
+        );
+        for line in Self::default_toml()?.lines() {
+            if line.trim().is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str("# ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        Ok(out)
+    }
+
     /// Validate configuration values.
     pub fn validate(&self) -> Result<()> {
         // Search validation
@@ -1458,7 +1492,10 @@ threshold = 0.5
         let mut config = Config::default();
         config.code.duplication.similarity_threshold = 1.5;
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("code.duplication.similarity_threshold"), "{err}");
+        assert!(
+            err.contains("code.duplication.similarity_threshold"),
+            "{err}"
+        );
 
         config.code.duplication.similarity_threshold = -0.1;
         assert!(config.validate().is_err());
@@ -1495,6 +1532,38 @@ threshold = 0.5
         assert!(err.contains("code.duplication.model"), "{err}");
     }
 
+    /// The file `init` writes must not pin anything.
+    ///
+    /// Writing the live defaults instead is how lowering
+    /// `hamming_threshold` from 12 to 6 reached no store that already existed:
+    /// the old value was sitting in every `config.toml` ever created, and a
+    /// present key beats the code.
+    #[test]
+    fn the_config_init_writes_pins_no_value() {
+        let written = Config::commented_default_toml().unwrap();
+
+        for (n, line) in written.lines().enumerate() {
+            assert!(
+                line.trim().is_empty() || line.starts_with('#'),
+                "line {} would pin a value: {line:?}",
+                n + 1
+            );
+        }
+
+        // Commented out is not the same as absent: the options still have to be
+        // readable, or there is no reason to write the file at all.
+        assert!(written.contains("hamming_threshold"), "{written}");
+        assert!(written.contains("[code.duplication]"), "{written}");
+
+        // And what it parses to is the defaults, not an empty config.
+        let parsed: Config = toml::from_str(&written).expect("a fully commented file still parses");
+        assert_eq!(
+            parsed.code.duplication.hamming_threshold,
+            Config::default().code.duplication.hamming_threshold,
+            "a commented file must take the value from the code"
+        );
+    }
+
     #[test]
     fn test_duplication_defaults_match_the_measured_gate() {
         let config = Config::default();
@@ -1503,7 +1572,7 @@ threshold = 0.5
         assert!(dup.enabled);
         assert_eq!(dup.model, "JinaEmbeddingsV2BaseCode");
         assert!((dup.similarity_threshold - 0.70).abs() < f32::EPSILON);
-        assert_eq!(dup.hamming_threshold, 12);
+        assert_eq!(dup.hamming_threshold, 6);
         assert_eq!(dup.min_nodes, 30);
         assert!(config.validate().is_ok(), "the defaults must be valid");
     }
