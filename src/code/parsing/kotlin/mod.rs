@@ -8,7 +8,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, is_plain_path, node_range,
+    EdgeWalk, LanguageParser, check_recursion_depth, is_plain_path, node_range,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -614,12 +614,9 @@ impl KotlinParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut imports = Vec::new();
-        Self::find_imports_in_node(tree.root_node(), code, file_id, 0, &mut imports);
-        imports
+        self.parser.collect(code, |root, code, found| {
+            Self::find_imports_in_node(*root, code, file_id, 0, found);
+        })
     }
 
     fn find_imports_in_node(
@@ -665,15 +662,6 @@ impl KotlinParser {
     }
 
     // ── Calls ───────────────────────────────────────────────────────────
-
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
 
     fn find_calls_in_node<'a>(
         node: &Node,
@@ -1094,6 +1082,10 @@ fn extract_delegation_type<'a>(
 // ── LanguageParser trait impl ───────────────────────────────────────────
 
 impl LanguageParser for KotlinParser {
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
+    }
+
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
@@ -1110,35 +1102,28 @@ impl LanguageParser for KotlinParser {
         extract_kdoc(node, code)
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
+        })
     }
 
-    fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut results = Vec::new();
-        Self::find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
-        results
+    fn implementations_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_implementations_in_node(root, code, 0, found);
+        })
     }
 
-    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut uses = Vec::new();
-        Self::find_uses_in_node(&tree.root_node(), code, 0, &mut uses);
-        uses
+    fn uses_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_uses_in_node(root, code, 0, found);
+        })
     }
 
-    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut defines = Vec::new();
-        Self::find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
-        defines
+    fn defines_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_defines_in_node(root, code, 0, found);
+        })
     }
 
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
@@ -1344,7 +1329,7 @@ class App {
 }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
@@ -1373,11 +1358,7 @@ class App {
 }
 "#;
 
-        let targets: Vec<&str> = parser
-            .find_calls_impl(code)
-            .iter()
-            .map(|(_, t, _)| *t)
-            .collect();
+        let targets: Vec<&str> = parser.find_calls(code).iter().map(|(_, t, _)| *t).collect();
         assert!(
             targets.contains(&"Other.stat"),
             "a named receiver must be kept: {targets:?}"

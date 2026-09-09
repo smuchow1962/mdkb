@@ -5,7 +5,8 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, node_range, receiver_call_target, unnamed_call_target,
+    EdgeWalk, LanguageParser, check_recursion_depth, node_range, receiver_call_target,
+    unnamed_call_target,
 };
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -1067,12 +1068,9 @@ impl GoParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut imports = Vec::new();
-        Self::extract_imports_from_node(tree.root_node(), code, file_id, &mut imports, 0);
-        imports
+        self.parser.collect(code, |root, code, found| {
+            Self::extract_imports_from_node(*root, code, file_id, found, 0);
+        })
     }
 
     fn extract_imports_from_node(
@@ -1212,15 +1210,6 @@ impl GoParser {
         }
     }
 
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::extract_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
-        calls
-    }
-
     // ── Type uses ───────────────────────────────────────────────────────
 
     #[allow(clippy::only_used_in_recursion)]
@@ -1336,15 +1325,6 @@ impl GoParser {
         }
     }
 
-    fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut uses = Vec::new();
-        Self::extract_type_uses_recursive(&tree.root_node(), code, &mut uses, 0);
-        uses
-    }
-
     // ── Method defines ──────────────────────────────────────────────────
 
     #[allow(clippy::only_used_in_recursion)]
@@ -1392,15 +1372,6 @@ impl GoParser {
         for child in node.children(&mut node.walk()) {
             Self::extract_method_defines_recursive(&child, code, defines, depth + 1);
         }
-    }
-
-    fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut defines = Vec::new();
-        Self::extract_method_defines_recursive(&tree.root_node(), code, &mut defines, 0);
-        defines
     }
 }
 
@@ -1487,6 +1458,10 @@ fn extract_go_type_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
 // ── LanguageParser trait impl ───────────────────────────────────────────
 
 impl LanguageParser for GoParser {
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
+    }
+
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
@@ -1503,8 +1478,10 @@ impl LanguageParser for GoParser {
         Self::extract_doc_comment_impl(node, code)
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::extract_calls_recursive(root, code, Some("<module>"), found, 0);
+        })
     }
 
     /// Go uses implicit interface implementation (duck typing).
@@ -1518,12 +1495,16 @@ impl LanguageParser for GoParser {
         Vec::new()
     }
 
-    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_uses_impl(code)
+    fn uses_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::extract_type_uses_recursive(root, code, found, 0);
+        })
     }
 
-    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_defines_impl(code)
+    fn defines_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::extract_method_defines_recursive(root, code, found, 0);
+        })
     }
 
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
@@ -2077,7 +2058,7 @@ func process() {}
 func getData() string { return "" }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
@@ -2112,7 +2093,7 @@ func main() {
 }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
@@ -2140,7 +2121,7 @@ func (s *Server) Start() {}
 func (s *Server) Stop() {}
 "#;
 
-        let defines = parser.find_defines_impl(code);
+        let defines = parser.find_defines(code);
         assert!(
             defines
                 .iter()

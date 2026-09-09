@@ -7,8 +7,8 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, find_modifier_keyword, node_range, receiver_call_target,
-    unnamed_call_target,
+    EdgeWalk, LanguageParser, check_recursion_depth, find_modifier_keyword, node_range,
+    receiver_call_target, unnamed_call_target,
 };
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -753,12 +753,9 @@ impl TypeScriptParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut imports = Vec::new();
-        Self::collect_imports(tree.root_node(), code, file_id, &mut imports);
-        imports
+        self.parser.collect(code, |root, code, found| {
+            Self::collect_imports(*root, code, file_id, found);
+        })
     }
 
     fn collect_imports(node: Node, code: &str, file_id: FileId, imports: &mut Vec<Import>) {
@@ -978,15 +975,6 @@ impl TypeScriptParser {
         }
     }
 
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::extract_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
-        calls
-    }
-
     // ── Implementations / extends ───────────────────────────────────────
 
     fn find_implementations_in_node<'a>(
@@ -1169,15 +1157,6 @@ impl TypeScriptParser {
         }
     }
 
-    fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut uses = Vec::new();
-        Self::extract_type_uses_recursive(&tree.root_node(), code, &mut uses, 0);
-        uses
-    }
-
     // ── Method defines ──────────────────────────────────────────────────
 
     #[allow(clippy::only_used_in_recursion)]
@@ -1233,15 +1212,6 @@ impl TypeScriptParser {
         for child in node.children(&mut node.walk()) {
             Self::extract_method_defines_recursive(&child, code, defines, depth + 1);
         }
-    }
-
-    fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut defines = Vec::new();
-        Self::extract_method_defines_recursive(&tree.root_node(), code, &mut defines, 0);
-        defines
     }
 }
 
@@ -1370,6 +1340,10 @@ fn extract_ts_type_from_annotation<'a>(
 // ── LanguageParser trait impl ───────────────────────────────────────────
 
 impl LanguageParser for TypeScriptParser {
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
+    }
+
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
@@ -1386,34 +1360,34 @@ impl LanguageParser for TypeScriptParser {
         extract_jsdoc(node, code)
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::extract_calls_recursive(root, code, Some("<module>"), found, 0);
+        })
     }
 
-    fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut results = Vec::new();
-        Self::find_implementations_in_node(tree.root_node(), code, 0, &mut results, false);
-        results
+    fn implementations_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_implementations_in_node(*root, code, 0, found, false);
+        })
     }
 
-    fn find_extends<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut results = Vec::new();
-        Self::find_implementations_in_node(tree.root_node(), code, 0, &mut results, true);
-        results
+    fn extends_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_implementations_in_node(*root, code, 0, found, true);
+        })
     }
 
-    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_uses_impl(code)
+    fn uses_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::extract_type_uses_recursive(root, code, found, 0);
+        })
     }
 
-    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_defines_impl(code)
+    fn defines_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::extract_method_defines_recursive(root, code, found, 0);
+        })
     }
 
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
@@ -1651,7 +1625,7 @@ function boot() {
 "#;
 
         let calls: Vec<(&str, &str)> = parser
-            .find_calls_impl(code)
+            .find_calls(code)
             .into_iter()
             .map(|(caller, target, _)| (caller, target))
             .collect();
@@ -1694,7 +1668,7 @@ function process(): void {}
 function getData(): string { return ""; }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
@@ -1723,7 +1697,7 @@ if (require.main === module) {
 }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
@@ -1790,7 +1764,7 @@ function main(): void {
 }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
@@ -1979,11 +1953,11 @@ export namespace Ext {}
         // than failing one file.
         let mut parser = TypeScriptParser::new().unwrap();
 
-        let chain = "a".to_string()
-            + &".b".repeat(crate::code::parsing::parser::MAX_AST_DEPTH * 40);
+        let chain =
+            "a".to_string() + &".b".repeat(crate::code::parsing::parser::MAX_AST_DEPTH * 40);
         let code = format!("function run() {{ {chain}.c(); }}");
 
-        let calls = parser.find_calls_impl(&code);
+        let calls = parser.find_calls(&code);
         assert_eq!(calls.len(), 1, "the call is still recorded");
     }
 
@@ -2002,7 +1976,7 @@ function run() {
 }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         let targets: Vec<&str> = calls.iter().map(|(_, t, _)| *t).collect();
 
         assert!(
@@ -2101,7 +2075,7 @@ abstract class Base {
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_ref()).collect();
 
-        for (owner, member, _) in parser.find_defines_impl(code) {
+        for (owner, member, _) in parser.find_defines(code) {
             assert!(
                 names.contains(&member),
                 "find_defines reports {owner}.{member}, but parse_symbols does not: {names:?}"

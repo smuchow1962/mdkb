@@ -5,8 +5,8 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, find_modifier_keyword, last_name_segment, node_range,
-    receiver_call_target,
+    EdgeWalk, LanguageParser, check_recursion_depth, find_modifier_keyword, last_name_segment,
+    node_range, receiver_call_target,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -510,15 +510,6 @@ impl PhpParser {
         }
     }
 
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
-
     fn find_calls_in_node<'a>(
         node: &Node,
         code: &'a str,
@@ -576,12 +567,9 @@ impl PhpParser {
         code: &'a str,
         clause: &str,
     ) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut found = Vec::new();
-        Self::find_inheritance_in_node(tree.root_node(), code, clause, 0, &mut found);
-        found
+        self.parser.collect(code, |root, code, found| {
+            Self::find_inheritance_in_node(*root, code, clause, 0, found);
+        })
     }
 
     fn find_inheritance_in_node<'a>(
@@ -619,15 +607,6 @@ impl PhpParser {
         for child in node.children(&mut node.walk()) {
             Self::find_inheritance_in_node(child, code, clause, depth + 1, found);
         }
-    }
-
-    fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut uses = Vec::new();
-        Self::find_uses_in_node(tree.root_node(), code, "<module>", 0, &mut uses);
-        uses
     }
 
     fn find_uses_in_node<'a>(
@@ -671,15 +650,6 @@ impl PhpParser {
         }
     }
 
-    fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut defines = Vec::new();
-        Self::find_defines_in_node(tree.root_node(), code, 0, &mut defines);
-        defines
-    }
-
     fn find_defines_in_node<'a>(
         node: Node,
         code: &'a str,
@@ -716,28 +686,25 @@ impl PhpParser {
     }
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut imports = Vec::new();
-        for child in tree.root_node().children(&mut tree.root_node().walk()) {
-            if child.kind() == "namespace_use_declaration" {
-                let text = code[child.byte_range()].trim();
-                let path = text
-                    .trim_start_matches("use ")
-                    .trim_end_matches(';')
-                    .trim()
-                    .to_string();
-                imports.push(Import {
-                    path,
-                    alias: None,
-                    file_id,
-                    is_glob: false,
-                    is_type_only: false,
-                });
+        self.parser.collect(code, |root, code, imports| {
+            for child in root.children(&mut root.walk()) {
+                if child.kind() == "namespace_use_declaration" {
+                    let text = code[child.byte_range()].trim();
+                    let path = text
+                        .trim_start_matches("use ")
+                        .trim_end_matches(';')
+                        .trim()
+                        .to_string();
+                    imports.push(Import {
+                        path,
+                        alias: None,
+                        file_id,
+                        is_glob: false,
+                        is_type_only: false,
+                    });
+                }
             }
-        }
-        imports
+        })
     }
 }
 
@@ -804,6 +771,10 @@ fn extract_phpdoc(node: &Node, code: &str) -> Option<String> {
 }
 
 impl LanguageParser for PhpParser {
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
+    }
+
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
@@ -820,8 +791,10 @@ impl LanguageParser for PhpParser {
         extract_phpdoc(node, code)
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
+        })
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
@@ -832,12 +805,16 @@ impl LanguageParser for PhpParser {
         self.find_inheritance_impl(code, "base_clause")
     }
 
-    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_uses_impl(code)
+    fn uses_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_uses_in_node(*root, code, "<module>", 0, found);
+        })
     }
 
-    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_defines_impl(code)
+    fn defines_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_defines_in_node(*root, code, 0, found);
+        })
     }
 
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
@@ -1017,7 +994,7 @@ class App extends Base {
 }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
 
         assert!(edges.contains(&("run", "Foo")), "new Foo(): {edges:?}");

@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, extract_c_family_doc, node_range,
+    EdgeWalk, LanguageParser, check_recursion_depth, extract_c_family_doc, node_range,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -484,38 +484,26 @@ impl CParser {
     }
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut imports = Vec::new();
-        for child in tree.root_node().children(&mut tree.root_node().walk()) {
-            if child.kind() == "preproc_include" {
-                if let Some(path_node) = child.child_by_field_name("path") {
-                    let raw = &code[path_node.byte_range()];
-                    let path = raw
-                        .trim_start_matches(['"', '<'])
-                        .trim_end_matches(['"', '>'])
-                        .to_string();
-                    imports.push(Import {
-                        path,
-                        alias: None,
-                        file_id,
-                        is_glob: false,
-                        is_type_only: false,
-                    });
+        self.parser.collect(code, |root, code, imports| {
+            for child in root.children(&mut root.walk()) {
+                if child.kind() == "preproc_include" {
+                    if let Some(path_node) = child.child_by_field_name("path") {
+                        let raw = &code[path_node.byte_range()];
+                        let path = raw
+                            .trim_start_matches(['"', '<'])
+                            .trim_end_matches(['"', '>'])
+                            .to_string();
+                        imports.push(Import {
+                            path,
+                            alias: None,
+                            file_id,
+                            is_glob: false,
+                            is_type_only: false,
+                        });
+                    }
                 }
             }
-        }
-        imports
-    }
-
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
+        })
     }
 
     fn find_calls_in_node<'a>(
@@ -619,6 +607,10 @@ fn extract_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
 }
 
 impl LanguageParser for CParser {
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
+    }
+
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
@@ -635,8 +627,10 @@ impl LanguageParser for CParser {
         extract_c_family_doc(node, code)
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
+        })
     }
 
     fn find_implementations<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
@@ -729,7 +723,13 @@ mod tests {
         );
 
         for member in [
-            "Box.plain", "Box.ptr", "Box.arr", "Box.cb", "Box.flag", "Box.a", "Box.b",
+            "Box.plain",
+            "Box.ptr",
+            "Box.arr",
+            "Box.cb",
+            "Box.flag",
+            "Box.a",
+            "Box.b",
         ] {
             assert!(
                 names.iter().any(|n| n == member),
@@ -963,7 +963,7 @@ int main() {
 }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
