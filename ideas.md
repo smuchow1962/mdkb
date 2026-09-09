@@ -174,7 +174,7 @@ claimed for that directory. And the cluster came back, smaller, over the same 11
 modules. That is the whole measured return so far.
 
 **Precision, by hand.** Eight clusters drawn at random from the 6-bit bucket —
-68% of the headline — gave 1 clearly worth extracting (`get_aggregate_tool_usage`
+two thirds of the headline — gave 1 clearly worth extracting (`get_aggregate_tool_usage`
 and two siblings in `stats.rs`), 2 true but marginal, and **5 false positives**:
 a C# parser function paired with a CLI integration test, `has_modifier_keyword`
 paired with `extract_php_namespace`, four unrelated functions from four
@@ -183,20 +183,20 @@ Six clusters drawn from the 0-bit bucket were **6 of 6 genuine**.
 
 **The conclusion the numbers force.** Signal is concentrated at the low end and
 noise at the cut, where two thirds of the claimed lines live. The trustworthy
-core here is the 88 clusters at ≤3 bits, 2037 lines, **9% of what the report
-claims**. The honest headline for this repository is not "23480 duplicated
-lines"; it is "about 2000 lines of real duplication, inside a report that says
-eleven times that".
+core here is the 78 clusters at ≤3 bits, 1776 lines, **8% of what the report
+claims**. The honest headline for this repository is not "22727 duplicated
+lines"; it is "under 2000 lines of real duplication, inside a report that says
+twelve times that".
 
 Three things follow, in order of value:
 
 1. **Report by bucket, not as one number.** A reader who sees `47 clusters at 0
-   bits` above `388 at the cut` calibrates in one glance. The headline sums them
-   and hides the difference. **Cost: low** — the distance is already computed
-   per cluster, so this is a rendering change plus the same breakdown in the
-   JSON and CSV surfaces.
+   bits` above `371 at the cut` calibrates in one glance. The headline sums
+   them and hides the difference. `--format json` now carries the distance per
+   cluster, so a caller can bucket for itself; the prose headline still cannot.
+   **Cost: low** — nothing is left to compute, only to print.
 2. **The threshold needs a labelled case set**, not another guess. 12 was wrong,
-   6 is better and still puts 68% of its output on its own boundary. Nothing
+   6 is better and still puts two thirds of its output on its own boundary. Nothing
    measured so far justifies a third guessed constant. **Cost: the label work,
    which is human** — this is the one entry on this list that cannot be
    delivered by writing code, and it gates §6.

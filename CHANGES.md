@@ -6,7 +6,7 @@ Two questions the index could not answer before: *what does this repository say
 twice?* and *what changes together without any edge saying why?*
 
 Read the duplication report knowing what it is worth. Measured on this
-repository, 68% of the lines it claims sit at exactly the threshold, and a
+repository, 66% of the lines it claims sit at exactly the threshold, and a
 hand-classified sample of that bucket was 5 false positives out of 8. The
 trustworthy core is the clusters at 0–3 bits apart. The numbers are under *The
 structural threshold* below, because a reader who does not have them will
@@ -29,9 +29,13 @@ over-trust the headline.
   your change did not touch, so narrowing the candidates first deletes the very
   symbols the answer is made of. The whole index is fingerprinted and clustered
   as always, and only the **report** is narrowed, to clusters with at least one
-  member among the changed files. On this repository 709 clusters become 260
-  over 44 changed files, and the unchanged twin is still named in each one —
-  which is the finding. Two behaviours a test pins: an unresolvable ref is an
+  member among the changed files. On this repository a sweep of 690 clusters
+  came back as 230 against an uncommitted working tree, and the unchanged twin
+  is still named in each one — which is the finding. (The exact pair moves with
+  the tree; what does not is that the twin survives the narrowing.) Note that a
+  worktree shares its main worktree's store by design, so `--since` compares
+  the tree the store is anchored to, not the checkout you typed the command in.
+  Two behaviours a test pins: an unresolvable ref is an
   error and never an empty report, because an empty report reads as "your change
   duplicated nothing"; and untracked files count, because `git diff --name-only`
   lists tracked work only while a brand-new file duplicating existing code is
@@ -76,16 +80,18 @@ over-trust the headline.
   bodies over 100 AST nodes, 63% over 200), so it was the threshold and not an
   entropy floor on small bodies. Reported lines halve, 38931 to 19200.
 
-  The distribution did **not** come off the boundary. Over the 652 structural
-  clusters of a full sweep at the shipped threshold:
+  The distribution did **not** come off the boundary. One sweep of this
+  repository, 690 clusters claiming 22727 lines, broken out by the distance
+  that admitted each one (`mdkb dup --format json` is where these come from):
 
   | bits apart | clusters | lines claimed | share of lines |
   |---:|---:|---:|---:|
-  | 0 | 47 | 1103 | 4.9% |
-  | 1–3 | 41 | 934 | 4.1% |
-  | 4 | 57 | 1269 | 5.6% |
-  | 5 | 119 | 3875 | 17.1% |
-  | **6 (the cut)** | **388** | **15456** | **68.3%** |
+  | 0 | 40 | 922 | 4.1% |
+  | 1–3 | 38 | 854 | 3.8% |
+  | 4 | 57 | 1397 | 6.1% |
+  | 5 | 124 | 3619 | 15.9% |
+  | **6 (the cut)** | **371** | **15034** | **66.2%** |
+  | semantic (cosine, no distance) | 60 | 901 | 4.0% |
 
   Halving the threshold moved the cliff; it did not remove it. The shape belongs
   to simhash over shingles, not to the number 12, so 6 is an improvement and not
