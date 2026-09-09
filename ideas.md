@@ -51,8 +51,25 @@ whatever fits. The widest cluster it produced joined `path_like_tokens`, a
 Two competing explanations were tested and one was ruled out: the share at the
 cut held at every body size (70% for bodies over 100 AST nodes, 63% over 200), so
 it was the threshold and not an entropy floor on small bodies. At 6 bits the
-reported lines halve, 38931 to 19200, and the distribution comes off the
-boundary.
+reported lines halve, 38931 to 19200.
+
+**But the distribution did not come off the boundary, and an earlier draft of
+this document claimed it did.** Re-measured on the shipped threshold, over the
+652 structural clusters of a full sweep:
+
+| bits apart | clusters | lines claimed | share of lines |
+|---:|---:|---:|---:|
+| 0 | 47 | 1103 | 4.9% |
+| 1–3 | 41 | 934 | 4.1% |
+| 4 | 57 | 1269 | 5.6% |
+| 5 | 119 | 3875 | 17.1% |
+| **6 (the cut)** | **388** | **15456** | **68.3%** |
+
+60% of the clusters, and 68% of every line the headline claims, still sit at
+exactly the threshold. Halving it moved the cliff; it did not remove it. The
+shape is a property of simhash over shingles, not of the number 12 — which means
+the number was never the whole fix, and treating the 6 as settled would repeat
+the mistake that found it.
 
 ### `mdkb init` no longer freezes its defaults
 
@@ -371,6 +388,60 @@ safe direction, but it is still 32% of every edge the graph can say anything
 about. Story 041-0014 — recording the receiver expression tier 7 is missing —
 raises the ceiling on both entries. It is not polish; it is infrastructure for
 this list.
+
+---
+
+## What the audit is actually worth, measured
+
+Everything above counts what `mdkb dup` **reports**. This section is the only
+one that asks what acting on it **returns**, and the answer is uncomfortable
+enough to belong here rather than in a footnote.
+
+**The one closed loop.** Story 052 took the single most convincing finding the
+tool has produced — 13 near-identical bodies across 13 parsers, the clearest
+cluster in the report — and acted on it properly, twice: a shared helper, then a
+trait redesign. Net result across `src/code/parsing`: **−54 lines**, against the
+7143 duplicated lines the tool claimed for that directory. And the cluster came
+back, smaller, over the same 11 modules. That is the whole measured return so
+far.
+
+**Precision, by hand, on a random sample.** Eight clusters drawn from the 6-bit
+bucket — the 68% of the headline:
+
+- 1 clearly worth extracting (`get_aggregate_tool_usage` and two siblings in
+  `stats.rs`: same file, same subject, same prepare-map-collect shape)
+- 2 true but marginal (test cases that want parametrising; `process_method` /
+  `process_object` / `process_class`, real but across three grammars)
+- **5 false positives** — a C# parser function paired with a CLI integration
+  test; `has_modifier_keyword` paired with `extract_php_namespace`; four
+  unrelated functions from four subsystems grouped because they all iterate
+  tree-sitter children and read text
+
+Six clusters drawn from the 0-bit bucket: **6 of 6 genuine** — a `create_file`
+helper copied verbatim into two test files, `names_of` duplicated between the C
+and C++ test modules, `find_existing_store` and `find_git_root` walking the tree
+identically in `git.rs`. Four of the six are test parametrisation, so cheap to
+act on and low-value; two are real.
+
+**The conclusion the numbers force.** The signal is concentrated at the low end
+and the noise is concentrated at the cut — where two thirds of the claimed lines
+live. The trustworthy core is the 88 clusters at ≤ 3 bits, 2037 lines, **9% of
+what the report claims**. The honest headline for this repository is not "23480
+duplicated lines". It is "about 2000 lines of real duplication, inside a report
+that says eleven times that".
+
+Three things follow, in order of value:
+
+1. **Report by bucket, not as one number.** A reader who sees `47 clusters at 0
+   bits` above `388 at the cut` calibrates correctly in one glance. Today the
+   headline sums them and hides the difference.
+2. **The threshold needs a labelled case set**, not another guess. 12 was wrong,
+   6 is better and still puts 68% of its output on its own boundary. Nothing
+   here justifies a third guessed constant.
+3. **Same-file and same-module clusters are the actionable ones.** Every true
+   positive in the sample shared a file or a sibling module; every false
+   positive spanned unrelated subsystems. Proximity is a cheap, strong prior the
+   ranking does not use yet.
 
 ---
 
