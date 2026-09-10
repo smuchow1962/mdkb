@@ -1076,6 +1076,7 @@ mod tests {
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
+        // Use a separate temporary directory so the target exists on either OS.
         let outside = setup_temp_dir();
         let link_path = temp.path().join("sneaky");
         symlink_dir(outside.path(), &link_path);

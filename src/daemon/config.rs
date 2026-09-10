@@ -297,6 +297,8 @@ whitelist_dirs = ["~/Code"]
     fn test_daemon_socket_path_default() {
         let config = DaemonConfig::default();
         let path = config.socket_path();
+        // Compare on components: the path is a real filesystem path and so
+        // carries the host separator, which the literal must not assume.
         assert!(path.ends_with(".mdkb/daemon.sock"));
     }
 
@@ -307,6 +309,8 @@ whitelist_dirs = ["~/Code"]
             ..Default::default()
         };
         let path = config.socket_path();
+        // Compare on components: the path is a real filesystem path and so
+        // carries the host separator, which the literal must not assume.
         assert!(path.ends_with("custom/mdkb.sock"));
     }
 
