@@ -190,6 +190,13 @@ by a session on the host that reported them.
   That is threshold-boundary churn rather than a loss — several are the same
   finding with different membership — and it lands in the bucket the report
   already ranks last.
+- **A semantic sweep from the CLI runs at background priority.** It still costs
+  the same CPU-seconds; it stops taking a core away from the editor and the
+  build that are running next to it. macOS gets `PRIO_DARWIN_BG`, which throttles
+  disk I/O along with CPU — right for a sweep that reads the index once and then
+  sits in ONNX for minutes; other unix gets nice 19. Never the daemon: it answers
+  interactive searches from a long-lived process, and backgrounding that would
+  make every search pay for an audit nobody asked it to run.
 - **Thirteen language parsers share one parse-and-collect helper, and their
   walks are data.** `mdkb dup` found the same four lines — parse, bail quietly
   on unreadable source, allocate, hand over the root — written out 50 times.

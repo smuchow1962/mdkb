@@ -3412,6 +3412,16 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
 /// `mdkb dup` and `mdkb search --scope duplicates` are two ways of asking the
 /// same question; they load the config the same way and call the same handler,
 /// so they cannot answer differently.
+/// The CLI's only duplication entry point — `mdkb dup` and
+/// `mdkb search --scope duplicates` both come through here.
+///
+/// That is why the priority drop lives in this function rather than in one of
+/// the two match arms: both are the CLI, both are the same minutes-long sweep,
+/// and putting it in one arm would leave the other running at full priority for
+/// no reason a user could explain. It is emphatically *not* in `core::dup`,
+/// which the MCP surface shares — the daemon answers interactive searches from
+/// a long-lived process, and backgrounding that would make every search pay for
+/// an audit nobody asked it to run.
 fn run_dup(
     root: &std::path::Path,
     memory: Option<&rusqlite::Connection>,
@@ -3419,6 +3429,11 @@ fn run_dup(
     overrides: &mdkb::core::dup::DupOverrides,
 ) -> mdkb::error::Result<mdkb::core::dup::DupReport> {
     let config = mdkb::config::Config::load_or_default(config_path);
+    // Only the semantic pass is worth backgrounding: the structural sweep is
+    // seconds, and a user waiting on seconds should not have them throttled.
+    if mdkb::core::dup::semantic_requested(&config.code.duplication, overrides) {
+        mdkb::cli::priority::lower_to_background();
+    }
     mdkb::core::dup::handle_dup(root, memory, &config, overrides)
 }
 

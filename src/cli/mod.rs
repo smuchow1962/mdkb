@@ -9,6 +9,7 @@ pub mod hook_logic;
 pub mod journal;
 #[cfg(unix)]
 pub mod mcp_proxy;
+pub mod priority;
 pub mod setup;
 pub mod stats_render;
 pub mod stats_render_report;
