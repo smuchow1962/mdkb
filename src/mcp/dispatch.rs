@@ -4994,14 +4994,15 @@ mod tests {
         assert!(format_quarantine_banner(tmp.path(), 0).is_none());
     }
 
-    fn make_handle(tmp: &TempDir) -> Arc<RepoHandle> {
-        let root = tmp.path().to_path_buf();
+    /// The one `RepoHandle::from_shared` in these tests.
+    ///
+    /// Every handle a test builds differs only in its root and in a line or
+    /// two of config, so the seven-argument constructor lives here once and
+    /// the callers say what is different about theirs.
+    fn handle_at(root: std::path::PathBuf, tweak: impl FnOnce(&mut Config)) -> Arc<RepoHandle> {
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        // Recall tests exercise the injection mechanics, not the sigil gate; the
-        // gate now defaults on, so disable it here to keep prompts un-prefixed.
-        // The gate itself is covered by `require_sigil_gates_injection_*`.
         let mut config = Config::default();
-        config.hooks.user_prompt_submit_require_sigil = false;
+        tweak(&mut config);
         Arc::new(RepoHandle::from_shared(
             root,
             Arc::new(Mutex::new(None)),
@@ -5011,6 +5012,30 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ))
+    }
+
+    /// A handle rooted at `tmp`, with the config the caller asks for.
+    fn make_handle_with(tmp: &TempDir, tweak: impl FnOnce(&mut Config)) -> Arc<RepoHandle> {
+        handle_at(tmp.path().to_path_buf(), tweak)
+    }
+
+    /// A handle rooted at `tmp/name` — a store nested under another one, which
+    /// is how the ancestor-isolation tests build their child repo.
+    fn nested_handle(
+        tmp: &TempDir,
+        name: &str,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Arc<RepoHandle> {
+        handle_at(tmp.path().join(name), tweak)
+    }
+
+    fn make_handle(tmp: &TempDir) -> Arc<RepoHandle> {
+        // Recall tests exercise the injection mechanics, not the sigil gate; the
+        // gate now defaults on, so disable it here to keep prompts un-prefixed.
+        // The gate itself is covered by `require_sigil_gates_injection_*`.
+        make_handle_with(tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+        })
     }
 
     #[tokio::test]
@@ -5536,20 +5561,10 @@ mod tests {
     #[tokio::test]
     async fn recall_docs_limit_zero_injects_memory_only() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        let mut config = Config::default();
-        config.hooks.user_prompt_submit_require_sigil = false;
-        config.hooks.recall_docs_limit = 0;
-        let handle = Arc::new(RepoHandle::from_shared(
-            root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            config,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 0;
+        });
         seed_memory_entry(&handle, "topic-mem").await;
         seed_document(
             &handle,
@@ -5574,20 +5589,10 @@ mod tests {
     #[tokio::test]
     async fn recall_docs_limit_caps_injected_documents() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        let mut config = Config::default();
-        config.hooks.user_prompt_submit_require_sigil = false;
-        config.hooks.recall_docs_limit = 2;
-        let handle = Arc::new(RepoHandle::from_shared(
-            root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            config,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 2;
+        });
         for i in 0..5 {
             seed_document(
                 &handle,
@@ -5610,19 +5615,9 @@ mod tests {
     #[tokio::test]
     async fn recall_docs_leg_is_gated_by_the_sigil() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        let mut config = Config::default();
-        config.hooks.user_prompt_submit_require_sigil = true;
-        let handle = Arc::new(RepoHandle::from_shared(
-            root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            config,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+        });
         seed_document(
             &handle,
             "docs/quarantine.md",
@@ -5759,19 +5754,9 @@ mod tests {
         seed_memory_entry(&parent, "parent-mem").await;
 
         // Primary store nested under the parent.
-        let nested_root = tmp.path().join("nested-repo");
-        std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
-        let mut primary_config = Config::default();
-        primary_config.hooks.user_prompt_submit_require_sigil = false;
-        let primary = Arc::new(RepoHandle::from_shared(
-            nested_root.clone(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            primary_config,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let primary = nested_handle(&tmp, "nested-repo", |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+        });
         seed_memory_entry(&primary, "child-mem").await;
 
         let out = hook_session_start_impl(&primary, None).await;
@@ -5794,19 +5779,9 @@ mod tests {
         seed_memory_entry(&parent, "parent-mem").await;
 
         // Primary store nested under the parent.
-        let nested_root = tmp.path().join("nested-repo");
-        std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
-        let mut primary_config = Config::default();
-        primary_config.hooks.user_prompt_submit_require_sigil = false;
-        let primary = Arc::new(RepoHandle::from_shared(
-            nested_root.clone(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            primary_config,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let primary = nested_handle(&tmp, "nested-repo", |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+        });
         seed_memory_entry(&primary, "child-mem").await;
 
         // Prompt terms match the seeded entries' content ("...about the topic.").
@@ -5829,19 +5804,9 @@ mod tests {
     #[tokio::test]
     async fn require_sigil_gates_injection_to_star_prefixed_prompts() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        let mut config = Config::default();
-        config.hooks.user_prompt_submit_require_sigil = true;
-        let handle = Arc::new(RepoHandle::from_shared(
-            root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            config,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+        });
         seed_memory_entry(&handle, "sigil-mem").await;
 
         // Same recall-worthy prompt WITHOUT the sigil: no injection at all.
@@ -6512,17 +6477,7 @@ mod tests {
 
     /// Build a primary store nested under `parent_tmp` and return its handle.
     fn nested_primary(parent_tmp: &TempDir, name: &str) -> Arc<RepoHandle> {
-        let nested_root = parent_tmp.path().join(name);
-        std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
-        Arc::new(RepoHandle::from_shared(
-            nested_root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            Config::default(),
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ))
+        nested_handle(parent_tmp, name, |_| {})
     }
 
     /// Isolation proof: a curated high-confidence prior living ONLY in an
@@ -6575,20 +6530,10 @@ mod tests {
 
         // Child: warmup_limit hot entries (high access_count) that would fill
         // every slot, plus a tight warmup_limit and a confidence floor.
-        let nested_root = tmp.path().join("warmup-nested");
-        std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
-        let mut cfg = Config::default();
-        cfg.hooks.warmup_limit = 3;
-        cfg.hooks.warmup_min_confidence = 0.3;
-        let primary = Arc::new(RepoHandle::from_shared(
-            nested_root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            cfg,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let primary = nested_handle(&tmp, "warmup-nested", |config| {
+            config.hooks.warmup_limit = 3;
+            config.hooks.warmup_min_confidence = 0.3;
+        });
         for i in 0..5 {
             seed_topic_with_content(&primary, &format!("hot-{i}"), "hot entry content", 100).await;
         }
@@ -7750,23 +7695,13 @@ mod tests {
     #[tokio::test]
     async fn render_document_content_truncation_still_renders() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        let mut config = Config::default();
-        config.hooks.user_prompt_submit_require_sigil = false;
-        // Above the continuation message's own token cost, or
-        // `truncate_with_continuation` falls back to the "Content too large"
-        // stub and never emits the line marker this test is about.
-        config.mcp.max_response_tokens = 200;
-        let handle = Arc::new(RepoHandle::from_shared(
-            root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            config,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            // Above the continuation message's own token cost, or
+            // `truncate_with_continuation` falls back to the "Content too large"
+            // stub and never emits the line marker this test is about.
+            config.mcp.max_response_tokens = 200;
+        });
 
         let long_content = "line\n".repeat(2000);
         seed_document(&handle, "docs/long.md", "Long", &long_content).await;
@@ -8081,19 +8016,9 @@ mod tests {
     #[tokio::test]
     async fn hook_session_start_disabled_returns_empty() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        let mut cfg = Config::default();
-        cfg.hooks.session_start_enabled = false;
-        let handle = Arc::new(RepoHandle::from_shared(
-            root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            cfg,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.session_start_enabled = false;
+        });
         let result = hook_session_start_impl(&handle, None).await;
         assert_eq!(result, json!({}));
     }
@@ -8209,18 +8134,9 @@ mod tests {
     async fn hook_pre_tool_use_prior_suppressed_when_injection_disabled() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        let mut cfg = Config::default();
-        cfg.priors.injection_enabled = false;
-        let handle = Arc::new(RepoHandle::from_shared(
-            root.clone(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            cfg,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let handle = make_handle_with(&tmp, |config| {
+            config.priors.injection_enabled = false;
+        });
         seed_promoted_prior(
             &handle,
             "pre_tool",
@@ -8344,19 +8260,9 @@ mod tests {
     #[tokio::test]
     async fn session_start_disabled_skips_backfill() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        let mut cfg = Config::default();
-        cfg.hooks.session_start_enabled = false;
-        let handle = Arc::new(RepoHandle::from_shared(
-            root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            cfg,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.session_start_enabled = false;
+        });
         let _ = hook_session_start_impl(&handle, None).await;
         assert!(
             !handle.backfill_in_flight.load(Ordering::Acquire),
@@ -8367,19 +8273,9 @@ mod tests {
     #[tokio::test]
     async fn hook_stop_noop_when_no_distiller_configured() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        let mut cfg = Config::default();
-        cfg.priors.mining_enabled = true; // on, but no distiller_program → still off
-        let handle = Arc::new(RepoHandle::from_shared(
-            root,
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            cfg,
-            Vec::new(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        ));
+        let handle = make_handle_with(&tmp, |config| {
+            config.priors.mining_enabled = true; // on, but no distiller_program → still off
+        });
         let event = json!({"transcript_path": "/nonexistent", "session_id": "s1"});
         assert_eq!(hook_stop_impl(handle, &event), json!({}));
     }
