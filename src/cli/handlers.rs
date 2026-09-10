@@ -72,12 +72,27 @@ mod tests {
         tempfile::tempdir().expect("failed to create temp dir")
     }
 
+    #[cfg(any(unix, windows))]
+    fn symlink_dir(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("create directory symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).expect(
+            "create directory symlink; enable Developer Mode or run with symlink privilege",
+        );
+    }
+
     /// `.mutation.lock`, `.live.lock` and SQLite's own `-wal`/`-shm` are all
     /// named from `db_path` as a string. Two spellings of one store therefore
     /// mean two lock domains over a single inode: neither the open guard nor
     /// the live lock excludes the other writer, and the result is the
     /// doubly-referenced pages and freelist mismatch we kept recovering from.
     /// Opening through an alias must land on the identical path.
+    ///
+    /// Windows runs this explicitly because creating a symlink requires
+    /// Developer Mode or symlink privilege.
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(windows, ignore = "requires Developer Mode or symlink privilege")]
     #[test]
     fn open_canonicalizes_the_store_so_every_lock_shares_one_identity() {
         let temp = setup_temp_dir();
@@ -88,7 +103,7 @@ mod tests {
         let direct = Context::open(&real).expect("open directly");
 
         let alias = temp.path().join("alias");
-        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        symlink_dir(&real, &alias);
         let aliased = Context::open(&alias).expect("open through the alias");
 
         assert_eq!(
@@ -843,16 +858,18 @@ mod tests {
         assert!(msg.contains("escapes root"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(windows, ignore = "requires Developer Mode or symlink privilege")]
     #[test]
     fn test_handle_collection_add_blocks_symlink_escape() {
         let temp = setup_temp_dir();
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
-        // Create a symlink inside the project that points outside
+        // Use a separate temporary directory so the target exists on either OS.
+        let outside = setup_temp_dir();
         let link_path = temp.path().join("sneaky");
-        std::os::unix::fs::symlink("/tmp", &link_path).unwrap();
+        symlink_dir(outside.path(), &link_path);
 
         let result = handle_collection_add(&ctx, "evil", "sneaky", "**/*");
         assert!(result.is_err());

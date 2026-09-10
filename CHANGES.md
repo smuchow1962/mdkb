@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`cargo test` compiles and runs on Windows.** Four test sites used Unix-only
+  APIs (`std::os::unix::fs::symlink`, `UnixListener`, the daemon singleton
+  module) or compared native paths against slash-separated strings, so the
+  Windows test build failed before a single test ran. The Unix socket tests and
+  the singleton test file now build on Unix only; the alias and collection-escape
+  tests use a directory symlink on Windows (`#[ignore]` there by default, because
+  a symlink needs Developer Mode); the path checks use `Path::ends_with`.
+  `surface_parity` also stops splitting each `mdkb surface` line at the first
+  space, which silently matched nothing when the binary lived under a path with a
+  space in it. Test code only; no production behaviour changes. On Linux the
+  suite is unchanged (2,021 passed, 0 failed).
+
 ## 3.8.0 (2026-08-29)
 
 Seventy-two commits, most of them in the code index. 3.7.18 was prepared but

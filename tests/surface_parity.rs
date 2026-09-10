@@ -12,6 +12,8 @@
 //! checked against the MCP tool list the server actually advertises, and against
 //! the CLI commands clap actually parses. Neither is a copy of the other.
 
+use std::path::Path;
+
 use mdkb::core::surface::{SURFACE_MAP, SurfaceEntry};
 
 /// Every tool the MCP server advertises must appear in the map.
@@ -143,11 +145,27 @@ fn the_cheatsheet_names_only_commands_that_exist() {
     // starts with it rather than a placeholder. Checked explicitly: an earlier
     // version of this test looked for a `{0} ` prefix that the output never
     // contains, so it scanned nothing and passed for the wrong reason.
-    let bin = env!("CARGO_BIN_EXE_mdkb");
+    //
+    // Matched as a PATH, never as a string. The cheatsheet prints
+    // `std::env::current_exe()` while this test holds the path cargo composed,
+    // and on Windows those are two spellings of one file: cargo joins whatever
+    // separator `CARGO_TARGET_DIR` used, while the OS reports backslashes
+    // throughout. A string compare then finds no lines and the test fails for a
+    // reason unrelated to the cheatsheet. `Path` compares by component, and on
+    // Windows both separators are separators.
+    let bin = Path::new(env!("CARGO_BIN_EXE_mdkb"));
     let mut checked = 0usize;
     let mut broken = Vec::new();
     for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix(bin) else {
+        let line = line.trim();
+        // The binary path may itself contain spaces (`C:\Users\Jo Smith\...`),
+        // so the split point is the first space at which the prefix IS the
+        // binary, rather than the first space in the line.
+        let Some(rest) = line
+            .match_indices(' ')
+            .find(|(i, _)| Path::new(&line[..*i]) == bin)
+            .map(|(i, _)| &line[i + 1..])
+        else {
             continue;
         };
         let words: Vec<&str> = rest
