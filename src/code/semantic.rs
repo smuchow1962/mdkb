@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, bail, ensure};
 
 use crate::code::types::SymbolKind;
-use crate::llm::EmbeddingService;
+use crate::llm::{EmbeddingService, cosine_similarity};
 
 /// Embedding dimensionality for AllMiniLML6V2.
 ///
@@ -309,29 +309,6 @@ fn validate_header(header: &[u8]) -> anyhow::Result<()> {
         "Dimension mismatch: file has {dim}, expected {EMBEDDING_DIM}"
     );
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Cosine similarity
-// ---------------------------------------------------------------------------
-
-/// Compute cosine similarity between two vectors.
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < f32::EPSILON {
-        0.0
-    } else {
-        dot / denom
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,52 +1060,6 @@ mod tests {
         let removed = search.remove_embeddings(&empty).unwrap();
         assert_eq!(removed, 0);
         assert_eq!(search.count().unwrap(), 1);
-    }
-
-    // --- Cosine similarity tests ---
-
-    #[test]
-    fn test_cosine_similarity_identical() {
-        let a = vec![1.0, 2.0, 3.0];
-        let b = vec![1.0, 2.0, 3.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!(
-            (sim - 1.0).abs() < 1e-5,
-            "Identical vectors should have similarity ~1.0, got {sim}"
-        );
-    }
-
-    #[test]
-    fn test_cosine_similarity_orthogonal() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!(
-            sim.abs() < 1e-5,
-            "Orthogonal vectors should have similarity ~0.0, got {sim}"
-        );
-    }
-
-    #[test]
-    fn test_cosine_similarity_opposite() {
-        let a = vec![1.0, 2.0, 3.0];
-        let b = vec![-1.0, -2.0, -3.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!(
-            (sim - (-1.0)).abs() < 1e-5,
-            "Opposite vectors should have similarity ~-1.0, got {sim}"
-        );
-    }
-
-    #[test]
-    fn test_cosine_similarity_zero_vector() {
-        let a = vec![1.0, 2.0, 3.0];
-        let b = vec![0.0, 0.0, 0.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!(
-            sim.abs() < 1e-5,
-            "Zero vector should have similarity 0.0, got {sim}"
-        );
     }
 
     // --- format_symbol_text tests ---
