@@ -154,7 +154,7 @@ pub fn scan_duplication(
     }
     let ignored = before - clusters.len();
 
-    rank(&mut clusters);
+    rank(&mut clusters, options.hamming_threshold);
     Ok(DupOutcome {
         clusters,
         considered,

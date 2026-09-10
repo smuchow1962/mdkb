@@ -137,6 +137,18 @@ by a session on the host that reported them.
   from the 6-bit bucket gave 1 clearly worth extracting, 2 true but marginal and
   5 false positives, while 6 drawn from the 0-bit bucket were 6 for 6 genuine.
   Treat the ≤3-bit clusters as the report's core.
+- **`mdkb dup` reports by bucket, not as one number, and ranks bucket-first.**
+  The table above was one sweep, printed once, in this file. Every run now
+  prints its own: after the headline, a table of clusters and duplicated
+  lines per bucket — `0`, `1-3`, `4`, `5`, `at cut`, `cosine` — so a reader
+  calibrates without re-deriving the table by hand. `--format json` carries
+  the same `buckets` summary next to `evidence.hamming`; CSV is unchanged,
+  since it is already one row per member and a repeated bucket column would
+  not read as a table there. `rank()` used to order by module spread, which
+  put the noisiest cut-band clusters on top — the ones the hand sample called
+  wrong two times in three. It orders by bucket first now, then the same
+  spread-before-reach tie-breakers, so a single-module 0-bit finding outranks
+  a twelve-module 6-bit one instead of losing to it.
 - **Thirteen language parsers share one parse-and-collect helper, and their
   walks are data.** `mdkb dup` found the same four lines — parse, bail quietly
   on unreadable source, allocate, hand over the root — written out 50 times.

@@ -57,6 +57,77 @@ impl Evidence {
             Self::Semantic { .. } => "semantic",
         }
     }
+
+    /// Which named bucket a finding falls in, given the structural cut the run
+    /// used.
+    ///
+    /// The bands are the ones CHANGES.md measured by hand: 0 bits was 6 of 6
+    /// true, 1–3 stayed near that, 4 and 5 are drawn apart because precision
+    /// visibly degrades between them, and everything landing exactly on the
+    /// cut is its own bucket — that is where two thirds of a sweep's claimed
+    /// lines sat, and hand precision there was about 2 in 6. Semantic findings
+    /// get their own bucket rather than a hamming distance they were never
+    /// measured on.
+    ///
+    /// `hamming == cut` is checked before the named bands, so a run configured
+    /// with a cut inside 1..=5 still puts that exact distance in "at cut"
+    /// rather than the band it would otherwise land in. A structural distance
+    /// past every named band — only reachable when `cut` itself is configured
+    /// above 6 — falls back to "at cut" too: clustering bounds every member's
+    /// distance to `cut` by construction, so nothing past the named bands was
+    /// ever part of what was hand-classified.
+    pub fn bucket(self, cut: u32) -> Bucket {
+        match self {
+            Self::Semantic { .. } => Bucket::Cosine,
+            Self::Structural { hamming } if hamming == cut => Bucket::AtCut,
+            Self::Structural { hamming: 0 } => Bucket::Zero,
+            Self::Structural { hamming } if (1..=3).contains(&hamming) => Bucket::OneToThree,
+            Self::Structural { hamming: 4 } => Bucket::Four,
+            Self::Structural { hamming: 5 } => Bucket::Five,
+            Self::Structural { .. } => Bucket::AtCut,
+        }
+    }
+}
+
+/// A named range of hamming distance, or the semantic pass, ordered
+/// most-trustworthy first.
+///
+/// The [`Ord`] derive is the point: it is declaration order, and declaration
+/// order is trust order, so sorting a slice of buckets ascending is sorting it
+/// by how much a reader should believe the findings in it — which is exactly
+/// what [`rank`] and the report table need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Bucket {
+    Zero,
+    OneToThree,
+    Four,
+    Five,
+    AtCut,
+    Cosine,
+}
+
+impl Bucket {
+    /// Every bucket, most trustworthy first.
+    const ALL: [Bucket; 6] = [
+        Self::Zero,
+        Self::OneToThree,
+        Self::Four,
+        Self::Five,
+        Self::AtCut,
+        Self::Cosine,
+    ];
+
+    /// How the bucket reads in a report.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Zero => "0",
+            Self::OneToThree => "1-3",
+            Self::Four => "4",
+            Self::Five => "5",
+            Self::AtCut => "at cut",
+            Self::Cosine => "cosine",
+        }
+    }
 }
 
 /// A group of symbols reported as one finding.
@@ -140,6 +211,11 @@ impl Cluster {
     pub fn cluster_hash(&self) -> String {
         cluster_hash(&self.members)
     }
+
+    /// See [`Evidence::bucket`].
+    pub fn bucket(&self, cut: u32) -> Bucket {
+        self.evidence.bucket(cut)
+    }
 }
 
 /// See [`Cluster::cluster_hash`].
@@ -161,16 +237,23 @@ pub fn cluster_hash(members: &[DupCandidate]) -> String {
 
 /// Order clusters worst-first.
 ///
-/// Lexicographic, spread before reach, because distance is the stronger signal:
-/// two copies in one file sit under one reader's eyes and get fixed together,
-/// while two copies in different modules diverge — one gets the bug fix and the
-/// other does not. Reach breaks the tie between equally-distant clusters, then
-/// the line count, then the hash so that two runs over an unchanged repository
-/// print the same report.
-pub fn rank(clusters: &mut [Cluster]) {
+/// Bucket before anything else: hand-classifying showed the ≤3-bit bands were
+/// true positives every time and the cut band was right about one time in
+/// three, so a finding the report can vouch for outranks one it cannot,
+/// however far the untrustworthy one spreads — the module-spread order used to
+/// run first and put exactly those noisy cut-band clusters on top. Within a
+/// bucket the old lexicographic order still applies, spread before reach,
+/// because among equally-trustworthy findings distance is still the stronger
+/// signal: two copies in one file sit under one reader's eyes and get fixed
+/// together, while two copies in different modules diverge — one gets the bug
+/// fix and the other does not. Reach breaks the tie between equally-distant
+/// clusters, then the line count, then the hash so that two runs over an
+/// unchanged repository print the same report.
+pub fn rank(clusters: &mut [Cluster], cut: u32) {
     clusters.sort_by(|a, b| {
-        b.module_spread()
-            .cmp(&a.module_spread())
+        a.bucket(cut)
+            .cmp(&b.bucket(cut))
+            .then(b.module_spread().cmp(&a.module_spread()))
             .then(b.file_spread().cmp(&a.file_spread()))
             .then(b.reach().cmp(&a.reach()))
             .then(b.duplicated_lines().cmp(&a.duplicated_lines()))
@@ -178,12 +261,39 @@ pub fn rank(clusters: &mut [Cluster]) {
     });
 }
 
+/// Clusters and duplicated lines per bucket, most-trustworthy first, skipping
+/// buckets nothing landed in.
+///
+/// Shared by [`render`] and [`render_json`] so the prose table and the
+/// machine-readable summary can never disagree about what they counted.
+fn bucket_summary(clusters: &[Cluster], cut: u32) -> Vec<(Bucket, usize, u32)> {
+    Bucket::ALL
+        .into_iter()
+        .filter_map(|bucket| {
+            let members: Vec<&Cluster> = clusters.iter().filter(|c| c.bucket(cut) == bucket).collect();
+            if members.is_empty() {
+                return None;
+            }
+            let lines: u32 = members.iter().map(|c| c.duplicated_lines()).sum();
+            Some((bucket, members.len(), lines))
+        })
+        .collect()
+}
+
 /// The markdown report.
 ///
 /// `snippet` yields a member's body, or `None` when the file has changed under
 /// the index — a stale line range prints no code rather than the wrong code.
+///
+/// `cut` is the structural threshold the scan actually ran with, the same one
+/// [`rank`] orders by. It is a parameter rather than
+/// [`super::body::SIMHASH_HAMMING_THRESHOLD`] because a repository that
+/// configured `code.duplication.hamming_threshold` away from the default would
+/// otherwise get a table whose "at cut" row counts against a cut its clusters
+/// were never bounded by, disagreeing with the order printed beneath it.
 pub fn render(
     clusters: &[Cluster],
+    cut: u32,
     snippet: &mut dyn FnMut(&DupCandidate) -> Option<String>,
 ) -> String {
     if clusters.is_empty() {
@@ -199,6 +309,11 @@ pub fn render(
         if total == 1 { "" } else { "s" },
     ));
 
+    out.push_str("\n| bucket | clusters | lines |\n|---|---:|---:|\n");
+    for (bucket, n, lines) in bucket_summary(clusters, cut) {
+        out.push_str(&format!("| {} | {n} | {lines} |\n", bucket.label()));
+    }
+
     for (n, cluster) in clusters.iter().enumerate() {
         out.push('\n');
         render_cluster(&mut out, n + 1, cluster, snippet);
@@ -212,12 +327,26 @@ pub fn render(
 /// consumer reads the body itself, so this never touches the disk. It also
 /// carries `evidence.hamming`, which the prose report only spells out — that is
 /// what lets a caller bucket the findings by distance, and the distance is
-/// where the report's signal actually lives.
-pub fn render_json(clusters: &[Cluster]) -> String {
+/// where the report's signal actually lives. `buckets` is the same summary
+/// [`render`] prints as a table, pre-computed rather than left for a caller to
+/// re-derive from `evidence.hamming` — `cut` is the scan's own threshold, as
+/// in [`render`].
+pub fn render_json(clusters: &[Cluster], cut: u32) -> String {
+    let buckets: Vec<serde_json::Value> = bucket_summary(clusters, cut)
+        .into_iter()
+        .map(|(bucket, n, lines)| {
+            serde_json::json!({
+                "bucket": bucket.label(),
+                "clusters": n,
+                "duplicated_lines": lines,
+            })
+        })
+        .collect();
     let findings: Vec<serde_json::Value> = clusters.iter().map(cluster_json).collect();
     let value = serde_json::json!({
         "clusters": clusters.len(),
         "duplicated_lines": total_lines(clusters),
+        "buckets": buckets,
         "findings": findings,
     });
     format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
@@ -582,7 +711,7 @@ mod tests {
                     member(4, "d", right_file, right_module, Visibility::Private, 10),
                 ]),
             ];
-            rank(&mut clusters);
+            rank(&mut clusters, 6);
             clusters[0].members[0].name.clone()
         };
 
@@ -609,7 +738,7 @@ mod tests {
                     member(4, "d", "src/d.rs", Some("delta"), right, 10),
                 ]),
             ];
-            rank(&mut clusters);
+            rank(&mut clusters, 6);
             clusters[0].members[0].name.clone()
         };
 
@@ -783,7 +912,7 @@ mod tests {
         ]);
         let hash = c.cluster_hash();
 
-        let out = render(&[c], &mut |_| Some("fn parse() {\n    todo!()\n}\n".into()));
+        let out = render(&[c], 6, &mut |_| Some("fn parse() {\n    todo!()\n}\n".into()));
 
         assert!(out.contains(&hash), "the cluster hash:\n{out}");
         // 1-based display over 0-based storage: line_start 10 renders as 11.
@@ -805,7 +934,7 @@ mod tests {
             evidence: Evidence::Structural { hamming: 4 },
         };
 
-        let out = render(&[c], &mut |_| None);
+        let out = render(&[c], 6, &mut |_| None);
 
         assert!(out.contains("same shape, 4 bits apart"), "{out}");
         assert!(!out.contains("cosine"), "{out}");
@@ -820,7 +949,7 @@ mod tests {
             member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
         ]);
 
-        let out = render(&[c], &mut |_| None);
+        let out = render(&[c], 6, &mut |_| None);
 
         assert!(!out.contains("```"), "no empty fence:\n{out}");
         assert!(
@@ -841,7 +970,7 @@ mod tests {
             member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 100),
         ]);
 
-        let out = render(&[c], &mut |_| Some(body.clone()));
+        let out = render(&[c], 6, &mut |_| Some(body.clone()));
 
         assert!(out.contains("line 19"), "the head is shown:\n{out}");
         assert!(!out.contains("line 20"), "the tail is not:\n{out}");
@@ -877,7 +1006,7 @@ mod tests {
             evidence: Evidence::Structural { hamming: 6 },
         };
 
-        let out = render_json(&[near, at_the_cut]);
+        let out = render_json(&[near, at_the_cut], 6);
         let value: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
 
         let findings = value["findings"].as_array().unwrap();
@@ -899,7 +1028,7 @@ mod tests {
         let out = render_json(&[cluster(vec![
             member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 3),
             member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
-        ])]);
+        ])], 6);
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
 
         let evidence = &value["findings"][0]["evidence"];
@@ -916,8 +1045,8 @@ mod tests {
             member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 3),
             member(2, "parse", "src/b.rs", Some("beta"), Visibility::Public, 3),
         ]);
-        let prose = render(std::slice::from_ref(&c), &mut |_| None);
-        let value: serde_json::Value = serde_json::from_str(&render_json(&[c])).unwrap();
+        let prose = render(std::slice::from_ref(&c), 6, &mut |_| None);
+        let value: serde_json::Value = serde_json::from_str(&render_json(&[c], 6)).unwrap();
 
         assert!(prose.contains("`src/a.rs:11-13`"), "{prose}");
         assert_eq!(value["findings"][0]["members"][0]["line_start"], 11);
@@ -982,8 +1111,8 @@ mod tests {
                 member(4, "d", "src/d.rs", Some("delta"), Visibility::Public, 4),
             ]),
         ];
-        let prose = render(&clusters, &mut |_| None);
-        let value: serde_json::Value = serde_json::from_str(&render_json(&clusters)).unwrap();
+        let prose = render(&clusters, 6, &mut |_| None);
+        let value: serde_json::Value = serde_json::from_str(&render_json(&clusters, 6)).unwrap();
 
         // 8 duplicated in the first cluster, 4 in the second.
         assert!(prose.contains("2 clusters, 12 duplicated lines."), "{prose}");
@@ -998,17 +1127,18 @@ mod tests {
 
     #[test]
     fn no_clusters_renders_an_empty_payload_in_every_machine_format() {
-        let value: serde_json::Value = serde_json::from_str(&render_json(&[])).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&render_json(&[], 6)).unwrap();
 
         assert_eq!(value["clusters"], 0);
         assert_eq!(value["duplicated_lines"], 0);
         assert!(value["findings"].as_array().unwrap().is_empty());
+        assert!(value["buckets"].as_array().unwrap().is_empty());
         assert_eq!(render_csv(&[]).lines().count(), 1, "the header alone");
     }
 
     #[test]
     fn an_empty_report_says_so_instead_of_printing_a_bare_heading() {
-        let out = render(&[], &mut |_| None);
+        let out = render(&[], 6, &mut |_| None);
 
         assert!(out.contains("No clusters found"), "{out}");
     }
@@ -1033,11 +1163,192 @@ mod tests {
         let mut second = build();
         second.reverse();
 
-        rank(&mut first);
-        rank(&mut second);
+        rank(&mut first, 6);
+        rank(&mut second, 6);
 
         assert_eq!(first[0].cluster_hash(), second[0].cluster_hash());
         assert_eq!(first[1].cluster_hash(), second[1].cluster_hash());
+    }
+
+    // --- buckets ---
+
+    #[test]
+    fn bucket_boundaries_match_the_hand_classified_bands() {
+        let structural = |hamming| Evidence::Structural { hamming };
+        let cut = 6;
+
+        assert_eq!(structural(0).bucket(cut), Bucket::Zero);
+        assert_eq!(structural(1).bucket(cut), Bucket::OneToThree);
+        assert_eq!(structural(3).bucket(cut), Bucket::OneToThree);
+        assert_eq!(structural(4).bucket(cut), Bucket::Four);
+        assert_eq!(structural(5).bucket(cut), Bucket::Five);
+        assert_eq!(structural(6).bucket(cut), Bucket::AtCut);
+        assert_eq!(
+            Evidence::Semantic { similarity: 0.9 }.bucket(cut),
+            Bucket::Cosine,
+            "a semantic finding never reads the cut"
+        );
+    }
+
+    /// `hamming == cut` is checked before the named bands, so a cut configured
+    /// inside 1..=5 still claims that exact distance for "at cut" rather than
+    /// losing it to the band it would otherwise land in.
+    #[test]
+    fn a_cut_configured_inside_a_named_band_still_wins_that_distance() {
+        assert_eq!(Evidence::Structural { hamming: 3 }.bucket(3), Bucket::AtCut);
+        assert_eq!(
+            Evidence::Structural { hamming: 2 }.bucket(3),
+            Bucket::OneToThree,
+            "still strictly under the cut"
+        );
+    }
+
+    /// Only reachable when `cut` itself is configured above 6: clustering
+    /// bounds every member's distance to `cut` by construction, so nothing
+    /// past the named bands was ever part of the hand-classified sample.
+    #[test]
+    fn a_distance_past_every_named_band_falls_back_to_at_cut() {
+        assert_eq!(Evidence::Structural { hamming: 7 }.bucket(10), Bucket::AtCut);
+    }
+
+    #[test]
+    fn the_bucket_table_rows_sum_to_the_headline_totals() {
+        let clusters = vec![
+            Cluster {
+                members: vec![
+                    member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+                    member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 10),
+                ],
+                evidence: Evidence::Structural { hamming: 0 },
+            },
+            Cluster {
+                members: vec![
+                    member(3, "c", "src/c.rs", Some("gamma"), Visibility::Public, 10),
+                    member(4, "d", "src/d.rs", Some("delta"), Visibility::Public, 8),
+                ],
+                evidence: Evidence::Structural { hamming: 6 },
+            },
+            cluster(vec![
+                member(5, "e", "src/e.rs", Some("epsilon"), Visibility::Public, 10),
+                member(6, "f", "src/f.rs", Some("zeta"), Visibility::Public, 6),
+            ]),
+        ];
+
+        let out = render(&clusters, 6, &mut |_| None);
+        let table_start = out.find("| bucket |").unwrap_or_else(|| panic!("a bucket table:\n{out}"));
+        let rows: Vec<&str> = out[table_start..]
+            .lines()
+            .skip(2) // header row, then the `|---|---:|---:|` separator
+            .take_while(|line| line.starts_with('|'))
+            .collect();
+
+        let mut cluster_sum = 0usize;
+        let mut line_sum = 0u32;
+        for row in &rows {
+            let cols: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+            cluster_sum += cols[1].parse::<usize>().expect(row);
+            line_sum += cols[2].parse::<u32>().expect(row);
+        }
+
+        assert_eq!(rows.len(), 3, "one row per bucket that got a hit:\n{out}");
+        assert_eq!(cluster_sum, clusters.len(), "{out}");
+        assert_eq!(line_sum, total_lines(&clusters), "{out}");
+        assert!(out.contains("3 clusters, 24 duplicated lines."), "{out}");
+    }
+
+    #[test]
+    fn json_carries_the_same_bucket_summary_as_the_table() {
+        let clusters = vec![
+            Cluster {
+                members: vec![
+                    member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+                    member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 10),
+                ],
+                evidence: Evidence::Structural { hamming: 0 },
+            },
+            Cluster {
+                members: vec![
+                    member(3, "c", "src/c.rs", Some("gamma"), Visibility::Public, 10),
+                    member(4, "d", "src/d.rs", Some("delta"), Visibility::Public, 8),
+                ],
+                evidence: Evidence::Structural { hamming: 6 },
+            },
+        ];
+
+        let value: serde_json::Value = serde_json::from_str(&render_json(&clusters, 6)).unwrap();
+        let buckets = value["buckets"].as_array().unwrap();
+
+        assert_eq!(buckets.len(), 2, "{buckets:?}");
+        assert_eq!(buckets[0]["bucket"], "0");
+        assert_eq!(buckets[0]["clusters"], 1);
+        assert_eq!(buckets[0]["duplicated_lines"], 10);
+        assert_eq!(buckets[1]["bucket"], "at cut");
+        assert_eq!(buckets[1]["clusters"], 1);
+        assert_eq!(buckets[1]["duplicated_lines"], 8);
+    }
+
+    /// Both surfaces bucket against the cut the scan ran with, not against the
+    /// default constant. A repository that lowered
+    /// `code.duplication.hamming_threshold` to 4 has its 4-bit clusters *at*
+    /// its cut; counting them in the "4" band would print a table that
+    /// disagrees with the order [`rank`] gave the same clusters.
+    #[test]
+    fn both_surfaces_bucket_against_the_configured_cut_not_the_default() {
+        let clusters = vec![Cluster {
+            members: vec![
+                member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+                member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 8),
+            ],
+            evidence: Evidence::Structural { hamming: 4 },
+        }];
+
+        let prose = render(&clusters, 4, &mut |_| None);
+        assert!(prose.contains("| at cut | 1 | 8 |"), "{prose}");
+        assert!(!prose.contains("| 4 |"), "not the default band:\n{prose}");
+
+        let value: serde_json::Value = serde_json::from_str(&render_json(&clusters, 4)).unwrap();
+        assert_eq!(value["buckets"][0]["bucket"], "at cut");
+
+        // The same clusters under the default cut land in the "4" band instead.
+        let value: serde_json::Value = serde_json::from_str(&render_json(&clusters, 6)).unwrap();
+        assert_eq!(value["buckets"][0]["bucket"], "4");
+    }
+
+    /// The whole point of the change: the bucket a finding falls in decides
+    /// the order before spread does, so a trustworthy single-module finding
+    /// is not buried under a noisy one just because the noisy one spreads
+    /// wider.
+    #[test]
+    fn a_0_bit_single_module_cluster_outranks_a_6_bit_12_module_one() {
+        let trustworthy = Cluster {
+            members: vec![
+                member(1, "trustworthy", "src/a.rs", Some("alpha"), Visibility::Private, 10),
+                member(2, "trustworthy", "src/a.rs", Some("alpha"), Visibility::Private, 10),
+            ],
+            evidence: Evidence::Structural { hamming: 0 },
+        };
+        let noisy = Cluster {
+            members: (0..12)
+                .map(|i| {
+                    let file = format!("src/m{i}.rs");
+                    let module = format!("mod{i}");
+                    member(100 + i, "noisy", &file, Some(&module), Visibility::Public, 10)
+                })
+                .collect(),
+            evidence: Evidence::Structural { hamming: 6 },
+        };
+        assert!(
+            noisy.module_spread() > trustworthy.module_spread(),
+            "the noisy cluster must actually be the one that spreads wider"
+        );
+
+        let mut clusters = vec![noisy, trustworthy];
+        rank(&mut clusters, 6);
+
+        assert_eq!(
+            clusters[0].members[0].name, "trustworthy",
+            "bucket must win over spread"
+        );
     }
 
     // --- the ignore-list ---
@@ -1296,7 +1607,7 @@ mod tests {
         // renderer that panics turns a bad cluster into no report at all.
         let c = cluster(Vec::new());
 
-        let out = render(&[c], &mut |_| None);
+        let out = render(&[c], 6, &mut |_| None);
 
         assert!(out.contains("(empty)"), "{out}");
     }

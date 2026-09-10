@@ -384,10 +384,13 @@ mdkb coupling --since 6.months --min-cochanges 3
 mdkb dup --format json               # findings with their distance, for bucketing
 ```
 
-Read `dup` knowing where its signal is: most of the lines it claims sit at
-exactly its threshold, and that bucket is mostly false positives. The clusters
-reported 0–3 bits apart are the trustworthy core. `--format json` carries
-`evidence.hamming` per cluster, which is how you bucket them yourself. See
+Read `dup` knowing where its signal is: the report says so itself. After the
+headline, a bucket table breaks the clusters down by structural distance
+(`0`, `1-3`, `4`, `5`, `at cut`) and the semantic pass (`cosine`) — the
+clusters at 0–3 bits are the trustworthy core, the ones at the cut are mostly
+false positives. Clusters are ranked bucket-first, so a trustworthy finding
+outranks a noisy one regardless of how far it spreads. `--format json` carries
+the same `buckets` summary alongside `evidence.hamming` per cluster. See
 `CHANGES.md` for the measured distribution.
 
 ### Knowledge Graph

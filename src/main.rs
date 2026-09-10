@@ -3497,7 +3497,7 @@ fn render_dup(report: &mdkb::core::dup::DupReport, format: OutputFormat) -> Stri
         return report.markdown.clone();
     }
     match format {
-        OutputFormat::Json => render_json(&report.findings),
+        OutputFormat::Json => render_json(&report.findings, report.hamming_threshold),
         OutputFormat::Csv => render_csv(&report.findings),
         // The prose report is markdown already, so `text` and `markdown` are
         // one surface rather than two that could drift apart.

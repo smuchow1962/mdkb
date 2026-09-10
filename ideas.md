@@ -190,11 +190,7 @@ twelve times that".
 
 Three things follow, in order of value:
 
-1. **Report by bucket, not as one number.** A reader who sees `47 clusters at 0
-   bits` above `371 at the cut` calibrates in one glance. The headline sums
-   them and hides the difference. `--format json` now carries the distance per
-   cluster, so a caller can bucket for itself; the prose headline still cannot.
-   **Cost: low** — nothing is left to compute, only to print.
+1. **Report by bucket, not as one number — shipped.** See `CHANGES.md`.
 2. **The threshold needs a labelled case set**, not another guess. 12 was wrong,
    6 is better and still puts two thirds of its output on its own boundary. Nothing
    measured so far justifies a third guessed constant. **Cost: the label work,
@@ -214,11 +210,12 @@ actually fixes the report, and it needs a human first.
 
 ## What I would pick
 
-1. **Bucketed reporting and proximity ranking (§10, points 1 and 3)** — because
-   they are cheap, and because a shipped report that overstates itself by a
-   factor of eleven is a worse problem than any function still missing from this
-   list. §4 was picked first on the same reasoning and cost the least of
-   anything here.
+1. **Proximity ranking (§10, point 3)** — point 1 of that entry, bucketed
+   reporting, shipped; this is what is left of the pair, and for the same
+   reason: cheap, and a shipped report that overstates itself by a factor of
+   eleven is a worse problem than any function still missing from this list.
+   §4 was picked first on the same reasoning and cost the least of anything
+   here.
 2. **Cyclomatic complexity (§1)** — not for itself, but because it is the missing
    ingredient in hotspots, reading order, test budget and the duplication filter.
    Two columns that enable four things.

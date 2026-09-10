@@ -37,6 +37,9 @@ pub struct DupReport {
     pub findings: Vec<Cluster>,
     pub considered: usize,
     pub ignored: usize,
+    /// The structural cut the scan ran with, so a caller rendering JSON or CSV
+    /// buckets against the same threshold the prose report and the ranking did.
+    pub hamming_threshold: u32,
     /// False when there is no code index. The caller reports that and stops;
     /// it is not an error, it is a repository nobody has indexed yet.
     pub indexed: bool,
@@ -69,6 +72,10 @@ pub fn handle_dup(
         findings: Vec::new(),
         considered: 0,
         ignored: 0,
+        // No scan ran, so no cut was used. Carrying the configured one keeps
+        // the field honest for a caller that reads it without checking
+        // `indexed` — there are no findings to bucket either way.
+        hamming_threshold: config.code.duplication.hamming_threshold,
         indexed: false,
     };
     if !code_path.exists() {
@@ -146,7 +153,7 @@ pub fn handle_dup(
         chrono::Utc::now().timestamp(),
     )?;
 
-    let markdown = render(&outcome.clusters, &mut |candidate| {
+    let markdown = render(&outcome.clusters, options.hamming_threshold, &mut |candidate| {
         let source = read_indexed(&repo, &candidate.file_path)?;
         crate::code::duplication::body::body_text(&source, candidate.line_start, candidate.line_end)
             .map(str::to_string)
@@ -157,6 +164,7 @@ pub fn handle_dup(
         findings: outcome.clusters,
         considered: outcome.considered,
         ignored: outcome.ignored,
+        hamming_threshold: options.hamming_threshold,
         indexed: true,
     })
 }
