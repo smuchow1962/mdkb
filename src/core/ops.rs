@@ -874,7 +874,12 @@ pub fn handle_init(root: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 /// Get document content, applying optional line range.
-fn get_document_content(
+///
+/// The only place that fetches a document's blob and applies a line range —
+/// both `mdkb get` (via [`handle_get`]) and the MCP `get` tool
+/// (`mcp::dispatch::render_document_content`) call through here so CLI and
+/// MCP cannot drift on what a document range returns.
+pub fn get_document_content(
     ctx: &Context,
     doc: &crate::domain::Document,
     lines: Option<&str>,

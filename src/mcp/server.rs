@@ -2172,38 +2172,6 @@ pub(super) fn format_ttl_info(expires_at: Option<i64>) -> String {
     }
 }
 
-/// Apply line range to content.
-pub(super) fn apply_line_range(content: &str, range: &str) -> Result<String, McpError> {
-    let parts: Vec<&str> = range.split(':').collect();
-    if parts.len() != 2 {
-        return Err(mcp_error(format!(
-            "Invalid line range: '{}', expected 'start:end'",
-            range
-        )));
-    }
-
-    let start: usize = parts[0]
-        .parse()
-        .map_err(|_| mcp_error(format!("Invalid start line: '{}'", parts[0])))?;
-    let end: usize = parts[1]
-        .parse()
-        .map_err(|_| mcp_error(format!("Invalid end line: '{}'", parts[1])))?;
-
-    if start == 0 {
-        return Err(mcp_error("Line numbers start at 1"));
-    }
-
-    let lines: Vec<&str> = content.lines().collect();
-    let start_idx = start.saturating_sub(1);
-    let end_idx = end.min(lines.len());
-
-    if start_idx >= lines.len() {
-        return Ok(String::new());
-    }
-
-    Ok(lines[start_idx..end_idx].join("\n"))
-}
-
 /// The tool names this server advertises to a client.
 ///
 /// Read from the generated tool router rather than a list maintained by hand,
@@ -2508,25 +2476,6 @@ mod tests {
             !output.contains("zero.md"),
             "Should filter out result with score 0.00, got: {output}"
         );
-    }
-
-    #[test]
-    fn test_apply_line_range_basic() {
-        let content = "line 1\nline 2\nline 3\nline 4\nline 5";
-        let result = apply_line_range(content, "2:4").unwrap();
-        assert_eq!(result, "line 2\nline 3\nline 4");
-    }
-
-    #[test]
-    fn test_apply_line_range_invalid() {
-        let result = apply_line_range("content", "invalid");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_apply_line_range_zero_start() {
-        let result = apply_line_range("content", "0:5");
-        assert!(result.is_err());
     }
 
     #[test]
