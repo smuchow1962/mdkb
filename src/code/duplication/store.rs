@@ -39,7 +39,14 @@ CREATE TABLE IF NOT EXISTS body_fingerprints (
     embedding BLOB,
     last_seen INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
+
+/// The `meta` key naming what produced the embeddings in this file.
+const EMBEDDING_SIGNATURE: &str = "embedding_signature";
 
 /// The duplication side database.
 #[derive(Debug)]
@@ -142,6 +149,46 @@ impl DupDb {
                 },
             )
             .optional()
+    }
+
+    /// Drop every embedding that `signature` did not produce, and record it.
+    ///
+    /// Returns how many were dropped. A vector is only comparable with vectors
+    /// from the same model, at the same stored dimensions, computed over the
+    /// same input cut — change any of the three and the cached vectors score
+    /// against the new ones as noise, which reads as a duplication finding
+    /// nobody can explain. Nothing else in this file would ever notice: the key
+    /// is the body hash, and the body did not change.
+    ///
+    /// The simhashes stay. They are structural, cost no model, and are what the
+    /// pass falls back on — throwing them away would turn a model change into a
+    /// full re-fingerprint of the repository for no reason.
+    ///
+    /// A cache written before this table existed has no signature, so the first
+    /// run after the upgrade clears every embedding. That is the honest reading:
+    /// what produced them was never recorded, so they cannot be vouched for.
+    pub fn reconcile_embedding_signature(&self, signature: &str) -> rusqlite::Result<usize> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![EMBEDDING_SIGNATURE],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if stored.as_deref() == Some(signature) {
+            return Ok(0);
+        }
+        let cleared = self.conn.execute(
+            "UPDATE body_fingerprints SET embedding = NULL WHERE embedding IS NOT NULL",
+            [],
+        )?;
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![EMBEDDING_SIGNATURE, signature],
+        )?;
+        Ok(cleared)
     }
 
     /// Number of cached bodies.
@@ -343,6 +390,89 @@ mod tests {
             .unwrap();
 
         assert_eq!(db.get("bad").unwrap().unwrap().embedding, None);
+    }
+
+    #[test]
+    fn a_changed_signature_nulls_the_embeddings_and_keeps_the_simhashes() {
+        // The order a real run uses: reconcile first, then embed. So the cache
+        // below is one a previous run at 512 tokens legitimately vouched for.
+        let db = DupDb::in_memory().unwrap();
+        db.upsert_structural("a", 11, 5, 1).unwrap();
+        db.upsert_structural("b", 22, 6, 1).unwrap();
+        assert_eq!(db.reconcile_embedding_signature("Jina:256:512").unwrap(), 0);
+        db.set_embedding("a", &[1.0, 0.0]).unwrap();
+        db.set_embedding("b", &[0.0, 1.0]).unwrap();
+
+        // Same bodies, same hashes — only the cut changed.
+        let cleared = db.reconcile_embedding_signature("Jina:256:256").unwrap();
+
+        assert_eq!(cleared, 2, "both vectors are stale");
+        assert_eq!(db.get("a").unwrap().unwrap().embedding, None);
+        assert_eq!(db.get("b").unwrap().unwrap().embedding, None);
+        assert_eq!(
+            db.get("a").unwrap().unwrap().simhash,
+            11,
+            "the structural half costs no model and must survive"
+        );
+        assert_eq!(db.get("b").unwrap().unwrap().nodes, 6);
+        assert_eq!(db.count().unwrap(), 2, "no row was deleted");
+    }
+
+    #[test]
+    fn the_same_signature_leaves_every_embedding_alone() {
+        // The common case: the second run of an unchanged configuration must
+        // not throw away the pass the first one paid for.
+        let db = DupDb::in_memory().unwrap();
+        db.upsert_structural("a", 1, 5, 1).unwrap();
+        db.reconcile_embedding_signature("Jina:256:256").unwrap();
+        db.set_embedding("a", &[0.5, 0.5]).unwrap();
+
+        let cleared = db.reconcile_embedding_signature("Jina:256:256").unwrap();
+
+        assert_eq!(cleared, 0);
+        assert_eq!(
+            db.get("a").unwrap().unwrap().embedding,
+            Some(vec![0.5, 0.5])
+        );
+    }
+
+    #[test]
+    fn a_cache_written_before_the_signature_existed_is_cleared_once() {
+        // An upgrade meets rows whose provenance was never recorded. They are
+        // dropped on the first reconcile and the second one is a no-op, so the
+        // upgrade costs one re-embed and not one per run.
+        let db = DupDb::in_memory().unwrap();
+        db.upsert_structural("legacy", 9, 5, 1).unwrap();
+        db.set_embedding("legacy", &[1.0]).unwrap();
+
+        assert_eq!(db.reconcile_embedding_signature("Jina:256:256").unwrap(), 1);
+        assert_eq!(db.reconcile_embedding_signature("Jina:256:256").unwrap(), 0);
+    }
+
+    #[test]
+    fn the_signature_survives_being_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup.sqlite");
+        {
+            let db = DupDb::open(&path).unwrap();
+            db.upsert_structural("keep", 1, 5, 1).unwrap();
+            db.reconcile_embedding_signature("Jina:256:256").unwrap();
+            db.set_embedding("keep", &[1.0]).unwrap();
+        }
+
+        let reopened = DupDb::open(&path).unwrap();
+
+        assert_eq!(
+            reopened
+                .reconcile_embedding_signature("Jina:256:256")
+                .unwrap(),
+            0,
+            "a reopened cache must not re-clear what it already vouched for"
+        );
+        assert_eq!(
+            reopened.get("keep").unwrap().unwrap().embedding,
+            Some(vec![1.0])
+        );
     }
 
     #[test]

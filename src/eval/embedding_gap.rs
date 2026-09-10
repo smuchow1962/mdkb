@@ -300,31 +300,52 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/.cache/fastembed", std::env::var("HOME").unwrap()));
         let cases = duplication_cases();
 
-        // (label, model, truncate-to-dims). A truncated variant answers whether
-        // this model tolerates the benchmark's 256-dim reduction, which is only
-        // established for MRL-trained models and NOT for v2-base-code.
-        let variants: Vec<(&str, EmbeddingModel, Option<usize>)> = vec![
-            ("AllMiniLML6V2-384", EmbeddingModel::AllMiniLML6V2, None),
+        // (label, model, truncate-to-dims, max input tokens). The truncated
+        // variant answers whether this model tolerates the benchmark's 256-dim
+        // reduction, which is only established for MRL-trained models and NOT
+        // for v2-base-code. `max_tokens` is the *input* cut, a different axis:
+        // fastembed defaults it to 512, and halving it is only free if the gap
+        // does not move.
+        //
+        // Read the two Jina-256 rows knowing what they can show. fastembed pads
+        // to the longest text in the batch, not to `max_length`, so lowering the
+        // cut changes a vector only for a text longer than the cut. Every text
+        // in `duplication_cases` is well under 256 tokens, so the two rows are
+        // expected to agree exactly — that agreement is evidence the harness is
+        // wired to the right knob, NOT evidence that truncating real bodies is
+        // free. Bodies over 256 tokens are what that question needs, and this
+        // case set has none.
+        let variants: Vec<(&str, EmbeddingModel, Option<usize>, usize)> = vec![
+            ("AllMiniLML6V2-384", EmbeddingModel::AllMiniLML6V2, None, 512),
             (
                 "JinaEmbeddingsV2BaseCode-768",
                 EmbeddingModel::JinaEmbeddingsV2BaseCode,
                 None,
+                512,
             ),
             (
-                "JinaEmbeddingsV2BaseCode-256",
+                "JinaEmbeddingsV2BaseCode-256 @512tok",
                 EmbeddingModel::JinaEmbeddingsV2BaseCode,
                 Some(256),
+                512,
+            ),
+            (
+                "JinaEmbeddingsV2BaseCode-256 @256tok",
+                EmbeddingModel::JinaEmbeddingsV2BaseCode,
+                Some(256),
+                256,
             ),
         ];
 
         println!(
-            "\n{:<32} {:>8} {:>10} {:>10}",
+            "\n{:<40} {:>8} {:>10} {:>10}",
             "model", "gap", "high", "low"
         );
-        for (label, model, truncate) in variants {
+        for (label, model, truncate, max_tokens) in variants {
             let embedder = TextEmbedding::try_new(
                 InitOptions::new(model)
                     .with_cache_dir(cache.clone().into())
+                    .with_max_length(max_tokens)
                     .with_show_download_progress(true),
             )
             .expect("model init");
@@ -343,7 +364,7 @@ mod tests {
 
             let r = run_gap(&cases, &embed);
             println!(
-                "{label:<32} {:>8.4} {:>10.4} {:>10.4}",
+                "{label:<40} {:>8.4} {:>10.4} {:>10.4}",
                 r.gap, r.high_mean, r.low_mean
             );
         }

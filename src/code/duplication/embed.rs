@@ -46,6 +46,36 @@ pub const DUP_EMBEDDING_DIM: usize = 256;
 /// is never freed.
 const EMBED_BATCH_SIZE: usize = 32;
 
+/// Input tokens per body, against fastembed's default of 512.
+///
+/// Attention is quadratic in sequence length, so halving the cut is more than
+/// halving the cost on the bodies that reach it. A body long enough to be
+/// truncated is one whose first 256 tokens already say what it is — a 500-line
+/// function duplicated elsewhere is duplicated in its opening as well.
+///
+/// This value is part of [`embedding_signature`]: change it and every cached
+/// vector is dropped, because a vector computed over a different cut is not
+/// comparable with one computed over this cut.
+pub const DUP_MAX_TOKENS: usize = 256;
+
+/// Bodies embedded between one write to the cache and the next.
+///
+/// Cold, this pass runs for minutes. Persisting nothing until the last body was
+/// embedded meant a Ctrl-C — or a model that died half way — threw away every
+/// vector computed so far. A chunk bounds that loss to the chunk. It is not the
+/// inference batch size: 256 bodies is 8 batches, so the write amortises over
+/// enough work to stay invisible.
+const EMBED_PERSIST_CHUNK: usize = 256;
+
+/// What a cached vector would have to match to be reusable.
+///
+/// Model, stored dimensions and input cut: change any one and the vectors on
+/// disk score against fresh ones as noise. Stored in `dup.sqlite`'s `meta`
+/// table and checked by `DupDb::reconcile_embedding_signature`.
+pub fn embedding_signature(model: &str) -> String {
+    format!("{model}:{DUP_EMBEDDING_DIM}:{DUP_MAX_TOKENS}")
+}
+
 /// Anything that can turn body texts into vectors.
 ///
 /// A trait so the cache logic — which bodies to embed, which to leave alone —
@@ -119,20 +149,32 @@ pub fn embed_missing(
         return Ok(0);
     }
 
-    let texts: Vec<&str> = pending.iter().map(|(_, t)| *t).collect();
-    let vectors = embedder.embed_bodies(&texts)?;
-    if vectors.len() != pending.len() {
-        return Err(Error::other(format!(
-            "embedder returned {} vectors for {} bodies",
-            vectors.len(),
-            pending.len()
-        )));
+    // fastembed pads every batch to its longest text, so a batch drawn in file
+    // order makes each short body pay the token cost of its longest neighbour.
+    // Sorting by length puts bodies of similar size together and the padding
+    // waste per batch falls to almost nothing. The vectors come back in *this*
+    // order, which is why the zip below is against `chunk` and never against
+    // the caller's `bodies`.
+    pending.sort_by_key(|(_, text)| text.len());
+
+    let mut embedded = 0usize;
+    for chunk in pending.chunks(EMBED_PERSIST_CHUNK) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, t)| *t).collect();
+        let vectors = embedder.embed_bodies(&texts)?;
+        if vectors.len() != chunk.len() {
+            return Err(Error::other(format!(
+                "embedder returned {} vectors for {} bodies",
+                vectors.len(),
+                chunk.len()
+            )));
+        }
+        for ((hash, _), vector) in chunk.iter().zip(&vectors) {
+            dup.set_embedding(hash, vector)
+                .map_err(|e| Error::other(format!("duplication cache write failed: {e}")))?;
+        }
+        embedded += chunk.len();
     }
-    for ((hash, _), vector) in pending.iter().zip(&vectors) {
-        dup.set_embedding(hash, vector)
-            .map_err(|e| Error::other(format!("duplication cache write failed: {e}")))?;
-    }
-    Ok(pending.len())
+    Ok(embedded)
 }
 
 /// Index pairs the structural pass left unresolved.
@@ -265,6 +307,7 @@ impl DupEmbedder {
         let model = fastembed::TextEmbedding::try_new(
             fastembed::InitOptions::new(variant)
                 .with_cache_dir(dup_cache_dir())
+                .with_max_length(DUP_MAX_TOKENS)
                 .with_show_download_progress(true),
         )
         .map_err(|e| {
@@ -431,6 +474,130 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(embedder.texts.load(Ordering::SeqCst), 2);
         assert!(db.get("h1").unwrap().unwrap().embedding.is_some());
+    }
+
+    /// Bodies reach the model shortest first, and every vector still lands on
+    /// the hash whose text produced it.
+    ///
+    /// Sorting is the point: fastembed pads a batch to its longest text, so
+    /// candidates in file order make each short body pay for its longest
+    /// neighbour. It is also the easiest place to write a bug — the vectors
+    /// come back in the sorted order, and zipping them against the caller's
+    /// unsorted list would attach every vector to the wrong body while
+    /// reporting success.
+    #[test]
+    fn bodies_reach_the_model_shortest_first_and_land_on_their_own_hash() {
+        struct Recording {
+            seen: Mutex<Vec<usize>>,
+        }
+        impl BodyEmbedder for Recording {
+            fn embed_bodies(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+                self.seen.lock().unwrap().extend(texts.iter().map(|t| t.len()));
+                // A vector that names the text it came from, so a misplaced
+                // one is visible rather than merely present.
+                Ok(texts.iter().map(|t| vec![t.len() as f32]).collect())
+            }
+        }
+
+        let db = seeded(&["long", "short", "middle"]);
+        let embedder = Recording {
+            seen: Mutex::new(Vec::new()),
+        };
+
+        let n = embed_missing(
+            &db,
+            &[
+                ("long".into(), "x".repeat(30)),
+                ("short".into(), "x".repeat(5)),
+                ("middle".into(), "x".repeat(12)),
+            ],
+            &embedder,
+        )
+        .unwrap();
+
+        assert_eq!(n, 3);
+        assert_eq!(
+            *embedder.seen.lock().unwrap(),
+            vec![5, 12, 30],
+            "the model must see them shortest first"
+        );
+        assert_eq!(db.get("short").unwrap().unwrap().embedding, Some(vec![5.0]));
+        assert_eq!(
+            db.get("middle").unwrap().unwrap().embedding,
+            Some(vec![12.0])
+        );
+        assert_eq!(db.get("long").unwrap().unwrap().embedding, Some(vec![30.0]));
+    }
+
+    /// A failure part way through leaves the work already done on disk.
+    ///
+    /// Cold, this pass runs for minutes. Persisting nothing until the last body
+    /// was embedded meant a Ctrl-C at minute 12 cost all twelve minutes. The
+    /// loss is now bounded by one chunk.
+    #[test]
+    fn a_failure_on_the_second_chunk_keeps_what_the_first_chunk_embedded() {
+        struct DiesAfterOneChunk {
+            calls: AtomicUsize,
+        }
+        impl BodyEmbedder for DiesAfterOneChunk {
+            fn embed_bodies(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return Err(Error::other("model died"));
+                }
+                Ok(texts.iter().map(|t| vec![t.len() as f32]).collect())
+            }
+        }
+
+        // One body more than a chunk holds, so there is a second chunk to fail
+        // on. Body length rises with the index, so sorted order is index order
+        // and "the first chunk" is a set the assertion can name.
+        let total = EMBED_PERSIST_CHUNK + 10;
+        let hashes: Vec<String> = (0..total).map(|i| format!("h{i:04}")).collect();
+        let db = DupDb::in_memory().unwrap();
+        for h in &hashes {
+            db.upsert_structural(h, 1, 50, 1).unwrap();
+        }
+        let bodies: Vec<(String, String)> = hashes
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.clone(), "x".repeat(i + 1)))
+            .collect();
+
+        let err = embed_missing(
+            &db,
+            &bodies,
+            &DiesAfterOneChunk {
+                calls: AtomicUsize::new(0),
+            },
+        )
+        .expect_err("the second chunk must fail");
+
+        assert!(err.to_string().contains("model died"), "{err}");
+        let embedded = hashes
+            .iter()
+            .filter(|h| db.get(h).unwrap().unwrap().embedding.is_some())
+            .count();
+        assert_eq!(
+            embedded, EMBED_PERSIST_CHUNK,
+            "the first chunk must survive the failure of the second"
+        );
+    }
+
+    /// The signature is what makes a cached vector reusable, so every input to
+    /// it has to be in it.
+    #[test]
+    fn the_embedding_signature_names_the_model_the_dimensions_and_the_cut() {
+        let sig = embedding_signature(DEFAULT_DUP_MODEL);
+
+        assert_eq!(
+            sig,
+            format!("{DEFAULT_DUP_MODEL}:{DUP_EMBEDDING_DIM}:{DUP_MAX_TOKENS}")
+        );
+        assert_ne!(
+            sig,
+            embedding_signature("AllMiniLML6V2"),
+            "a different model must not reuse these vectors"
+        );
     }
 
     #[test]

@@ -162,6 +162,34 @@ by a session on the host that reported them.
   machine with no model on disk and no network gets the structural report in
   seconds instead of a download; a model that is configured but will not load
   still degrades the run rather than failing it.
+- **The semantic pass costs a third and survives a Ctrl-C.** Measured on 2323
+  bodies, cold cache, release build: **479 s and 13.3 GB peak before, 168 s and
+  4.6 GB after** — 2.85× less wall time, 2.9× less memory. Three changes, none
+  of which touch the structural half:
+  - Input is cut at 256 tokens rather than fastembed's 512. Attention is
+    quadratic in sequence length, so the bodies long enough to be truncated are
+    exactly the expensive ones.
+  - Bodies are sorted by length before batching. fastembed pads every batch to
+    its longest text, and candidates used to arrive in file order, so each short
+    body paid the token cost of its longest neighbour.
+  - Vectors are written every 256 bodies instead of once at the end. A pass
+    interrupted at minute 12 used to lose all twelve minutes; it now loses the
+    current chunk. This is also what caps the memory: the old code held every
+    vector until the last body was embedded.
+
+  `dup.sqlite` gains a `meta` table recording `model:dimensions:max_tokens`. A
+  vector is only comparable with vectors computed the same way, and nothing else
+  would notice a change — the key is the body hash and the body did not change.
+  A mismatch drops the embeddings and keeps the simhashes, which cost no model.
+  The first run after this release drops the whole embedding cache, because what
+  produced it was never recorded.
+
+  Structural cluster hashes are byte-identical before and after, on both corpora
+  measured. The `cosine` bucket is not: 53 of 59 clusters survive, 6 drop and 8
+  appear, all fourteen scoring between 0.7019 and 0.8140 against a 0.70 floor.
+  That is threshold-boundary churn rather than a loss — several are the same
+  finding with different membership — and it lands in the bucket the report
+  already ranks last.
 - **Thirteen language parsers share one parse-and-collect helper, and their
   walks are data.** `mdkb dup` found the same four lines — parse, bail quietly
   on unreadable source, allocate, hand over the root — written out 50 times.

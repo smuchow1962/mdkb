@@ -159,6 +159,21 @@ pub fn handle_dup(
         None
     };
 
+    // Only a run that will actually read vectors reconciles the signature. A
+    // structural run never touches the embedding column, so clearing it there
+    // would throw away a cache nobody was about to use.
+    if let Some(embedder) = &embedder {
+        let signature = crate::code::duplication::embed::embedding_signature(embedder.model_name());
+        match dup.reconcile_embedding_signature(&signature) {
+            Ok(0) => {}
+            Ok(cleared) => tracing::info!(
+                "duplication embeddings were produced by a different configuration; \
+                 {cleared} dropped, re-embedding against {signature}"
+            ),
+            Err(e) => tracing::warn!("cannot reconcile the duplication embedding signature: {e}"),
+        }
+    }
+
     let repo = root.to_path_buf();
     let mut read_file = |path: &str| read_indexed(&repo, path);
 
