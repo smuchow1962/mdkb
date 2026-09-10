@@ -67,9 +67,9 @@ pub async fn run_https_server(
 
     // Spawn shutdown listener
     tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
+        if let Err(e) = super::wait_for_shutdown_signal().await {
+            tracing::warn!("signal: {e}");
+        }
         tracing::info!("Shutdown signal received, stopping HTTPS server...");
         cancellation_token.cancel();
         shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));

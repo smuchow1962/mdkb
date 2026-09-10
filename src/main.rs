@@ -3741,9 +3741,11 @@ async fn run_daemon() -> Result<()> {
     }
 
     // Wait for SIGINT or SIGTERM, or for the self-retirement above.
-    let mut signals = ShutdownSignals::install()?;
     tokio::select! {
-        _ = signals.next() => {
+        result = mdkb::mcp::wait_for_shutdown_signal() => {
+            if let Err(e) = result {
+                tracing::warn!("signal: {e}");
+            }
             tracing::info!("mdkb daemon received shutdown signal");
         }
         () = shutdown.cancelled() => {
@@ -3765,7 +3767,9 @@ async fn run_daemon() -> Result<()> {
     // action is to unlink what shutdown would have unlinked and exit.
     let exit_base = base_dir.clone();
     tokio::spawn(async move {
-        let signum = signals.next().await;
+        // A second call installs a fresh listener that still sees the next
+        // SIGINT/SIGTERM — see `wait_for_shutdown_signal`'s doc comment.
+        let signum = mdkb::mcp::wait_for_shutdown_signal().await.unwrap_or(15);
         tracing::warn!("mdkb daemon received a second signal; exiting without finishing the write");
         ipc_server::unlink_sockets(&exit_base);
         std::process::exit(128 + signum);
@@ -3827,50 +3831,6 @@ fn command_to_json(cmd: &clap::Command) -> serde_json::Value {
         "args": args,
         "subcommands": subcommands,
     })
-}
-
-/// The process shutdown signals, kept alive past the first one.
-///
-/// Tokio never unregisters a signal handler once installed, so the default
-/// "terminate now" disposition does not come back after the first SIGINT. An
-/// operator whose second Ctrl-C is swallowed can only stop a draining daemon
-/// with SIGKILL — so the second signal has to be awaited explicitly here and
-/// turned into an abort for `ipc_server::serve`'s drain.
-/// Gated with `run_daemon`, its only caller: the daemon is a unix-socket
-/// singleton, so there is no process to signal off Unix.
-#[cfg(unix)]
-struct ShutdownSignals {
-    term: tokio::signal::unix::Signal,
-    int: tokio::signal::unix::Signal,
-}
-
-/// Signal numbers, kept so a second one can exit with the code a shell expects
-/// (`128 + signum`) instead of inventing one.
-#[cfg(unix)]
-const SIGINT: i32 = 2;
-#[cfg(unix)]
-const SIGTERM: i32 = 15;
-
-#[cfg(unix)]
-impl ShutdownSignals {
-    fn install() -> Result<Self> {
-        use tokio::signal::unix::{SignalKind, signal};
-        Ok(Self {
-            term: signal(SignalKind::terminate())
-                .map_err(|e| mdkb::Error::other(format!("sigterm handler: {e}")))?,
-            int: signal(SignalKind::interrupt())
-                .map_err(|e| mdkb::Error::other(format!("sigint handler: {e}")))?,
-        })
-    }
-
-    /// Wait for the next SIGINT or SIGTERM, returning which arrived. May be
-    /// awaited repeatedly — that is the point of holding the streams.
-    async fn next(&mut self) -> i32 {
-        tokio::select! {
-            _ = self.term.recv() => SIGTERM,
-            _ = self.int.recv() => SIGINT,
-        }
-    }
 }
 
 #[cfg(test)]

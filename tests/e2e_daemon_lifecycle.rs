@@ -166,3 +166,62 @@ fn status_stop_restart_cycle() {
     unsafe { libc::kill(pid_after as libc::pid_t, libc::SIGTERM) };
     let _ = wait_until(Duration::from_secs(5), || !pid_alive(pid_after));
 }
+
+/// `mdkb serve --http` exits 0 within 5s of SIGTERM.
+///
+/// The HTTP transport used to watch only Ctrl-C (SIGINT), ignoring SIGTERM
+/// entirely — the signal `docker stop` and systemd both send. It now shares
+/// `mdkb::mcp::wait_for_shutdown_signal` with the daemon (see `run_daemon` in
+/// `main.rs`), which watches both.
+#[cfg(feature = "http-server")]
+#[test]
+fn http_server_exits_on_sigterm() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local_addr").port();
+    drop(listener);
+
+    let mut child = Command::new(BIN)
+        .arg("serve")
+        .arg("--http")
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--allow-no-auth")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mdkb serve --http");
+
+    // Startup latency is not what this test measures — a debug build cold-starting
+    // on a loaded machine has been seen to need more than 5s, which made the test
+    // flake. Only the SIGTERM response below is held to a tight deadline.
+    let up = wait_until(Duration::from_secs(30), || {
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+    assert!(
+        up,
+        "http server did not start listening on 127.0.0.1:{port} within 30s"
+    );
+
+    let pid = child.id();
+    // SAFETY: kill is safe; SIGTERM is well-defined.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("http server did not exit within 5s of SIGTERM");
+        }
+        sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "http server should exit 0 on SIGTERM; got {status:?}"
+    );
+}
