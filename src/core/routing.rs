@@ -93,6 +93,8 @@ pub fn routing_for(command: &Command) -> Routing {
 
         // ── reads ───────────────────────────────────────────────────────────
         Command::Search { .. }
+        | Command::Dup { .. }
+        | Command::Coupling { .. }
         | Command::Get { .. }
         | Command::Mget { .. }
         | Command::Stats { .. }
@@ -416,6 +418,8 @@ pub fn mutation_request(
         },
         Command::Init
         | Command::Search { .. }
+        | Command::Dup { .. }
+        | Command::Coupling { .. }
         | Command::Get { .. }
         | Command::Mget { .. }
         | Command::Serve { .. }

@@ -2,13 +2,245 @@
 
 ## Unreleased
 
-Every open issue in the tracker, plus the collection command their absence kept
-asking for. Three of them were Windows-only. Those three now **compile** for
-`x86_64-pc-windows-msvc`, but nothing here has been **run** on Windows: the
-platform rules are pinned by portable unit tests, not by a session on the host
-that reported them.
+Two questions the index could not answer before: *what does this repository say
+twice?* and *what changes together without any edge saying why?*
+
+Read the duplication report knowing what it is worth. Measured on this
+repository, 66% of the lines it claims sit at exactly the threshold, and a
+hand-classified sample of that bucket was 5 false positives out of 8. The
+trustworthy core is the clusters at 0–3 bits apart. The numbers are under *The
+structural threshold* below, because a reader who does not have them will
+over-trust the headline.
+
+This release also closes every open issue in the tracker, plus the collection
+command their absence kept asking for. Three of them were Windows-only. Those
+three now **compile** for `x86_64-pc-windows-msvc`, but nothing here has been
+**run** on Windows: the platform rules are pinned by portable unit tests, not
+by a session on the host that reported them.
+
+### Added
+
+- **`mdkb dup` reports duplicated code**, and `search scope="duplicates"` asks
+  the same question over MCP. One handler serves both surfaces, so the CLI and
+  the MCP server cannot disagree about the same repository, and there is no
+  thirteenth MCP tool: the audit is a scope on the search tool that already
+  exists. `--file` scopes the sweep, `--min-nodes` sets how big a body must be
+  to be worth comparing, `--threshold` overrides the semantic floor.
+- **Review mode: `mdkb dup --since <ref>`**, and `since` on the MCP search.
+  The whole-repository sweep is the audit; the daily question is narrower —
+  *what did **this change** duplicate against code that already existed?* The
+  distinction that makes it work is where the narrowing happens. `--file`
+  narrows the **candidates**, deciding what gets fingerprinted at all. Review
+  mode must not, because the code your change duplicated is by definition code
+  your change did not touch, so narrowing the candidates first deletes the very
+  symbols the answer is made of. The whole index is fingerprinted and clustered
+  as always, and only the **report** is narrowed, to clusters with at least one
+  member among the changed files. On this repository a sweep of 690 clusters
+  came back as 230 against an uncommitted working tree, and the unchanged twin
+  is still named in each one — which is the finding. (The exact pair moves with
+  the tree; what does not is that the twin survives the narrowing.) Note that a
+  worktree shares its main worktree's store by design, so `--since` compares
+  the tree the store is anchored to, not the checkout you typed the command in.
+  Two behaviours a test pins: an unresolvable ref is an
+  error and never an empty report, because an empty report reads as "your change
+  duplicated nothing"; and untracked files count, because `git diff --name-only`
+  lists tracked work only while a brand-new file duplicating existing code is
+  the archetypal finding.
+- **`mdkb coupling` reports files that change together with no edge between
+  them.** Two files with shared commits in git history and no
+  `Calls`/`Uses`/`Expands`/`Implements` edge in the code graph — an implicit
+  contract, a config kept in two places, a test that knows the implementation.
+  No new column and no new table: `git log --name-only` joined against the index
+  that already exists. Defaults are 5 shared commits over 12 months; `--ref`,
+  `--since` and `--min-cochanges` override them. Two filters decide whether the
+  output is a report or noise, both added because the unfiltered run produced
+  noise: only files the index parsed are paired, since a path with no symbols
+  can carry no edge by construction (without it, 51 of 61 pairs here were
+  `Cargo.lock` ↔ `Cargo.toml` and friends); and commits touching over 100 files
+  are dropped whole rather than truncated, because a repo-wide sweep is one
+  event and not evidence about any two of its files — it is also where the O(n²)
+  pair expansion would go, a 500-file commit alone contributing ~124,750 pairs.
+  15 pairs on this repository, in 0.11s of CPU after the index is open. CLI
+  only; there is no MCP scope for it yet.
+
+- **Store namespaces, so a consumer's test suite cannot pollute the store its
+  sessions warm up from.** `MDKB_NAMESPACE=<name>` points a process at
+  `.mdkb/namespaces/<name>/` — its own index, projection and locks — which no
+  read of the default store can see and the store-level `.gitignore` never
+  commits. A process carrying a test runner's marker (`NODE_TEST_CONTEXT`,
+  `VITEST`, `JEST_WORKER_ID`, `PYTEST_CURRENT_TEST`) is routed to the `test`
+  namespace without asking; `MDKB_NAMESPACE=default` opts back out. Namespaced
+  processes never use the daemon, and the daemon refuses to start in one. The
+  file watcher reconciles the projection of the store it opened, namespaced or
+  not. Motivated by three `wiz-bridge-test-<timestamp>` entries and a `retest-001`
+  found active in a live store.
+
+- **Warmup eligibility is an allow-list.** The pool admits topics, problems,
+  decisions and priors (the last only for the reserved confidence-gated slot).
+  Handoffs, reminders and net-refuted entries (`corrections > confirmations`)
+  never compete for a slot; the newest handoff and due reminders still arrive
+  through their own queries.
+
+- **`mdkb collection update <name> [--path P] [--pattern G]`** changes a
+  collection in place. Changing a pattern used to mean `collection remove` +
+  `collection add`, which drops every indexed document and forces a full
+  re-embed of files whose content never changed. The update keeps `created_at`
+  and `source`, validates the new path and pattern before writing, and refuses
+  a call that names neither. The saving applies to `--pattern`: a document is
+  keyed by its path relative to the collection's base, so `--path` moves the
+  base out from under the existing rows and the new one is indexed — and
+  embedded — from scratch. *(#11, reported by Stefano Straus (@sstraus))*
+
+- **[docs/graph.md](docs/graph.md)** — how graph edges are created, how a
+  reference resolves (and what is tried before it is called dangling), what each
+  query answers, and when to reach for the graph instead of search.
+
+### Changed
+
+- **Duplication clusters use complete linkage.** Similarity is not transitive.
+  Union-find closed it transitively anyway, and on this repository that produced
+  one component of 3209 symbols across 241 modules whose widest pair sat 47 bits
+  apart against a threshold of 12 — half the report was noise. A member now
+  joins a group only if it is admissible with **every** member already in it, so
+  the group's diameter is bounded by the threshold by construction rather than
+  by hope. Seeding is ordered by simhash and not by row id, so editing a file
+  above a symbol cannot renumber the groups an ignore-list is keyed on. 21
+  clusters became 758; the widest pair went from 47 bits to 12; the largest
+  cluster from 3209 members to 26. 19 of the 21 pre-existing cluster hashes were
+  unchanged, so accepted-duplication decisions survived the fix — the two that
+  moved are the two that were out of contract.
+- **The structural threshold is 6 bits, was 12.** The clustering fix bounded the
+  groups but not the cut. At 12 bits, 497 of 706 clusters sat at exactly 12 and
+  another 105 at 11 — 85% of the mass pressed against the boundary. A threshold
+  that finds real duplication has its mass near 0; one whose mass sits on its
+  own cut is reporting whatever fits. Two competing explanations were tested and
+  one was ruled out: the share at the cut held at every body size (70% for
+  bodies over 100 AST nodes, 63% over 200), so it was the threshold and not an
+  entropy floor on small bodies. Reported lines halve, 38931 to 19200.
+
+  The distribution did **not** come off the boundary. One sweep of this
+  repository, 690 clusters claiming 22727 lines, broken out by the distance
+  that admitted each one (`mdkb dup --format json` is where these come from):
+
+  | bits apart | clusters | lines claimed | share of lines |
+  |---:|---:|---:|---:|
+  | 0 | 40 | 922 | 4.1% |
+  | 1–3 | 38 | 854 | 3.8% |
+  | 4 | 57 | 1397 | 6.1% |
+  | 5 | 124 | 3619 | 15.9% |
+  | **6 (the cut)** | **371** | **15034** | **66.2%** |
+  | semantic (cosine, no distance) | 60 | 901 | 4.0% |
+
+  Halving the threshold moved the cliff; it did not remove it. The shape belongs
+  to simhash over shingles, not to the number 12, so 6 is an improvement and not
+  a settled answer. Hand-classifying a random sample says the same: 8 clusters
+  from the 6-bit bucket gave 1 clearly worth extracting, 2 true but marginal and
+  5 false positives, while 6 drawn from the 0-bit bucket were 6 for 6 genuine.
+  Treat the ≤3-bit clusters as the report's core.
+- **`mdkb dup` reports by bucket, not as one number, and ranks bucket-first.**
+  The table above was one sweep, printed once, in this file. Every run now
+  prints its own: after the headline, a table of clusters and duplicated
+  lines per bucket — `0`, `1-3`, `4`, `5`, `at cut`, `cosine` — so a reader
+  calibrates without re-deriving the table by hand. `--format json` carries
+  the same `buckets` summary next to `evidence.hamming`; CSV is unchanged,
+  since it is already one row per member and a repeated bucket column would
+  not read as a table there. `rank()` used to order by module spread, which
+  put the noisiest cut-band clusters on top — the ones the hand sample called
+  wrong two times in three. It orders by bucket first now, then the same
+  spread-before-reach tie-breakers, so a single-module 0-bit finding outranks
+  a twelve-module 6-bit one instead of losing to it.
+- **The semantic pass is opt-in: `mdkb dup --semantic`.** `dup` runs a
+  structural pass over fingerprints and a semantic pass that embeds every
+  body. On this repository the second one took **817 s of an 818 s run** to
+  add 69 of 767 clusters — 4% of the findings for 99.8% of the time. It is now
+  off unless asked for: `--semantic` or any `--threshold` override turns it on
+  for one run, and `semantic = true` under `[code.duplication]` is the standing
+  opt-in (the key was `enabled` earlier in this cycle, and never shipped under
+  that name). Over MCP there is no new field — passing `threshold` to
+  `search(scope="duplicates")` is the opt-in, which is what the parameter's
+  schema now says. A default `dup` never constructs the embedder at all, so a
+  machine with no model on disk and no network gets the structural report in
+  seconds instead of a download; a model that is configured but will not load
+  still degrades the run rather than failing it.
+- **The semantic pass costs a third and survives a Ctrl-C.** Measured on 2323
+  bodies, cold cache, release build: **479 s and 13.3 GB peak before, 168 s and
+  4.6 GB after** — 2.85× less wall time, 2.9× less memory. Three changes, none
+  of which touch the structural half:
+  - Input is cut at 256 tokens rather than fastembed's 512. Attention is
+    quadratic in sequence length, so the bodies long enough to be truncated are
+    exactly the expensive ones.
+  - Bodies are sorted by length before batching. fastembed pads every batch to
+    its longest text, and candidates used to arrive in file order, so each short
+    body paid the token cost of its longest neighbour.
+  - Vectors are written every 256 bodies instead of once at the end. A pass
+    interrupted at minute 12 used to lose all twelve minutes; it now loses the
+    current chunk. This is also what caps the memory: the old code held every
+    vector until the last body was embedded.
+
+  `dup.sqlite` gains a `meta` table recording `model:dimensions:max_tokens`. A
+  vector is only comparable with vectors computed the same way, and nothing else
+  would notice a change — the key is the body hash and the body did not change.
+  A mismatch drops the embeddings and keeps the simhashes, which cost no model.
+  The first run after this release drops the whole embedding cache, because what
+  produced it was never recorded.
+
+  Structural cluster hashes are byte-identical before and after, on both corpora
+  measured. The `cosine` bucket is not: 53 of 59 clusters survive, 6 drop and 8
+  appear, all fourteen scoring between 0.7019 and 0.8140 against a 0.70 floor.
+  That is threshold-boundary churn rather than a loss — several are the same
+  finding with different membership — and it lands in the bucket the report
+  already ranks last.
+- **A semantic sweep from the CLI runs at background priority.** It still costs
+  the same CPU-seconds; it stops taking a core away from the editor and the
+  build that are running next to it. macOS gets `PRIO_DARWIN_BG`, which throttles
+  disk I/O along with CPU — right for a sweep that reads the index once and then
+  sits in ONNX for minutes; other unix gets nice 19. Never the daemon: it answers
+  interactive searches from a long-lived process, and backgrounding that would
+  make every search pay for an audit nobody asked it to run.
+- **Thirteen language parsers share one parse-and-collect helper, and their
+  walks are data.** `mdkb dup` found the same four lines — parse, bail quietly
+  on unreadable source, allocate, hand over the root — written out 50 times.
+  They are now `CachingParser::collect`. Exactly 13 sites keep the old shape and
+  they are all `parse_symbols`, whose walk is a `&mut self` call that cannot be
+  made while `self.parser` is borrowed by `collect`: a real borrow conflict, one
+  per language. That alone reduced no duplication — 606 clusters before, 606
+  after — because the 13 `find_calls_impl` methods got shorter, not fewer.
+  `LanguageParser` now takes the walk as data instead: a plain `fn` pointer
+  returned by `calls_walk`, `uses_walk`, `defines_walk` and three siblings, with
+  the six `find_*` methods sharing one body in the trait. The trait stays object
+  safe, which it must, since it is used as `Box<dyn LanguageParser>`.
+  Duplication in `src/code/parsing` went from 7143 lines to 7051 at an unchanged
+  113 clusters, and the three clusters the work was started for are gone. It
+  shrank rather than vanished: a `calls_walk` cluster now stands where
+  `find_calls_impl` stood, over the same 11 modules, at 50 duplicated lines
+  against 80. Thirteen trait implementations must exist; what a refactor can
+  remove is how much each one has to say.
 
 ### Fixed
+
+- **`mdkb dup` and `mdkb coupling` honour `--format`.** The flag is declared
+  `global = true`, so both commands advertised `json`, `csv` and `markdown` in
+  their own `--help` — and printed the prose report whatever was asked for. A
+  flag a program accepts and then ignores is worse than one it rejects. Both now
+  render the findings they already ranked: JSON carries `evidence.hamming`,
+  which the prose only spells out in a sentence, so a caller can bucket the
+  findings by distance — the thing the section above says a reader has to do.
+  CSV writes one row per member under a repeated cluster key, and quotes any
+  field holding a comma. `text` and `markdown` stay one surface, because the
+  prose report is markdown already. One deliberate exception: a repository with
+  no code index prints its prose in *every* format, since
+  `{"clusters": 0, "findings": []}` is indistinguishable from "nothing is
+  duplicated here" — the one answer an unindexed repository must not be able to
+  give.
+- **`mdkb init` no longer freezes its defaults into the config it writes.**
+  `Config` and all 20 of its sections are `#[serde(default)]`, so an absent key
+  takes the value in the code — but `init` was writing every default out as live
+  TOML, and a **present** key beats the code. Every store ever created was
+  pinned to whatever the defaults were on its creation date, which is why
+  lowering the duplication threshold reached nobody until this was found. `init`
+  now writes the same defaults commented out: the options stay discoverable, the
+  code stays the single place a default lives, and uncommenting a line is what
+  it looks like — a deliberate override.
 
 - **An MCP `memory_write` projects its entry to disk, like `mdkb memory add`
   always did.** The MCP path wrote the row and stopped; the `.md` appeared only
@@ -113,39 +345,6 @@ that reported them.
   interrupted writer on the next open, exactly as after the SIGKILL this
   replaces. *(#10, reported by Stefano Straus (@sstraus))*
 
-### Added
-
-- **Store namespaces, so a consumer's test suite cannot pollute the store its
-  sessions warm up from.** `MDKB_NAMESPACE=<name>` points a process at
-  `.mdkb/namespaces/<name>/` — its own index, projection and locks — which no
-  read of the default store can see and the store-level `.gitignore` never
-  commits. A process carrying a test runner's marker (`NODE_TEST_CONTEXT`,
-  `VITEST`, `JEST_WORKER_ID`, `PYTEST_CURRENT_TEST`) is routed to the `test`
-  namespace without asking; `MDKB_NAMESPACE=default` opts back out. Namespaced
-  processes never use the daemon, and the daemon refuses to start in one. The
-  file watcher reconciles the projection of the store it opened, namespaced or
-  not. Motivated by three `wiz-bridge-test-<timestamp>` entries and a `retest-001`
-  found active in a live store.
-
-- **Warmup eligibility is an allow-list.** The pool admits topics, problems,
-  decisions and priors (the last only for the reserved confidence-gated slot).
-  Handoffs, reminders and net-refuted entries (`corrections > confirmations`)
-  never compete for a slot; the newest handoff and due reminders still arrive
-  through their own queries.
-
-- **`mdkb collection update <name> [--path P] [--pattern G]`** changes a
-  collection in place. Changing a pattern used to mean `collection remove` +
-  `collection add`, which drops every indexed document and forces a full
-  re-embed of files whose content never changed. The update keeps `created_at`
-  and `source`, validates the new path and pattern before writing, and refuses
-  a call that names neither. The saving applies to `--pattern`: a document is
-  keyed by its path relative to the collection's base, so `--path` moves the
-  base out from under the existing rows and the new one is indexed — and
-  embedded — from scratch. *(#11, reported by Stefano Straus (@sstraus))*
-
-- **[docs/graph.md](docs/graph.md)** — how graph edges are created, how a
-  reference resolves (and what is tried before it is called dangling), what each
-  query answers, and when to reach for the graph instead of search.
 
 ## 3.8.0 (2026-08-29)
 

@@ -25,7 +25,7 @@ pub struct SearchParams {
     #[serde(default)]
     pub include_superseded: bool,
 
-    /// Search scope: "docs", "memory", "code", or "symbols". Omit to search docs+memory.
+    /// Search scope: "docs", "memory", "code", "symbols", or "duplicates". Omit to search docs+memory.
     #[serde(default)]
     pub scope: Option<String>,
 
@@ -33,17 +33,21 @@ pub struct SearchParams {
     #[serde(default)]
     pub kind: Option<String>,
 
-    /// Minimum similarity score 0.0-1.0 when scope is "code". Omit to use the configured code.semantic_search.threshold.
+    /// Minimum similarity score 0.0-1.0 when scope is "code" or "duplicates". Omit to use the configured threshold. For scope="duplicates" it also enables the semantic pass, which loads a model and takes minutes on a large repository — omit it for the fast structural sweep.
     #[serde(default)]
     pub threshold: Option<f32>,
 
-    /// Filter by file path (substring match) when scope is "symbols".
+    /// Filter by file path: substring match when scope is "symbols", path prefix when scope is "duplicates". Omit with scope="duplicates" to sweep the repository; query is then ignored.
     #[serde(default)]
     pub file: Option<String>,
 
     /// Minimum confidence threshold 0.0-1.0 when scope is "memory". Entries below this are excluded. Omit or 0.0 = no filter.
     #[serde(default)]
     pub min_confidence: Option<f64>,
+
+    /// Git ref when scope is "duplicates": report only clusters touching what changed since it, still scored against the whole index. Use it to ask what the current change duplicated.
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -404,7 +408,8 @@ pub struct SymbolAtPositionParams {
     /// Relative file path from repo root.
     pub file: String,
 
-    /// 1-based line number.
+    /// 1-based line number, as shown in search results and editors. The
+    /// `line_start`/`line_end` in the response are 0-based tree-sitter rows.
     pub line: u32,
 
     /// 0-based column number (optional).

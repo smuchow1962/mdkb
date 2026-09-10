@@ -520,7 +520,12 @@ impl CodeDb {
         rows.collect()
     }
 
-    /// Find the innermost symbol enclosing a given position (line is 1-based).
+    /// Find the innermost symbol enclosing a given position.
+    ///
+    /// `line` is 0-based, because `line_start`/`line_end` hold tree-sitter rows
+    /// verbatim (see `stage_index`, which passes `range.start_line` through). A
+    /// caller holding a 1-based line — anything a human or an editor produced —
+    /// must subtract one first, or this returns the symbol on the line below.
     pub fn symbol_at_position(
         &self,
         rel_path: &str,
@@ -1017,7 +1022,7 @@ fn io_as_sqlite(operation: &str, error: std::io::Error) -> rusqlite::Error {
 /// clause that would fix the first problem then takes for itself. `substr(x, -n)`
 /// asks the question directly — "do these characters end it" — and a name too
 /// short to fill `n` simply fails to compare equal.
-const RESOLUTION_TIER: &str = "CASE \
+pub(crate) const RESOLUTION_TIER: &str = "CASE \
      WHEN r.to_qualifier IS NOT NULL THEN ( CASE \
          WHEN s.owner_name IS NOT NULL AND ( \
              r.to_qualifier = s.owner_name \
@@ -1066,7 +1071,7 @@ pub const TIER_UNPLACED: i64 = 7;
 ///
 /// Callers keep the rows where `tier = nearest`: that is the first rule of the
 /// cascade to yield anything, and no later rule runs once one has.
-fn resolved_edges(filter: &str) -> String {
+pub(crate) fn resolved_edges(filter: &str) -> String {
     format!(
         "SELECT r.from_symbol_id AS from_id, s.id AS sym_id, \
                 {RESOLUTION_TIER} AS tier, \
@@ -1109,6 +1114,26 @@ fn like_pattern(substring: &str) -> String {
 }
 
 /// Convert a row from the standard 14-column symbol SELECT to a `Symbol`.
+/// Decode the `visibility` column.
+///
+/// The numbers are the enum's own discriminants, which are pinned in its
+/// declaration precisely because they are stored here. One definition, shared
+/// with the duplication pass: a second copy would keep answering `Private` for
+/// `Package` the day a level is added.
+///
+/// An unknown number reads as `Private` — the narrowest answer, so an index
+/// written by a newer version under-reports reach instead of over-reporting it.
+pub(crate) fn visibility_from_i64(value: i64) -> Visibility {
+    match value {
+        0 => Visibility::Public,
+        1 => Visibility::Crate,
+        2 => Visibility::Module,
+        4 => Visibility::Package,
+        5 => Visibility::Restricted,
+        _ => Visibility::Private,
+    }
+}
+
 fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let id: i64 = row.get(0)?;
     let name: String = row.get(1)?;
@@ -1146,16 +1171,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         line_end.unwrap_or(line_start),
         col_end.map_or(0, |v| v as u16),
     );
-    // The numbers are the enum's own discriminants, which are pinned in its
-    // declaration precisely because they are stored here.
-    let visibility = match visibility_val {
-        0 => Visibility::Public,
-        1 => Visibility::Crate,
-        2 => Visibility::Module,
-        4 => Visibility::Package,
-        5 => Visibility::Restricted,
-        _ => Visibility::Private,
-    };
+    let visibility = visibility_from_i64(visibility_val);
     let scope_context = scope_context_str.and_then(|s| {
         serde_json::from_str(&s)
             .map_err(|e| {
@@ -1984,14 +2000,7 @@ mod tests {
         let (here_file, caller) = file_with_function(&db, "caller", "here.php", "App\\Here");
         let local = function_in(&db, "run", (here_file, "here.php"), "App\\Here", 10);
         let (util_file, _) = file_with_function(&db, "unrelated", "util.php", "App\\Util");
-        let member = method_in(
-            &db,
-            "run",
-            "Util",
-            (util_file, "util.php"),
-            "App\\Util",
-            5,
-        );
+        let member = method_in(&db, "run", "Util", (util_file, "util.php"), "App\\Util", 5);
         db.insert_relationship(
             Some(caller),
             "caller",
@@ -2440,10 +2449,26 @@ mod tests {
             )
             .unwrap();
 
-        db.insert_relationship(Some(near), "near", "root", None, "Calls", near_file, (None, None))
-            .unwrap();
-        db.insert_relationship(Some(far), "far", "root", None, "Calls", far_file, (None, None))
-            .unwrap();
+        db.insert_relationship(
+            Some(near),
+            "near",
+            "root",
+            None,
+            "Calls",
+            near_file,
+            (None, None),
+        )
+        .unwrap();
+        db.insert_relationship(
+            Some(far),
+            "far",
+            "root",
+            None,
+            "Calls",
+            far_file,
+            (None, None),
+        )
+        .unwrap();
         db.insert_relationship(
             Some(shared),
             "shared",

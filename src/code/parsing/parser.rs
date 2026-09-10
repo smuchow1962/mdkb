@@ -4,12 +4,25 @@
 //! extraction, call graph detection, and relationship finding via
 //! tree-sitter AST traversal.
 
+use super::caching_parser::CachingParser;
 use super::import::Import;
 use super::language::Language;
 use crate::code::symbol::Symbol;
 use crate::code::types::{FileId, Range, SymbolCounter};
 
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
+
+/// One edge of the relationship graph: (source, target, where it was written).
+pub type Edge<'a> = (&'a str, &'a str, Range);
+
+/// The walk that collects edges of one kind out of a parsed tree.
+///
+/// A plain `fn` pointer, not a generic and not an associated function reached
+/// through `Self::`: this trait is used as `Box<dyn LanguageParser>`, so
+/// everything it exposes has to stay object safe. Handing the walk over as
+/// data is what lets the six `find_*` methods below have one shared body
+/// instead of thirteen copies each.
+pub type EdgeWalk = for<'a> fn(&Node<'_>, &'a str, &mut Vec<Edge<'a>>);
 
 /// Common interface for all language parsers.
 ///
@@ -22,11 +35,51 @@ pub trait LanguageParser: Send {
     /// Which language this parser handles.
     fn language(&self) -> Language;
 
+    /// The parsed tree for `code`, for a caller that needs the AST itself
+    /// rather than the symbols extracted from it.
+    ///
+    /// Every parser answers this from its [`CachingParser`], so a caller that
+    /// asks during `stage_parse` — where the same source has already been
+    /// parsed for symbol extraction — gets a clone of the cached tree instead
+    /// of a second run of the state machine.
+    ///
+    /// [`CachingParser`]: super::caching_parser::CachingParser
+    fn tree(&mut self, code: &str) -> Option<Tree> {
+        let _ = code;
+        None
+    }
+
     /// Extract documentation comment for an AST node.
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String>;
 
+    /// The caching parser this language owns.
+    ///
+    /// Required so the `find_*` methods below can share one body: they need the
+    /// parser to run a walk on, and only the implementor knows where it lives.
+    fn parser(&mut self) -> &mut CachingParser;
+
+    /// Run `walk` over `code` and return what it collected.
+    ///
+    /// `None` is a language that cannot state this relationship at all — Lua
+    /// has no inheritance syntax, most grammars cannot tell a macro from a
+    /// call — and it answers with nothing rather than with a guess.
+    fn collect_edges<'a>(&mut self, code: &'a str, walk: Option<EdgeWalk>) -> Vec<Edge<'a>> {
+        match walk {
+            Some(walk) => self.parser().collect(code, walk),
+            None => Vec::new(),
+        }
+    }
+
+    /// The walk that collects calls: (caller_name, callee_name, range).
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        None
+    }
+
     /// Find function/method calls: (caller_name, callee_name, range).
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)>;
+    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<Edge<'a>> {
+        let walk = self.calls_walk();
+        self.collect_edges(code, walk)
+    }
 
     /// Find macro invocations: (invoker_name, macro_name, range).
     ///
@@ -40,24 +93,58 @@ pub trait LanguageParser: Send {
     /// [`find_calls`](LanguageParser::find_calls): a macro is not a function,
     /// and reporting `assert!` as a call to a missing `assert` is 4 921 wrong
     /// edges in this repository's own index.
-    fn find_macro_expansions<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let _ = code;
-        Vec::new()
+    fn macro_expansions_walk(&self) -> Option<EdgeWalk> {
+        None
+    }
+
+    fn find_macro_expansions<'a>(&mut self, code: &'a str) -> Vec<Edge<'a>> {
+        let walk = self.macro_expansions_walk();
+        self.collect_edges(code, walk)
+    }
+
+    /// The walk that collects trait/interface implementations.
+    fn implementations_walk(&self) -> Option<EdgeWalk> {
+        None
     }
 
     /// Find trait/interface implementations: (type_name, trait_name, range).
-    fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)>;
+    fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<Edge<'a>> {
+        let walk = self.implementations_walk();
+        self.collect_edges(code, walk)
+    }
+
+    /// The walk that collects inheritance.
+    fn extends_walk(&self) -> Option<EdgeWalk> {
+        None
+    }
 
     /// Find inheritance (extends): (derived, base, range).
-    fn find_extends<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
+    fn find_extends<'a>(&mut self, code: &'a str) -> Vec<Edge<'a>> {
+        let walk = self.extends_walk();
+        self.collect_edges(code, walk)
+    }
+
+    /// The walk that collects type usage.
+    fn uses_walk(&self) -> Option<EdgeWalk> {
+        None
     }
 
     /// Find type usage (fields, params, returns): (context_name, used_type, range).
-    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)>;
+    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<Edge<'a>> {
+        let walk = self.uses_walk();
+        self.collect_edges(code, walk)
+    }
+
+    /// The walk that collects method definitions.
+    fn defines_walk(&self) -> Option<EdgeWalk> {
+        None
+    }
 
     /// Find method definitions (in traits/types): (definer_name, method_name, range).
-    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)>;
+    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<Edge<'a>> {
+        let walk = self.defines_walk();
+        self.collect_edges(code, walk)
+    }
 
     /// Find import statements.
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import>;

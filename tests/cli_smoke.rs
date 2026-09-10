@@ -412,6 +412,235 @@ fn smoke_search_scope_memory() {
     assert_ok(&out, "search --scope memory");
 }
 
+/// `mdkb dup` before anyone ran `mdkb code index`.
+///
+/// `mdkb init` creates an empty `code.sqlite`, so this is the state a fresh
+/// repository is really in — the audit must say the index is missing and exit
+/// 0, because an audit with nothing to audit is not a failure.
+#[test]
+fn smoke_dup_without_a_code_index() {
+    let repo = Repo::new();
+    let out = run(&["dup"], &repo.root);
+    assert_ok(&out, "dup without a code index");
+    let text = stdout(&out);
+    assert!(text.contains("No code index"), "dup said: {text}");
+    assert!(
+        text.contains("mdkb code index"),
+        "and must say what to run: {text}"
+    );
+}
+
+/// Review mode's one failure that must never be silent.
+///
+/// An empty duplication report reads as "your change duplicated nothing". A
+/// ref git cannot resolve must therefore be an error, not an empty report —
+/// otherwise a typo in the ref is indistinguishable from a clean review.
+///
+/// The repository is indexed first on purpose: without an index `dup` reports
+/// that instead, and this test would pass for the wrong reason.
+#[test]
+fn smoke_dup_since_an_unknown_ref_fails_rather_than_reporting_nothing() {
+    let repo = Repo::new();
+    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+
+    let out = run(&["dup", "--since", "no-such-ref-anywhere"], &repo.root);
+
+    assert!(
+        !out.status.success(),
+        "an unresolvable ref must not report an empty audit: {}",
+        stdout(&out)
+    );
+}
+
+/// A ref beginning with `-` never reaches git.
+///
+/// On this surface clap refuses it first, which is the outer of two guards;
+/// the inner one — `reject_option_like_ref`, which protects the MCP path where
+/// no argument parser is involved — is pinned by the unit tests in `git.rs`.
+#[test]
+fn smoke_dup_since_rejects_an_option_like_ref() {
+    let repo = Repo::new();
+    let out = run(&["dup", "--since", "--upload-pack=evil"], &repo.root);
+    assert!(!out.status.success(), "must refuse: {}", stdout(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--upload-pack"),
+        "and must name what it refused: {stderr}"
+    );
+}
+
+/// The semantic pass is opt-in, and both switches that turn it on reach the
+/// handler.
+///
+/// `mdkb dup` used to load a 160M-parameter model on every run: measured on
+/// this repository the semantic half took 817 s of an 818 s run. It now runs
+/// only when `--semantic` or a `--threshold` override asks for it.
+///
+/// The model is made unreachable on purpose — an empty cache directory plus an
+/// endpoint on a closed port. A run that asks for the semantic pass then warns
+/// and degrades to the structural half; a run that does not ask stays silent.
+/// That warning is what separates the three cases here without downloading
+/// weights or reaching the network.
+#[test]
+fn smoke_dup_semantic_pass_is_opt_in() {
+    let repo = Repo::new();
+    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+
+    let cache_dir = repo.root.join("fastembed-empty");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let cache = cache_dir.to_str().unwrap();
+    let offline = [
+        ("FASTEMBED_CACHE_DIR", cache),
+        // fastembed prefers HF_HOME over the cache directory it is handed, so
+        // a developer with one exported would otherwise hit their real cache.
+        ("HF_HOME", cache),
+        ("HF_ENDPOINT", "http://127.0.0.1:1"),
+    ];
+    const REACHED_FOR_A_MODEL: &str = "duplication model unavailable";
+
+    let plain = run_env(&["dup"], &repo.root, &offline);
+    assert_ok(&plain, "dup");
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        !stderr.contains(REACHED_FOR_A_MODEL),
+        "a default run must not reach for a model: {stderr}"
+    );
+
+    for args in [
+        ["dup", "--semantic"].as_slice(),
+        ["dup", "--threshold", "0.8"].as_slice(),
+    ] {
+        let label = args.join(" ");
+        let out = run_env(args, &repo.root, &offline);
+        assert_ok(&out, &label);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(REACHED_FOR_A_MODEL),
+            "`mdkb {label}` must ask for the semantic pass: {stderr}"
+        );
+        let text = stdout(&out);
+        assert!(
+            text.starts_with("# Duplication"),
+            "and must still report: {text}"
+        );
+    }
+}
+
+/// `mdkb coupling` before anyone ran `mdkb code index`.
+///
+/// Same contract as `dup`: nothing to correlate is not a failure. The tempdir
+/// is not a git repository either, so this also pins that a missing history
+/// exits 0 rather than surfacing git's own error.
+#[test]
+fn smoke_coupling_without_a_code_index() {
+    let repo = Repo::new();
+    let out = run(&["coupling"], &repo.root);
+    assert_ok(&out, "coupling without a code index");
+    let text = stdout(&out);
+    assert!(text.contains("Hidden Coupling"), "coupling said: {text}");
+    assert!(
+        text.contains("No code index") || text.contains("No git history"),
+        "and must name what is missing: {text}"
+    );
+}
+
+/// The three overrides must reach the handler, not just parse. A bad `--ref`
+/// is the one that proves it: the default path never names a revision, so an
+/// unreachable one can only fail if the flag was actually threaded through.
+#[test]
+fn smoke_coupling_accepts_its_overrides() {
+    let repo = Repo::new();
+    let out = run(
+        &[
+            "coupling",
+            "--min-cochanges",
+            "3",
+            "--since",
+            "1 year ago",
+            "--ref",
+            "HEAD",
+        ],
+        &repo.root,
+    );
+    assert_ok(&out, "coupling with every override");
+}
+
+/// `--format` is declared `global = true`, so every subcommand advertises it in
+/// its own `--help`. Both audits used to print their prose whatever was asked
+/// for — the flag parsed, was accepted, and was dropped. A flag a program
+/// accepts and ignores is worse than one it rejects.
+#[test]
+fn smoke_dup_honours_the_global_format_flag() {
+    let repo = Repo::new();
+    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+
+    let json = stdout(&run(&["dup", "--format", "json"], &repo.root));
+    let value: serde_json::Value = serde_json::from_str(json.trim())
+        .unwrap_or_else(|e| panic!("`dup --format json` must emit JSON ({e}), got: {json}"));
+    assert!(value["findings"].is_array(), "{value}");
+    assert!(value["clusters"].is_number(), "{value}");
+
+    let csv = stdout(&run(&["dup", "--format", "csv"], &repo.root));
+    assert!(
+        csv.starts_with("cluster_hash,cluster_name,"),
+        "`dup --format csv` must emit a CSV header, got: {csv}"
+    );
+
+    // text and markdown stay the prose report, which is markdown already.
+    let text = stdout(&run(&["dup"], &repo.root));
+    assert!(text.starts_with("# Duplication"), "{text}");
+    assert_eq!(text, stdout(&run(&["dup", "--format", "markdown"], &repo.root)));
+}
+
+#[test]
+fn smoke_coupling_honours_the_global_format_flag() {
+    let repo = Repo::new();
+    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+
+    let json = stdout(&run(&["coupling", "--format", "json"], &repo.root));
+    let value: serde_json::Value = serde_json::from_str(json.trim())
+        .unwrap_or_else(|e| panic!("`coupling --format json` must emit JSON ({e}), got: {json}"));
+    assert!(value["findings"].is_array(), "{value}");
+
+    let csv = stdout(&run(&["coupling", "--format", "csv"], &repo.root));
+    assert!(
+        csv.starts_with("file_a,file_b,cochanges"),
+        "`coupling --format csv` must emit a CSV header, got: {csv}"
+    );
+}
+
+/// `{"clusters": 0, "findings": []}` reads as "nothing is duplicated here",
+/// which is exactly the answer an unindexed repository must not be able to
+/// give. The prose is the honest payload in every format.
+#[test]
+fn smoke_dup_format_json_without_an_index_says_so_rather_than_returning_an_empty_list() {
+    let repo = Repo::new();
+
+    let out = run(&["dup", "--format", "json"], &repo.root);
+
+    assert_ok(&out, "dup --format json without a code index");
+    let text = stdout(&out);
+    assert!(text.contains("No code index"), "{text}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(text.trim()).is_err(),
+        "an empty JSON payload here would be a lie: {text}"
+    );
+}
+
+/// The scope spelling is the same audit as the subcommand, on the CLI too —
+/// `search --scope duplicates` exists because that is how MCP asks for it.
+#[test]
+fn smoke_search_scope_duplicates_matches_dup() {
+    let repo = Repo::new();
+    let scoped = run(&["search", "", "--scope", "duplicates"], &repo.root);
+    assert_ok(&scoped, "search --scope duplicates");
+    assert_eq!(
+        stdout(&scoped),
+        stdout(&run(&["dup"], &repo.root)),
+        "the two spellings must not drift"
+    );
+}
+
 #[test]
 fn smoke_get_by_path() {
     let repo = Repo::new();
@@ -1443,6 +1672,8 @@ fn smoke_help_all_subcommands() {
         &["update", "--help"],
         &["embed", "--help"],
         &["search", "--help"],
+        &["dup", "--help"],
+        &["coupling", "--help"],
         &["get", "--help"],
         &["mget", "--help"],
         &["stats", "--help"],

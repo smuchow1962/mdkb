@@ -380,14 +380,82 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     format_code_symbols(&found.symbols, cli.format);
                     report_find_truncation(&found);
                 }
+                Some("duplicates") => {
+                    // The query is not a query here: duplication is a sweep,
+                    // and what narrows it is `--file`, not words. An empty
+                    // query is therefore the ordinary case, not a mistake.
+                    let report = run_dup(
+                        &cwd,
+                        Some(&ctx.conn),
+                        &ctx.config_path,
+                        &mdkb::core::dup::DupOverrides {
+                            file: file
+                                .clone()
+                                .or_else(|| (!query.is_empty()).then(|| query.clone())),
+                            ..Default::default()
+                        },
+                    )?;
+                    print!("{}", report.markdown);
+                }
+                Some("coupling") => {
+                    // Same shape as `duplicates` above: a sweep, not a query,
+                    // so there is nothing to pass the query text to.
+                    let report = mdkb::core::coupling::handle_coupling(
+                        &cwd,
+                        &mdkb::core::coupling::CouplingOverrides::default(),
+                    )?;
+                    print!("{}", report.markdown);
+                }
                 Some(invalid) => {
                     eprintln!(
-                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols. Omit for docs+memory.",
+                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols, duplicates, coupling. Omit for docs+memory.",
                         invalid
                     );
                     std::process::exit(1);
                 }
             }
+        }
+        Command::Dup {
+            semantic,
+            threshold,
+            min_nodes,
+            file,
+            since,
+        } => {
+            // Read-only, and tolerant of a repository nobody has indexed: the
+            // report says so and exits 0. An audit that has nothing to audit is
+            // not a failure.
+            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let report = run_dup(
+                &cwd,
+                Some(&ctx.conn),
+                &ctx.config_path,
+                &mdkb::core::dup::DupOverrides {
+                    semantic,
+                    threshold,
+                    min_nodes,
+                    file,
+                    since,
+                },
+            )?;
+            print!("{}", render_dup(&report, cli.format));
+        }
+        Command::Coupling {
+            min_cochanges,
+            since,
+            git_ref,
+        } => {
+            // Read-only, and tolerant the same way `dup` is: a repository with
+            // no index, or no history to read, is reported and exits 0.
+            let report = mdkb::core::coupling::handle_coupling(
+                &cwd,
+                &mdkb::core::coupling::CouplingOverrides {
+                    min_cochanges,
+                    since,
+                    git_ref,
+                },
+            )?;
+            print!("{}", render_coupling(&report, cli.format));
         }
         Command::Get { id, lines } => {
             use mdkb::cli::handlers::GetResult;
@@ -1110,6 +1178,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} code search <query>                                # fuzzy symbol search
 {0} code find <name>                                   # exact symbol lookup; --kind and --file narrow it
 {0} code info                                          # code index counts
+
+# Audits (both read the code index)
+{0} dup                                                # duplication sweep; structural pass only, no model
+{0} dup --semantic                                     # add the embedding pass: minutes, not seconds ([code.duplication] semantic = true makes it standing)
+{0} dup --since HEAD                                   # review mode: only clusters the change touched
+{0} coupling                                           # files that change together without referencing each other
 
 # Knowledge graph (frontmatter + wikilink edges; refs accept collection-prefixed paths)
 {0} graph links <entity>                               # outgoing edges (endpoints shown as paths, with 'via' relation)
@@ -3333,6 +3407,36 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
 
 /// Render semantic search hits. The similarity score is the reason a hit is in
 /// the list at all, so it travels with the symbol rather than being dropped.
+/// Run the duplication audit for either surface that asks for it.
+///
+/// `mdkb dup` and `mdkb search --scope duplicates` are two ways of asking the
+/// same question; they load the config the same way and call the same handler,
+/// so they cannot answer differently.
+/// The CLI's only duplication entry point — `mdkb dup` and
+/// `mdkb search --scope duplicates` both come through here.
+///
+/// That is why the priority drop lives in this function rather than in one of
+/// the two match arms: both are the CLI, both are the same minutes-long sweep,
+/// and putting it in one arm would leave the other running at full priority for
+/// no reason a user could explain. It is emphatically *not* in `core::dup`,
+/// which the MCP surface shares — the daemon answers interactive searches from
+/// a long-lived process, and backgrounding that would make every search pay for
+/// an audit nobody asked it to run.
+fn run_dup(
+    root: &std::path::Path,
+    memory: Option<&rusqlite::Connection>,
+    config_path: &std::path::Path,
+    overrides: &mdkb::core::dup::DupOverrides,
+) -> mdkb::error::Result<mdkb::core::dup::DupReport> {
+    let config = mdkb::config::Config::load_or_default(config_path);
+    // Only the semantic pass is worth backgrounding: the structural sweep is
+    // seconds, and a user waiting on seconds should not have them throttled.
+    if mdkb::core::dup::semantic_requested(&config.code.duplication, overrides) {
+        mdkb::cli::priority::lower_to_background();
+    }
+    mdkb::core::dup::handle_dup(root, memory, &config, overrides)
+}
+
 fn format_scored_symbols(scored: &[(mdkb::code::symbol::Symbol, f32)], format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -3400,6 +3504,41 @@ fn report_find_truncation(found: &mdkb::cli::handlers::CodeFindResult) {
             found.symbols.len(),
             found.total,
         );
+    }
+}
+
+/// The duplication audit in the format the caller asked for.
+///
+/// A repository with no index prints its prose in every format, deliberately.
+/// `{"clusters": 0, "findings": []}` is indistinguishable from "nothing is
+/// duplicated here", which is the one answer an unindexed repository must not
+/// be able to give — the same reason `handle_dup` reports it instead of
+/// returning an empty list.
+fn render_dup(report: &mdkb::core::dup::DupReport, format: OutputFormat) -> String {
+    use mdkb::code::duplication::report::{render_csv, render_json};
+    if !report.indexed {
+        return report.markdown.clone();
+    }
+    match format {
+        OutputFormat::Json => render_json(&report.findings, report.hamming_threshold),
+        OutputFormat::Csv => render_csv(&report.findings),
+        // The prose report is markdown already, so `text` and `markdown` are
+        // one surface rather than two that could drift apart.
+        OutputFormat::Text | OutputFormat::Markdown => report.markdown.clone(),
+    }
+}
+
+/// The hidden-coupling audit in the format the caller asked for. Same
+/// unindexed rule as [`render_dup`].
+fn render_coupling(report: &mdkb::core::coupling::CouplingReport, format: OutputFormat) -> String {
+    use mdkb::core::coupling::{render_csv, render_json};
+    if !report.indexed {
+        return report.markdown.clone();
+    }
+    match format {
+        OutputFormat::Json => render_json(&report.findings),
+        OutputFormat::Csv => render_csv(&report.findings),
+        OutputFormat::Text | OutputFormat::Markdown => report.markdown.clone(),
     }
 }
 

@@ -3,6 +3,7 @@
 //! Provides symbol extraction, relationship graphing, and semantic code search
 //! via tree-sitter parsing and SQLite indexing.
 
+pub mod duplication;
 pub mod indexing;
 pub mod parsing;
 pub mod relationship;

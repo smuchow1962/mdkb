@@ -1443,8 +1443,39 @@ pub async fn search_impl(
                 Ok((out, count))
             }
         }
+        Some("duplicates") => {
+            // The audit reads the code index off its own read-only connection,
+            // so it does not take the code-index guard the other code scopes
+            // need. It does take the memory connection, for the ignore-list.
+            let mut ctx_guard = handle.ctx.lock().await;
+            let report =
+                crate::core::run_guarded_read(&mut ctx_guard, "duplication audit", |ctx| {
+                    crate::core::dup::handle_dup(
+                        &handle.root,
+                        Some(&ctx.conn),
+                        &handle.config,
+                        &crate::core::dup::DupOverrides {
+                            // No `semantic` field on the MCP schema: it would be
+                            // charged on every turn for an audit run rarely.
+                            // `threshold` is the opt-in, and it is the only
+                            // knob the pass has.
+                            semantic: false,
+                            threshold: params.threshold,
+                            min_nodes: None,
+                            // An empty query sweeps the repository; `file` is what
+                            // narrows it, matching `mdkb dup --file`.
+                            file: params.file.clone(),
+                            since: params.since.clone(),
+                        },
+                    )
+                })
+                .ok_or_else(|| mcp_error("Database not initialized"))?
+                .map_err(|e| mcp_error(format!("Duplication audit failed: {e}")))?;
+
+            Ok((report.markdown.clone(), report.clusters()))
+        }
         Some(invalid) => Err(mcp_error(format!(
-            "Invalid scope: '{invalid}'. Valid: docs, memory, code, symbols."
+            "Invalid scope: '{invalid}'. Valid: docs, memory, code, symbols, duplicates."
         ))),
     }
 }
@@ -1468,9 +1499,9 @@ pub async fn cross_repo_search_impl(
     let scope = params.scope.as_deref();
     let limit = params.limit.min(100);
 
-    if matches!(scope, Some("code" | "symbols")) {
+    if matches!(scope, Some("code" | "symbols" | "duplicates")) {
         return Err(mcp_error(
-            "Cross-repo search is not supported for code/symbols scope. Specify a root.",
+            "Cross-repo search is not supported for code/symbols/duplicates scope. Specify a root.",
         ));
     }
 
@@ -2336,6 +2367,11 @@ pub async fn code_find_impl(
 }
 
 /// `symbol_at_position` — find the innermost symbol at a given file position.
+///
+/// `params.line` is 1-based, which is what every line number Claude has already
+/// seen is: search results render `start_line + 1`, and so does every editor.
+/// The stored column is a 0-based tree-sitter row, so the conversion happens
+/// here — passing the parameter straight through named the symbol one line down.
 pub async fn symbol_at_position_impl(
     handle: &RepoHandle,
     params: &SymbolAtPositionParams,
@@ -2344,9 +2380,10 @@ pub async fn symbol_at_position_impl(
     let Some(facade) = idx_guard.as_ref() else {
         return Err(mcp_error("code index not available — run `update` first"));
     };
+    let row = params.line.saturating_sub(1);
     let symbol = facade
         .db()
-        .symbol_at_position(&params.file, params.line, params.col)
+        .symbol_at_position(&params.file, row, params.col)
         .map_err(|e| mcp_error(format!("symbol_at_position: {e}")))?;
 
     match symbol {
@@ -7467,6 +7504,7 @@ mod tests {
             threshold: None,
             file: None,
             min_confidence: None,
+            since: None,
         }
     }
 

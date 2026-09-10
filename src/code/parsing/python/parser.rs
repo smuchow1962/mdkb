@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, node_range, unnamed_call_target,
+    EdgeWalk, LanguageParser, check_recursion_depth, node_range, unnamed_call_target,
 };
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -365,12 +365,9 @@ impl PythonParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut imports = Vec::new();
-        Self::find_imports_in_node(tree.root_node(), code, file_id, &mut imports, 0);
-        imports
+        self.parser.collect(code, |root, code, found| {
+            Self::find_imports_in_node(*root, code, file_id, found, 0);
+        })
     }
 
     fn find_imports_in_node(
@@ -542,15 +539,6 @@ impl PythonParser {
         for child in node.children(&mut node.walk()) {
             Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
-    }
-
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
     }
 
     // ── Implementations (inheritance) ───────────────────────────────────
@@ -816,8 +804,16 @@ fn extract_base_class_names<'a>(
 // ── LanguageParser trait impl ───────────────────────────────────────────
 
 impl LanguageParser for PythonParser {
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
+    }
+
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
+    }
+
+    fn tree(&mut self, code: &str) -> Option<tree_sitter::Tree> {
+        self.parser.parse_cached(code)
     }
 
     fn language(&self) -> Language {
@@ -832,30 +828,26 @@ impl LanguageParser for PythonParser {
         }
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
+        })
     }
 
-    fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut results = Vec::new();
-        Self::find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
-        results
+    fn implementations_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_implementations_in_node(root, code, 0, found);
+        })
     }
 
     fn find_uses<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         Vec::new()
     }
 
-    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut defines = Vec::new();
-        Self::find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
-        defines
+    fn defines_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_defines_in_node(root, code, 0, found);
+        })
     }
 
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
@@ -1043,7 +1035,7 @@ def f():
 "#;
 
         let calls: Vec<(&str, &str)> = parser
-            .find_calls_impl(code)
+            .find_calls(code)
             .into_iter()
             .map(|(caller, target, _)| (caller, target))
             .collect();
@@ -1084,7 +1076,7 @@ def get_data():
     return []
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
@@ -1119,7 +1111,7 @@ def main():
     print("hello")
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()

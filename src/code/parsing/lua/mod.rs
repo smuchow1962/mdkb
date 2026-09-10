@@ -4,7 +4,7 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::ParserContext;
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{EdgeWalk, LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -289,15 +289,6 @@ impl LuaParser {
         }
     }
 
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
-
     fn find_calls_in_node<'a>(
         node: &Node,
         code: &'a str,
@@ -375,6 +366,10 @@ impl LanguageParser for LuaParser {
         self.parse_symbols(code, file_id, counter)
     }
 
+    fn tree(&mut self, code: &str) -> Option<tree_sitter::Tree> {
+        self.parser.parse_cached(code)
+    }
+
     fn language(&self) -> Language {
         Language::Lua
     }
@@ -383,27 +378,22 @@ impl LanguageParser for LuaParser {
         extract_lua_doc(node, code)
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
     }
 
-    // Lua has no declaration syntax for any of the three relationships below.
-    // Inheritance and "classes" are a convention built out of tables and
-    // `setmetatable` at run time, and there are no type annotations to read.
-    // Guessing a hierarchy out of those idioms would record edges the language
-    // does not state, so calls stay the only relationship Lua can prove.
-
-    fn find_implementations<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
+        })
     }
 
-    fn find_uses<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
-    }
-
-    fn find_defines<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
-    }
+    // Every other relationship keeps the trait's `None`. Lua has no declaration
+    // syntax for any of them: inheritance and "classes" are a convention built
+    // out of tables and `setmetatable` at run time, and there are no type
+    // annotations to read. Guessing a hierarchy out of those idioms would
+    // record edges the language does not state, so calls stay the only
+    // relationship Lua can prove.
 
     fn find_imports(&mut self, _code: &str, _file_id: FileId) -> Vec<Import> {
         Vec::new() // Lua uses require() which is a function call, not an import statement

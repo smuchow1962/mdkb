@@ -287,6 +287,32 @@ fn hook_symbols_in_file_returns_a_bare_symbol_array() {
     assert!(greet["kind"].is_string(), "kind must be a string: {greet}");
 }
 
+/// `symbol_at_position` documents its `line` as 1-based; the column it is
+/// compared against holds 0-based tree-sitter rows. Feeding the parameter
+/// straight into the query named the symbol one line down — and the fixture is
+/// built so that mistake is visible: 1-based line 3 is the closing brace of
+/// `greet` (row 2), while row 3 is the first line of `farewell`.
+#[test]
+fn hook_symbol_at_position_reads_its_line_as_1_based() {
+    let d = DaemonProc::spawn();
+    let root = d.repo_with_code_index();
+
+    let at = |line: u32| -> serde_json::Value {
+        let resp = d.hook_call(
+            "symbol_at_position",
+            serde_json::json!({ "root": root, "file": "src/lib.rs", "line": line }),
+        );
+        let text = resp["result"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("result.text must be a string: {resp}"));
+        serde_json::from_str(text).expect("text is json")
+    };
+
+    assert_eq!(at(1)["name"], "greet", "line 1 is `pub fn greet`");
+    assert_eq!(at(3)["name"], "greet", "line 3 is greet's closing brace");
+    assert_eq!(at(4)["name"], "farewell", "line 4 is `pub fn farewell`");
+}
+
 #[test]
 fn hook_code_find_wraps_symbols_in_a_total_envelope() {
     let d = DaemonProc::spawn();

@@ -70,6 +70,7 @@ async fn memory_search_payload_exposes_confidence_and_counters() {
             threshold: None,
             file: None,
             min_confidence: None,
+            since: None,
         }))
         .await
         .expect("search scope=memory");
@@ -143,6 +144,7 @@ async fn memory_search_payload_marks_never_confirmed_entries() {
             threshold: None,
             file: None,
             min_confidence: None,
+            since: None,
         }))
         .await
         .expect("search scope=memory");
@@ -213,6 +215,7 @@ async fn search_memory(server: &McpServer, query: &str, min_confidence: Option<f
             threshold: None,
             file: None,
             min_confidence,
+            since: None,
         }))
         .await
         .expect("search scope=memory");

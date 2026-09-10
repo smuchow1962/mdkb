@@ -4,7 +4,7 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{EdgeWalk, LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -72,12 +72,9 @@ impl RustParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut imports = Vec::new();
-        Self::extract_imports_from_node(tree.root_node(), code, file_id, 0, &mut imports);
-        imports
+        self.parser.collect(code, |root, code, found| {
+            Self::extract_imports_from_node(*root, code, file_id, 0, found);
+        })
     }
 
     fn extract_imports_from_node(
@@ -776,15 +773,6 @@ impl RustParser {
 
     // ── Calls ───────────────────────────────────────────────────────────
 
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_calls_in_node(tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
-
     fn find_calls_in_node<'a>(
         node: Node,
         code: &'a str,
@@ -831,15 +819,6 @@ impl RustParser {
     /// A separate node kind from `call_expression`, so this walk and
     /// [`find_calls_in_node`](Self::find_calls_in_node) never see each other's
     /// nodes and a name cannot land in both.
-    fn find_macro_expansions_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut found = Vec::new();
-        Self::find_macros_in_node(tree.root_node(), code, Some("<module>"), 0, &mut found);
-        found
-    }
-
     fn find_macros_in_node<'a>(
         node: Node,
         code: &'a str,
@@ -877,15 +856,6 @@ impl RustParser {
 
     // ── Implementations ─────────────────────────────────────────────────
 
-    fn find_implementations_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut impls = Vec::new();
-        Self::find_implementations_in_node(tree.root_node(), code, 0, &mut impls);
-        impls
-    }
-
     fn find_implementations_in_node<'a>(
         node: Node,
         code: &'a str,
@@ -919,15 +889,6 @@ impl RustParser {
     }
 
     // ── Type uses ───────────────────────────────────────────────────────
-
-    fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut uses = Vec::new();
-        Self::find_uses_in_node(tree.root_node(), code, 0, &mut uses);
-        uses
-    }
 
     fn find_uses_in_node<'a>(
         node: Node,
@@ -1015,15 +976,6 @@ impl RustParser {
 
     // ── Defines ─────────────────────────────────────────────────────────
 
-    fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut defines = Vec::new();
-        Self::find_defines_in_node(tree.root_node(), code, 0, &mut defines);
-        defines
-    }
-
     fn find_defines_in_node<'a>(
         node: Node,
         code: &'a str,
@@ -1088,8 +1040,16 @@ impl RustParser {
 // ── LanguageParser trait ────────────────────────────────────────────────
 
 impl LanguageParser for RustParser {
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
+    }
+
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
+    }
+
+    fn tree(&mut self, code: &str) -> Option<tree_sitter::Tree> {
+        self.parser.parse_cached(code)
     }
 
     fn language(&self) -> Language {
@@ -1107,24 +1067,34 @@ impl LanguageParser for RustParser {
         }
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_calls_in_node(*root, code, Some("<module>"), 0, found);
+        })
     }
 
-    fn find_macro_expansions<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_macro_expansions_impl(code)
+    fn macro_expansions_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_macros_in_node(*root, code, Some("<module>"), 0, found);
+        })
     }
 
-    fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_implementations_impl(code)
+    fn implementations_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_implementations_in_node(*root, code, 0, found);
+        })
     }
 
-    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_uses_impl(code)
+    fn uses_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_uses_in_node(*root, code, 0, found);
+        })
     }
 
-    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_defines_impl(code)
+    fn defines_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_defines_in_node(*root, code, 0, found);
+        })
     }
 
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
@@ -1357,7 +1327,7 @@ fn main() {
 fn process() {}
         "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
@@ -1384,7 +1354,7 @@ struct Point { x: f64, y: f64 }
 impl Display for Point { fn fmt(&self) {} }
         "#;
 
-        let impls = parser.find_implementations_impl(code);
+        let impls = parser.find_implementations(code);
         assert!(impls
             .iter()
             .any(|(type_name, trait_name, _)| *type_name == "Point" && *trait_name == "Display"));
@@ -1425,7 +1395,7 @@ struct Container { items: Vec<Item>, name: String }
 fn process(input: Config) -> Result {}
         "#;
 
-        let uses = parser.find_uses_impl(code);
+        let uses = parser.find_uses(code);
         assert!(
             uses.iter()
                 .any(|(ctx, typ, _)| *ctx == "Container" && *typ == "Vec")
@@ -1450,7 +1420,7 @@ impl Server {
 }
         "#;
 
-        let defines = parser.find_defines_impl(code);
+        let defines = parser.find_defines(code);
         assert!(
             defines
                 .iter()
@@ -1581,7 +1551,7 @@ fn m() {
     #[test]
     fn a_bare_macro_invocation_is_an_expansion() {
         let mut parser = RustParser::new().unwrap();
-        let found = parser.find_macro_expansions_impl(MACRO_CODE);
+        let found = parser.find_macro_expansions(MACRO_CODE);
         assert!(
             found
                 .iter()
@@ -1593,7 +1563,7 @@ fn m() {
     #[test]
     fn a_scoped_macro_invocation_keeps_its_path() {
         let mut parser = RustParser::new().unwrap();
-        let found = parser.find_macro_expansions_impl(MACRO_CODE);
+        let found = parser.find_macro_expansions(MACRO_CODE);
         assert!(
             found
                 .iter()
@@ -1605,7 +1575,7 @@ fn m() {
     #[test]
     fn a_macro_invocation_in_a_let_initializer_is_an_expansion() {
         let mut parser = RustParser::new().unwrap();
-        let found = parser.find_macro_expansions_impl(MACRO_CODE);
+        let found = parser.find_macro_expansions(MACRO_CODE);
         assert!(
             found
                 .iter()
@@ -1619,7 +1589,7 @@ fn m() {
     #[test]
     fn a_macro_invocation_is_not_reported_as_a_call() {
         let mut parser = RustParser::new().unwrap();
-        let calls = parser.find_calls_impl(MACRO_CODE);
+        let calls = parser.find_calls(MACRO_CODE);
         assert!(
             !calls
                 .iter()
@@ -1635,7 +1605,7 @@ fn m() {
         let mut parser = RustParser::new().unwrap();
         let code = "fn write() {}\nfn m() { write(); write!(f, \"x\"); }\n";
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         assert!(
             calls
                 .iter()
@@ -1652,7 +1622,7 @@ fn m() {
         );
         assert!(
             parser
-                .find_macro_expansions_impl(code)
+                .find_macro_expansions(code)
                 .iter()
                 .any(|(caller, target, _)| *caller == "m" && *target == "write"),
             "the macro invocation must still be recorded as an expansion"
@@ -1668,7 +1638,7 @@ fn inside() { helper(); }
     #[test]
     fn a_call_in_a_static_initializer_is_attributed_to_the_module() {
         let mut parser = RustParser::new().unwrap();
-        let calls = parser.find_calls_impl(TOP_LEVEL_CODE);
+        let calls = parser.find_calls(TOP_LEVEL_CODE);
         assert!(
             calls
                 .iter()
@@ -1686,7 +1656,7 @@ fn inside() { helper(); }
     #[test]
     fn a_call_inside_a_function_keeps_the_function_as_caller() {
         let mut parser = RustParser::new().unwrap();
-        let calls = parser.find_calls_impl(TOP_LEVEL_CODE);
+        let calls = parser.find_calls(TOP_LEVEL_CODE);
         assert!(
             calls
                 .iter()

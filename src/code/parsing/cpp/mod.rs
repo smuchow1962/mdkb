@@ -5,7 +5,8 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, extract_c_family_doc, last_name_segment, node_range,
+    EdgeWalk, LanguageParser, check_recursion_depth, extract_c_family_doc, last_name_segment,
+    node_range,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -592,15 +593,6 @@ impl CppParser {
         }
     }
 
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
-
     fn find_calls_in_node<'a>(
         node: &Node,
         code: &'a str,
@@ -700,29 +692,26 @@ impl CppParser {
     }
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut imports = Vec::new();
-        for child in tree.root_node().children(&mut tree.root_node().walk()) {
-            if child.kind() == "preproc_include" {
-                if let Some(path_node) = child.child_by_field_name("path") {
-                    let raw = &code[path_node.byte_range()];
-                    let path = raw
-                        .trim_start_matches(['"', '<'])
-                        .trim_end_matches(['"', '>'])
-                        .to_string();
-                    imports.push(Import {
-                        path,
-                        alias: None,
-                        file_id,
-                        is_glob: false,
-                        is_type_only: false,
-                    });
+        self.parser.collect(code, |root, code, imports| {
+            for child in root.children(&mut root.walk()) {
+                if child.kind() == "preproc_include" {
+                    if let Some(path_node) = child.child_by_field_name("path") {
+                        let raw = &code[path_node.byte_range()];
+                        let path = raw
+                            .trim_start_matches(['"', '<'])
+                            .trim_end_matches(['"', '>'])
+                            .to_string();
+                        imports.push(Import {
+                            path,
+                            alias: None,
+                            file_id,
+                            is_glob: false,
+                            is_type_only: false,
+                        });
+                    }
                 }
             }
-        }
-        imports
+        })
     }
 }
 
@@ -755,8 +744,16 @@ fn extract_cpp_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str>
 }
 
 impl LanguageParser for CppParser {
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
+    }
+
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
+    }
+
+    fn tree(&mut self, code: &str) -> Option<tree_sitter::Tree> {
+        self.parser.parse_cached(code)
     }
 
     fn language(&self) -> Language {
@@ -767,17 +764,16 @@ impl LanguageParser for CppParser {
         extract_c_family_doc(node, code)
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
+        })
     }
 
-    fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut results = Vec::new();
-        Self::find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
-        results
+    fn implementations_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_implementations_in_node(root, code, 0, found);
+        })
     }
 
     fn find_uses<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
@@ -1242,7 +1238,7 @@ void run() {
 }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
 
         assert!(edges.contains(&("run", "T")), "new T(): {edges:?}");
@@ -1275,7 +1271,7 @@ void run() {
         let scopes = "N::".repeat(crate::code::parsing::parser::MAX_AST_DEPTH * 40);
         let code = format!("void run() {{ new {scopes}Leaf(); }}");
 
-        let calls = parser.find_calls_impl(&code);
+        let calls = parser.find_calls(&code);
         let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
         assert!(
             edges.contains(&("run", "Leaf")),
@@ -1298,7 +1294,7 @@ void run() {
 }
 "#;
 
-        let calls = parser.find_calls_impl(code);
+        let calls = parser.find_calls(code);
         let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
 
         assert!(

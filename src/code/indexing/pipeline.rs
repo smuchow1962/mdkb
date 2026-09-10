@@ -356,7 +356,10 @@ fn build_parser<P: LanguageParser + 'static>(
 }
 
 /// Create a language parser for the given language.
-fn create_parser(language: Language) -> Option<Box<dyn LanguageParser>> {
+///
+/// `pub(crate)` for the duplication pass, which re-derives a symbol body from
+/// the AST and needs the same parser the pipeline built.
+pub(crate) fn create_parser(language: Language) -> Option<Box<dyn LanguageParser>> {
     match language {
         Language::Rust => build_parser(language, RustParser::new()),
         Language::Go => build_parser(language, GoParser::new()),

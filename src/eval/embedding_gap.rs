@@ -97,6 +97,66 @@ fn mean(sum: f64, n: usize) -> f64 {
     if n == 0 { 0.0 } else { sum / n as f64 }
 }
 
+/// The case set the duplication model is chosen on.
+///
+/// Each case isolates one axis of similarity and holds the others still, which
+/// is what makes a per-case failure readable. The four `low` cases are the
+/// adversarial half: code that looks alike and is not the same logic. A model
+/// that scores those high is worse than useless here, because the tool's job is
+/// to tell them apart.
+pub fn duplication_cases() -> Vec<GapCase> {
+    vec![
+        // Same logic, every identifier renamed. The axis the benchmark reports
+        // most models are weakest on.
+        GapCase::high(
+            "fn total(items: &[Item]) -> u64 { let mut sum = 0; for it in items { sum += it.price; } sum }",
+            "fn aggregate(rows: &[Row]) -> u64 { let mut acc = 0; for r in rows { acc += r.cost; } acc }",
+        ),
+        // Same problem, different algorithm, almost no shared vocabulary.
+        GapCase::high(
+            "fn contains(xs: &[i32], k: i32) -> bool { xs.iter().any(|x| *x == k) }",
+            "fn contains(xs: &[i32], k: i32) -> bool { let (mut lo, mut hi) = (0, xs.len()); while lo < hi { let mid = (lo + hi) / 2; if xs[mid] == k { return true } else if xs[mid] < k { lo = mid + 1 } else { hi = mid } } false }",
+        ),
+        // Same logic, one written as a loop and one as an iterator chain.
+        GapCase::high(
+            "fn evens(v: &[i32]) -> Vec<i32> { let mut out = Vec::new(); for x in v { if x % 2 == 0 { out.push(*x); } } out }",
+            "fn evens(v: &[i32]) -> Vec<i32> { v.iter().copied().filter(|x| x % 2 == 0).collect() }",
+        ),
+        // Code paired with the English description of what it does.
+        GapCase::high(
+            "fn retry<T>(f: impl Fn() -> Option<T>, n: usize) -> Option<T> { for _ in 0..n { if let Some(v) = f() { return Some(v) } } None }",
+            "Call the closure up to n times and return the first successful result, or nothing if every attempt failed.",
+        ),
+        // Same logic across a rename AND a reordering of independent statements.
+        GapCase::high(
+            "fn init(cfg: &Cfg) -> App { let db = open(cfg.db); let log = logger(cfg.level); App { db, log } }",
+            "fn build(conf: &Conf) -> Service { let writer = logger(conf.verbosity); let store = open(conf.store); Service { store, log: writer } }",
+        ),
+        // ---- adversarial: looks alike, is not the same logic ----
+        // Identical framework boilerplate, unrelated bodies. The benchmark's
+        // headline false-positive source.
+        GapCase::low(
+            "#[tokio::main] async fn main() -> anyhow::Result<()> { let app = Router::new(); serve(app).await?; Ok(()) }",
+            "#[tokio::main] async fn main() -> anyhow::Result<()> { let cfg = load()?; migrate(&cfg).await?; Ok(()) }",
+        ),
+        // Same identifiers, opposite behaviour.
+        GapCase::low(
+            "fn apply(state: &mut State, delta: i64) { state.value += delta; }",
+            "fn apply(state: &mut State, delta: i64) { state.value = delta; }",
+        ),
+        // Same signature and shape, different domain entirely.
+        GapCase::low(
+            "fn parse(input: &str) -> Result<Date> { Date::from_iso(input) }",
+            "fn parse(input: &str) -> Result<Color> { Color::from_hex(input) }",
+        ),
+        // Same control-flow skeleton, unrelated purpose.
+        GapCase::low(
+            "fn sum_file(p: &Path) -> u64 { let mut t = 0; for line in read(p) { t += line.len() as u64; } t }",
+            "fn hash_dir(p: &Path) -> u64 { let mut h = 0; for e in walk(p) { h ^= fnv(e.name()); } h }",
+        ),
+    ]
+}
+
 /// Cosine similarity, with a zero-magnitude vector scored as 0.0.
 ///
 /// Vectors of differing length score 0.0 rather than panicking: an `embed` that
@@ -115,7 +175,11 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
         norm_b += b[i] * b[i];
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < f32::EPSILON { 0.0 } else { dot / denom }
+    if denom < f32::EPSILON {
+        0.0
+    } else {
+        dot / denom
+    }
 }
 
 #[cfg(test)]
@@ -145,9 +209,9 @@ mod tests {
 
         assert_eq!(report.n, 0);
         assert!(report.gap.is_finite(), "gap must never be NaN");
-        assert_eq!(report.gap, 0.0);
-        assert_eq!(report.high_mean, 0.0);
-        assert_eq!(report.low_mean, 0.0);
+        assert!(report.gap.abs() < f64::EPSILON);
+        assert!(report.high_mean.abs() < f64::EPSILON);
+        assert!(report.low_mean.abs() < f64::EPSILON);
     }
 
     #[test]
@@ -155,8 +219,11 @@ mod tests {
         // No low pairs at all: the low mean has no population to average.
         let report = run_gap(&[GapCase::high("alpha beta", "alpha beta")], &bag_of_words);
 
-        assert!(report.gap.is_finite(), "an empty side must not poison the gap");
-        assert_eq!(report.low_mean, 0.0);
+        assert!(
+            report.gap.is_finite(),
+            "an empty side must not poison the gap"
+        );
+        assert!(report.low_mean.abs() < f64::EPSILON);
     }
 
     #[test]
@@ -194,10 +261,7 @@ mod tests {
         // The failure the headline number exists to catch: high absolute scores
         // that carry no information, because nothing separates the populations.
         let flat = |_: &str| vec![1.0f32; 8];
-        let cases = vec![
-            GapCase::high("a", "b"),
-            GapCase::low("c", "d"),
-        ];
+        let cases = vec![GapCase::high("a", "b"), GapCase::low("c", "d")];
 
         let report = run_gap(&cases, &flat);
 
@@ -212,6 +276,98 @@ mod tests {
 
         let report = run_gap(&[GapCase::high("ab", "abcd")], &ragged);
 
-        assert_eq!(report.high_mean, 0.0);
+        assert!(report.high_mean.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn the_case_set_has_both_populations() {
+        let cases = duplication_cases();
+        assert!(cases.iter().any(|c| c.high), "no high cases");
+        assert!(cases.iter().any(|c| !c.high), "no low cases");
+    }
+
+    /// Measure the real models. `#[ignore]`d on purpose: it downloads ONNX
+    /// weights (~500 MB for Jina) and takes minutes, which CI must never do.
+    ///
+    /// Run by hand:
+    ///   cargo test --lib eval::embedding_gap -- --ignored --nocapture
+    #[test]
+    #[ignore = "downloads ONNX weights; run by hand to choose the duplication model"]
+    fn gap_models() {
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+
+        let cache = std::env::var("FASTEMBED_CACHE_DIR")
+            .unwrap_or_else(|_| format!("{}/.cache/fastembed", std::env::var("HOME").unwrap()));
+        let cases = duplication_cases();
+
+        // (label, model, truncate-to-dims, max input tokens). The truncated
+        // variant answers whether this model tolerates the benchmark's 256-dim
+        // reduction, which is only established for MRL-trained models and NOT
+        // for v2-base-code. `max_tokens` is the *input* cut, a different axis:
+        // fastembed defaults it to 512, and halving it is only free if the gap
+        // does not move.
+        //
+        // Read the two Jina-256 rows knowing what they can show. fastembed pads
+        // to the longest text in the batch, not to `max_length`, so lowering the
+        // cut changes a vector only for a text longer than the cut. Every text
+        // in `duplication_cases` is well under 256 tokens, so the two rows are
+        // expected to agree exactly — that agreement is evidence the harness is
+        // wired to the right knob, NOT evidence that truncating real bodies is
+        // free. Bodies over 256 tokens are what that question needs, and this
+        // case set has none.
+        let variants: Vec<(&str, EmbeddingModel, Option<usize>, usize)> = vec![
+            ("AllMiniLML6V2-384", EmbeddingModel::AllMiniLML6V2, None, 512),
+            (
+                "JinaEmbeddingsV2BaseCode-768",
+                EmbeddingModel::JinaEmbeddingsV2BaseCode,
+                None,
+                512,
+            ),
+            (
+                "JinaEmbeddingsV2BaseCode-256 @512tok",
+                EmbeddingModel::JinaEmbeddingsV2BaseCode,
+                Some(256),
+                512,
+            ),
+            (
+                "JinaEmbeddingsV2BaseCode-256 @256tok",
+                EmbeddingModel::JinaEmbeddingsV2BaseCode,
+                Some(256),
+                256,
+            ),
+        ];
+
+        println!(
+            "\n{:<40} {:>8} {:>10} {:>10}",
+            "model", "gap", "high", "low"
+        );
+        for (label, model, truncate, max_tokens) in variants {
+            let embedder = TextEmbedding::try_new(
+                InitOptions::new(model)
+                    .with_cache_dir(cache.clone().into())
+                    .with_max_length(max_tokens)
+                    .with_show_download_progress(true),
+            )
+            .expect("model init");
+
+            let embed = |text: &str| {
+                let mut v = embedder
+                    .embed(vec![text], Some(1))
+                    .expect("embed")
+                    .pop()
+                    .expect("one vector");
+                if let Some(d) = truncate {
+                    v.truncate(d);
+                }
+                v
+            };
+
+            let r = run_gap(&cases, &embed);
+            println!(
+                "{label:<40} {:>8.4} {:>10.4} {:>10.4}",
+                r.gap, r.high_mean, r.low_mean
+            );
+        }
+        println!();
     }
 }

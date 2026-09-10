@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, is_plain_path, node_range,
+    EdgeWalk, LanguageParser, check_recursion_depth, is_plain_path, node_range,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -286,31 +286,6 @@ impl GdscriptParser {
         }
     }
 
-    fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
-
-    fn find_extends_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let root = tree.root_node();
-        // A script is itself a class: its `extends` sits at the top level and the
-        // derived side is whatever names the file. `class_name` is optional and
-        // most scripts omit it, so fall back to the per-file `<module>` symbol
-        // rather than dropping the base class of the whole project.
-        let script_name = extract_gdscript_class_name_ref(root, code).unwrap_or("<module>");
-
-        let mut extends = Vec::new();
-        Self::find_extends_in_node(root, code, script_name, 0, &mut extends);
-        extends
-    }
-
     fn find_extends_in_node<'a>(
         node: Node,
         code: &'a str,
@@ -342,17 +317,6 @@ impl GdscriptParser {
         for child in node.children(&mut node.walk()) {
             Self::find_extends_in_node(child, code, derived, depth + 1, extends);
         }
-    }
-
-    fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let root = tree.root_node();
-        let script_name = extract_gdscript_class_name_ref(root, code).unwrap_or("<module>");
-        let mut uses = Vec::new();
-        Self::find_uses_in_node(root, code, script_name, 0, &mut uses);
-        uses
     }
 
     fn find_uses_in_node<'a>(
@@ -389,17 +353,6 @@ impl GdscriptParser {
         for child in node.children(&mut node.walk()) {
             Self::find_uses_in_node(child, code, context, depth + 1, uses);
         }
-    }
-
-    fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let root = tree.root_node();
-        let script_name = extract_gdscript_class_name_ref(root, code).unwrap_or("<module>");
-        let mut defines = Vec::new();
-        Self::find_defines_in_node(root, code, script_name, 0, &mut defines);
-        defines
     }
 
     fn find_defines_in_node<'a>(
@@ -554,8 +507,16 @@ fn extract_gdscript_doc(node: &Node, code: &str) -> Option<String> {
 }
 
 impl LanguageParser for GdscriptParser {
+    fn parser(&mut self) -> &mut CachingParser {
+        &mut self.parser
+    }
+
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
+    }
+
+    fn tree(&mut self, code: &str) -> Option<tree_sitter::Tree> {
+        self.parser.parse_cached(code)
     }
 
     fn language(&self) -> Language {
@@ -566,24 +527,40 @@ impl LanguageParser for GdscriptParser {
         extract_gdscript_doc(node, code)
     }
 
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_calls_impl(code)
+    fn calls_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, found| {
+            Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
+        })
     }
 
     fn find_implementations<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         Vec::new() // GDScript has no interfaces: a script only ever `extends`.
     }
 
-    fn find_extends<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_extends_impl(code)
+    fn extends_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, extends| {
+            // A script is itself a class: its `extends` sits at the top level and
+            // the derived side is whatever names the file. `class_name` is
+            // optional and most scripts omit it, so fall back to the per-file
+            // `<module>` symbol rather than dropping the base class of the whole
+            // project.
+            let script_name = extract_gdscript_class_name_ref(*root, code).unwrap_or("<module>");
+            Self::find_extends_in_node(*root, code, script_name, 0, extends);
+        })
     }
 
-    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_uses_impl(code)
+    fn uses_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, uses| {
+            let script_name = extract_gdscript_class_name_ref(*root, code).unwrap_or("<module>");
+            Self::find_uses_in_node(*root, code, script_name, 0, uses);
+        })
     }
 
-    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_defines_impl(code)
+    fn defines_walk(&self) -> Option<EdgeWalk> {
+        Some(|root, code, defines| {
+            let script_name = extract_gdscript_class_name_ref(*root, code).unwrap_or("<module>");
+            Self::find_defines_in_node(*root, code, script_name, 0, defines);
+        })
     }
 
     fn find_imports(&mut self, _code: &str, _file_id: FileId) -> Vec<Import> {
@@ -682,7 +659,7 @@ func helper():
     fn targets_of(code: &str, caller: &str) -> Vec<String> {
         let mut parser = GdscriptParser::new().unwrap();
         parser
-            .find_calls_impl(code)
+            .find_calls(code)
             .iter()
             .filter(|(c, _, _)| *c == caller)
             .map(|(_, target, _)| (*target).to_string())

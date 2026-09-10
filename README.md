@@ -207,7 +207,7 @@ full in-process server, sharing one daemon for file watching and indexing.
 
 | Tool | Description |
 |------|-------------|
-| `search` | Hybrid search across docs+memory (default), or scoped to `docs`, `memory`, `code`, `symbols`. `scope="memory"` accepts `min_confidence` to filter decayed entries |
+| `search` | Hybrid search across docs+memory (default), or scoped to `docs`, `memory`, `code`, `symbols`, `duplicates`. `scope="memory"` accepts `min_confidence` to filter decayed entries; `scope="duplicates"` accepts `since` for review mode |
 | `get` | Retrieve by ID, path, memory slug, glob pattern, or comma-separated list |
 | `code_graph` | Call graph queries: `calls`, `callers`, or `impact` (transitive) |
 | `graph` | Knowledge-graph queries over frontmatter + wikilink edges: `links` (outgoing), `backlinks` (incoming), `neighbors` (adjacent, each annotated with the `via` relation), or `path` (shortest path to `to`). Edge endpoints render as document paths, never numeric ids |
@@ -229,6 +229,7 @@ full in-process server, sharing one daemon for file watching and indexing.
 | `memory` | Full-text over memory entries |
 | `symbols` | Exact symbol lookup by name, filterable by `kind` and `file` |
 | `code` | Semantic code search across indexed symbols |
+| `duplicates` | Clusters of near-identical bodies. `since="<ref>"` narrows the report to clusters your change touched |
 
 ### Memory
 
@@ -369,6 +370,38 @@ mdkb code calls main
 mdkb code callers handle_get
 mdkb code impact init --depth 5
 ```
+
+Two audits read the same index. `dup` reports what the repository says twice;
+`coupling` reports files that change together in git history with no edge
+between them in the code graph.
+
+```bash
+mdkb dup                          # sweep the repository
+mdkb dup --file src/code/parsing  # scope the candidates
+mdkb dup --since HEAD             # review mode: only clusters your change touched
+mdkb dup --semantic               # add the embedding pass (minutes, not seconds)
+mdkb coupling                     # 5+ shared commits over the last year
+mdkb coupling --since 6.months --min-cochanges 3
+mdkb dup --format json               # findings with their distance, for bucketing
+```
+
+`dup` runs two passes. The structural one compares fingerprints, needs no
+model, and finishes in seconds. The semantic one embeds every body and is
+**off by default**: measured on this repository it took 817 s of an 818 s run
+to add 69 of 767 clusters. Turn it on for a single run with `--semantic` or
+any `--threshold` override, or standing with `semantic = true` under
+`[code.duplication]` in `.mdkb/config.toml`. Over MCP, passing `threshold` to
+`search(scope="duplicates")` is the opt-in. A model that will not load
+degrades the run to the structural pass rather than failing it.
+
+Read `dup` knowing where its signal is: the report says so itself. After the
+headline, a bucket table breaks the clusters down by structural distance
+(`0`, `1-3`, `4`, `5`, `at cut`) and the semantic pass (`cosine`) — the
+clusters at 0–3 bits are the trustworthy core, the ones at the cut are mostly
+false positives. Clusters are ranked bucket-first, so a trustworthy finding
+outranks a noisy one regardless of how far it spreads. `--format json` carries
+the same `buckets` summary alongside `evidence.hamming` per cluster. See
+`CHANGES.md` for the measured distribution.
 
 ### Knowledge Graph
 

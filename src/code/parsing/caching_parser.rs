@@ -5,7 +5,7 @@
 //! is reused instead of re-parsing. Tree-sitter parsing is O(n) in source
 //! size; `Tree::clone()` (ts_tree_copy) is O(tree nodes) which is cheaper.
 
-use tree_sitter::{Parser, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 /// Wraps a [`tree_sitter::Parser`] with single-entry tree caching.
 ///
@@ -64,14 +64,101 @@ impl CachingParser {
         self.cached = Some((hash, tree.clone()));
         Some(tree)
     }
+
+    /// Parse `code`, walk it, and return what the walk collected.
+    ///
+    /// Every language parser needs the same four steps around its own walk:
+    /// parse, give up quietly on source tree-sitter cannot read, allocate the
+    /// output, hand the root over. `mdkb dup` found that shape written out 42
+    /// times across 13 parsers, so it lives here once instead.
+    ///
+    /// Giving up returns an empty `Vec` rather than an error: a file that does
+    /// not parse contributes nothing, and one bad file must not fail the index.
+    pub fn collect<'a, T>(
+        &mut self,
+        code: &'a str,
+        walk: impl FnOnce(&Node<'_>, &'a str, &mut Vec<T>),
+    ) -> Vec<T> {
+        let Some(tree) = self.parse_cached(code) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        walk(&tree.root_node(), code, &mut found);
+        found
+    }
 }
 
 /// FNV-1a hash for cache keying. Fast, no allocation, good distribution.
-fn fnv1a_hash(bytes: &[u8]) -> u64 {
+///
+/// `pub(crate)` so the duplication cache keys a body on the same hash the tree
+/// cache keys a file on — one hash function, not two that could disagree.
+pub(crate) fn fnv1a_hash(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rust_parser() -> CachingParser {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("rust grammar");
+        CachingParser::new(parser)
+    }
+
+    #[test]
+    fn collect_hands_the_root_to_the_walk_and_returns_what_it_found() {
+        let mut parser = rust_parser();
+
+        let kinds: Vec<&str> = parser.collect("fn a() {}\n", |root, _code, out| {
+            out.push(root.kind());
+            let mut cursor = root.walk();
+            for child in root.children(&mut cursor) {
+                out.push(child.kind());
+            }
+        });
+
+        assert_eq!(kinds, vec!["source_file", "function_item"]);
+    }
+
+    #[test]
+    fn collect_borrows_the_source_for_what_it_returns() {
+        // The whole point of the `'a` on the code: a walk returns slices of the
+        // source, which outlive the tree they were found through.
+        let mut parser = rust_parser();
+        let code = String::from("fn named() {}\n");
+
+        let names: Vec<&str> = parser.collect(&code, |root, code, out| {
+            let mut cursor = root.walk();
+            for child in root.children(&mut cursor) {
+                out.push(&code[child.byte_range()]);
+            }
+        });
+
+        assert_eq!(names, vec!["fn named() {}"]);
+    }
+
+    #[test]
+    fn source_the_grammar_cannot_read_collects_nothing_rather_than_failing() {
+        // One unparseable file must contribute nothing, not fail the index.
+        // Every one of the 42 call sites relied on this, so it is pinned once.
+        let mut parser = CachingParser::new(Parser::new());
+
+        let out: Vec<&str> = parser.collect("fn a() {}\n", |root, _code, out| {
+            out.push(root.kind());
+        });
+
+        assert!(
+            out.is_empty(),
+            "a parser with no grammar set cannot parse, and must say so by \
+             finding nothing: {out:?}"
+        );
+    }
 }

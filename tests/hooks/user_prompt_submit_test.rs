@@ -21,15 +21,32 @@ fn run_user_prompt_submit_in(dir: &Path, stdin_json: &str) -> (i32, String) {
     // exercise recall mechanics with plain (un-prefixed) prompts, so turn the gate
     // off in the project config when it exists. The gate itself is covered by the
     // unit test `require_sigil_gates_injection_to_star_prefixed_prompts`.
+    //
+    // Write the key rather than rewriting a line `init` happened to leave in
+    // the file: `init` writes its defaults commented out, so there is no
+    // `... = true` to patch, and a rewrite that matches nothing silently
+    // leaves the gate on and every test here reading an empty stdout.
+    const KEY: &str = "user_prompt_submit_require_sigil = false";
     let cfg = dir.join(".mdkb/config.toml");
-    if let Ok(body) = fs::read_to_string(&cfg) {
-        let patched = body.replace(
-            "user_prompt_submit_require_sigil = true",
-            "user_prompt_submit_require_sigil = false",
-        );
-        if patched != body {
-            let _ = fs::write(&cfg, patched);
+    let body = fs::read_to_string(&cfg).unwrap_or_default();
+    if !body.contains(KEY) {
+        // A `[hooks]` table already put there by the caller has to receive the
+        // key; declaring the table twice is not valid TOML. Match the line, not
+        // the substring: the commented defaults contain `# [hooks]` too.
+        let mut patched: Vec<String> = Vec::new();
+        let mut placed = false;
+        for line in body.lines() {
+            patched.push(line.to_string());
+            if line.trim_end() == "[hooks]" {
+                patched.push(KEY.to_string());
+                placed = true;
+            }
         }
+        if !placed {
+            patched.push(String::from("\n[hooks]"));
+            patched.push(KEY.to_string());
+        }
+        let _ = fs::write(&cfg, patched.join("\n") + "\n");
     }
 
     let mut child = mdkb_bin()
