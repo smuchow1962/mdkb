@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Recovery on Windows now sees a database that is still open.** Before mdkb
+  moves a damaged database aside it probes for a live connection, and leaves the
+  files alone when one holds the lock. Unix reports the held lock as
+  `WouldBlock`; Windows reports `ERROR_LOCK_VIOLATION` (os error 33), which Rust
+  leaves uncategorised, so the probe read "still in use" as an I/O error and
+  aborted recovery. `is_lock_contention` now treats error 33 on Windows the same
+  as `WouldBlock`. Unix behaviour is unchanged, and every other error is still
+  reported as one. Five lock-contention tests go green on Windows.
+
 ## 3.8.0 (2026-08-29)
 
 Seventy-two commits, most of them in the code index. 3.7.18 was prepared but

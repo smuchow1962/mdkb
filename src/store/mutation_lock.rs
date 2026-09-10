@@ -115,12 +115,42 @@ pub fn try_acquire_live_exclusive(db_path: &Path) -> Result<Option<MutationGuard
     let file = open_lock_file(&path)?;
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(Some(MutationGuard { file })),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) if is_lock_contention(&e) => Ok(None),
         Err(e) => Err(Error::from(ErrorKind::Io {
             path,
             operation: format!("probe live-connection lock: {e}"),
         })),
     }
+}
+
+/// Windows error 33, `ERROR_LOCK_VIOLATION`.
+///
+/// Named rather than inlined: the number is the whole reason the branch exists,
+/// and a bare `33` in a match arm is unreadable.
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Does this error mean "somebody else holds the lock" rather than "the probe
+/// failed"?
+///
+/// The distinction decides whether a corrupt database is quarantined or left
+/// alone, so getting it wrong is not cosmetic: contention read as failure turns
+/// a normal, expected outcome into an I/O error and aborts the heal path.
+///
+/// Unix reports contention as `EWOULDBLOCK`, which Rust categorises as
+/// `WouldBlock`. Windows reports `ERROR_LOCK_VIOLATION` from `LockFileEx` with
+/// `LOCKFILE_FAIL_IMMEDIATELY`, and Rust has no category for it — it arrives
+/// uncategorised, so it must be recognised by its raw code.
+fn is_lock_contention(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        return e.raw_os_error() == Some(ERROR_LOCK_VIOLATION);
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 /// Acquire the blocking, exclusive mutation lock for an index.
