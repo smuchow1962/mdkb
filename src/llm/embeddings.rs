@@ -178,6 +178,14 @@ mod tests {
     }
 
     #[test]
+    fn test_cosine_similarity_zero_vector() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![0.0, 0.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim.abs() < 0.001);
+    }
+
+    #[test]
     fn cap_rayon_global_pool_limits_the_batch_loop_to_one_worker() {
         // The nested-pool blowup needs a real ONNX session to reproduce, so
         // assert the lever itself: once capped, fastembed's `par_chunks` batch

@@ -7,7 +7,7 @@
 //! reconciliation, and they were reaching through `cli::handlers` to get at it.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::core::Context;
 use crate::error::Result;
@@ -74,6 +74,64 @@ fn save_entry_to_disk(ctx: &Context, entry: &MemoryEntry) -> Result<String> {
 pub(crate) fn project_entry(ctx: &Context, entry: &MemoryEntry, now: i64) -> Result<()> {
     let hash = save_entry_to_disk(ctx, entry)?;
     memory::set_projection(&ctx.conn, &entry.id, now, &hash)
+}
+
+/// Project an entry the store just wrote and refresh the warmup index.
+///
+/// Both write doors call this — `mdkb memory add` and the MCP `memory_write` —
+/// so whether an entry has a file cannot depend on which one it came through.
+/// Until it did, an MCP write landed in the index with no `.md`, and the
+/// git-tracked projection silently diverged until someone ran a sync.
+///
+/// Best-effort on purpose: the row is already committed, and a failed file
+/// write must not unwind it. The next `mdkb memory sync` backfills.
+pub(crate) fn project_after_write(ctx: &Context, id: &str, now: i64) {
+    match memory::get_entry_without_tracking(&ctx.conn, id) {
+        Ok(Some(entry)) => {
+            if let Err(e) = project_entry(ctx, &entry, now) {
+                tracing::warn!("Failed to save entry {id} to disk: {e}");
+            }
+        }
+        Ok(None) => tracing::warn!("Entry {id} vanished before it could be projected"),
+        Err(e) => tracing::warn!("Failed to read entry {id} for projection: {e}"),
+    }
+    if let Err(e) = generate_memory_index(ctx) {
+        tracing::warn!("Failed to regenerate memory index: {e}");
+    }
+}
+
+/// Retire the projection of an entry the store just deleted and refresh the
+/// warmup index. The file moves to `memory/archive/`: left in `entries/`, the
+/// next reconciliation would find a file with no row and import it, and the
+/// deleted entry would come back. Best-effort, like [`project_after_write`].
+pub(crate) fn archive_after_delete(ctx: &Context, id: &str) {
+    if let Err(e) = archive_entry_on_disk(ctx, id) {
+        tracing::warn!("Failed to archive entry {id} on disk: {e}");
+    }
+    if let Err(e) = generate_memory_index(ctx) {
+        tracing::warn!("Failed to regenerate memory index: {e}");
+    }
+}
+
+/// True when every changed file under `entries/` holds exactly the bytes the
+/// store recorded when it projected that entry — the change is the store's own
+/// write coming back through the watcher, and reconciling it would find
+/// nothing to do. An edit, a file for an unknown id, or a deletion returns
+/// false and needs the pass. Reads are not tracked: this is not a use of the
+/// memory.
+pub fn changes_are_recorded_projections(ctx: &Context, paths: &[PathBuf]) -> bool {
+    !paths.is_empty() && paths.iter().all(|path| {
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        matches!(
+            memory::projected_hash(&ctx.conn, id),
+            Ok(Some(recorded)) if recorded == crate::code::indexing::hasher::content_hash(&content)
+        )
+    })
 }
 
 /// Outcome of [`sync_memory_files`].
@@ -734,4 +792,83 @@ pub(crate) fn archive_entry_on_disk(ctx: &Context, id: &str) -> Result<()> {
     // `memory_file::archive_projection` for why a second copy was a bug.
     crate::store::memory_file::archive_projection(&ctx.memory_dir(), id)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::memory::{EntryType, SourceType, add_entry};
+
+    fn entry(id: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            title: id.to_string(),
+            content: "# body".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: 1,
+            updated_at: 1,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        }
+    }
+
+    /// Every write now projects its own file, and the watcher sees that file
+    /// land. A pass over the whole projection for a change the store itself
+    /// just recorded is wasted work on every write; the recorded hash is what
+    /// tells the flush the change is its own. Anything else — an edit, an
+    /// unknown file, a deletion — still needs the pass.
+    #[test]
+    fn a_change_matching_the_recorded_projection_needs_no_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Context::init(tmp.path()).unwrap();
+        let entries = ctx.memory_dir().join("entries");
+
+        let e = entry("own-write");
+        add_entry(&ctx.conn, &e).unwrap();
+        project_entry(&ctx, &e, 1).unwrap();
+        let own = entries.join("own-write.md");
+        assert!(
+            changes_are_recorded_projections(&ctx, std::slice::from_ref(&own)),
+            "the file the store just projected is its own change"
+        );
+
+        // A human edit: same id, bytes no longer match the recorded hash.
+        std::fs::write(&own, "edited by hand").unwrap();
+        assert!(!changes_are_recorded_projections(
+            &ctx,
+            std::slice::from_ref(&own)
+        ));
+
+        // A file for an entry the store has never seen.
+        let foreign = entries.join("from-a-colleague.md");
+        std::fs::write(&foreign, "---\nid: from-a-colleague\n---\nx").unwrap();
+        assert!(!changes_are_recorded_projections(
+            &ctx,
+            std::slice::from_ref(&foreign)
+        ));
+
+        // A deletion.
+        let gone = entries.join("deleted.md");
+        assert!(!changes_are_recorded_projections(
+            &ctx,
+            std::slice::from_ref(&gone)
+        ));
+
+        // A batch is its own only when every member is.
+        project_entry(&ctx, &e, 2).unwrap();
+        assert!(!changes_are_recorded_projections(
+            &ctx,
+            &[own.clone(), foreign]
+        ));
+        assert!(changes_are_recorded_projections(&ctx, &[own]));
+    }
 }

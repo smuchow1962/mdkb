@@ -30,6 +30,7 @@ use crate::core::indexing::{UpdateOutcome, UpdateRequest, update_documents};
 use crate::core::search::{handle_hybrid_search, handle_mget};
 use crate::daemon::registry::RepoHandle;
 use crate::domain::{SearchResult, UpdateResult};
+use crate::error::ErrorKind;
 use crate::metrics::{
     UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
 };
@@ -39,8 +40,8 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::mcp_error;
 use super::server::{
-    apply_line_range, apply_min_confidence, format_memory_search_results, format_search_results,
-    format_symbol, format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago,
+    apply_min_confidence, format_memory_search_results, format_search_results, format_symbol,
+    format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago,
     resolve_document, truncate_text,
 };
 
@@ -626,8 +627,14 @@ pub async fn memory_delete_impl(
 
     let mut ctx_guard = handle.ctx.lock().await;
     let deleted = run_handle_memory_mutation(&mut ctx_guard, "memory delete", |ctx| {
-        memory::delete_entry(&ctx.conn, id)
-            .map_err(|e| mcp_store_error("Failed to delete memory entry", e))
+        let deleted = memory::delete_entry(&ctx.conn, id)
+            .map_err(|e| mcp_store_error("Failed to delete memory entry", e))?;
+        if deleted {
+            // Same door as `mdkb memory rm`: a file left in `entries/` would be
+            // re-imported by the next reconciliation.
+            crate::core::memory_sync::archive_after_delete(ctx, id);
+        }
+        Ok(deleted)
     })?;
 
     Ok(if deleted {
@@ -1048,8 +1055,13 @@ pub async fn memory_write_impl(
         let result = write_single_memory(&ctx.conn, input);
         close_context_on_reported_corruption(&mut ctx_guard, "memory write dry run", result)
     } else {
+        let id = input.id;
         run_handle_memory_mutation(&mut ctx_guard, "memory write", |ctx| {
-            write_single_memory(&ctx.conn, input)
+            let output = write_single_memory(&ctx.conn, input)?;
+            // Same door as `mdkb memory add`: the file exists the moment the
+            // row does, instead of at the next sync.
+            crate::core::memory_sync::project_after_write(ctx, id, chrono::Utc::now().timestamp());
+            Ok(output)
         })
     }
 }
@@ -1140,6 +1152,13 @@ pub async fn memory_write_batch_impl(
                     dry_run,
                 },
             )?;
+            if !dry_run {
+                crate::core::memory_sync::project_after_write(
+                    ctx,
+                    &entry.id,
+                    chrono::Utc::now().timestamp(),
+                );
+            }
             results.push(result);
         }
 
@@ -1623,23 +1642,23 @@ pub async fn cross_repo_search_impl(
 }
 
 /// Render a single document's content with optional line range and evolution
-/// metadata. Mirrors `McpServer::get_document_content`. Truncation uses
-/// `handle.config.mcp.max_response_tokens` for parity.
+/// metadata. Fetches through [`crate::core::ops::get_document_content`], the
+/// one place CLI and MCP both go for a document's blob and line range.
+/// Truncation uses `handle.config.mcp.max_response_tokens` for parity.
 fn render_document_content(
     handle: &RepoHandle,
     ctx: &Context,
     doc: &crate::domain::Document,
     lines: Option<&str>,
 ) -> Result<String, McpError> {
-    let content = documents::get_content(&ctx.conn, &doc.hash)
-        .map_err(|e| mcp_store_error("Failed to get document content", e))?
-        .ok_or_else(|| mcp_error("Content missing for document. Try `update` to reindex."))?;
-
-    let mut output = if let Some(range) = lines {
-        apply_line_range(&content, range)?
-    } else {
-        content
-    };
+    let mut output = crate::core::ops::get_document_content(ctx, doc, lines).map_err(|e| {
+        match e.kind() {
+            ErrorKind::DocumentNotFound { .. } => {
+                mcp_error("Content missing for document. Try `update` to reindex.")
+            }
+            _ => mcp_store_error("Failed to get document content", e),
+        }
+    })?;
 
     let document_status = match evolution::get_document_status(&ctx.conn, doc.id) {
         Ok(status) => status,
@@ -2881,9 +2900,11 @@ pub fn append_hook_log(path: &std::path::Path, line: &str) {
     }
 }
 
-/// Append one line to `.mdkb/hook-events.jsonl`; also `.mdkb/hook-slow.jsonl`
-/// when elapsed exceeds the configured budget. Best-effort — silently drops on
-/// I/O failure. Designed to run inside `spawn_blocking`.
+/// Append one line to `hook-events.jsonl` in the store the hook ran against;
+/// also `hook-slow.jsonl` when elapsed exceeds the configured budget. The store,
+/// not `.mdkb/` — a namespaced process writes nothing outside its namespace,
+/// telemetry included. Best-effort — silently drops on I/O failure. Designed to
+/// run inside `spawn_blocking`.
 fn log_hook_event(
     root: std::path::PathBuf,
     event: &str,
@@ -2900,7 +2921,7 @@ fn log_hook_event(
     })
     .to_string();
     line.push('\n');
-    let mdkb_dir = root.join(".mdkb");
+    let mdkb_dir = crate::store::namespace::store_dir(&root).unwrap_or_else(|_| root.join(".mdkb"));
     append_hook_log(&mdkb_dir.join("hook-events.jsonl"), &line);
     if elapsed_ms > slow_threshold_ms {
         append_hook_log(&mdkb_dir.join("hook-slow.jsonl"), &line);
@@ -3298,15 +3319,22 @@ pub async fn hook_session_start_impl(
                 .map(|c| c.name)
                 .collect();
             let drift_banner = format_projection_drift_banner(ctx)?;
+            // The store this session opened — in a namespace, not `.mdkb/`.
+            // The quarantine banner must describe it, not the default store.
+            let store_dir = ctx
+                .db_path
+                .parent()
+                .map_or_else(|| handle.root.join(".mdkb"), std::path::Path::to_path_buf);
             Ok((
                 due_lines,
                 entries,
                 doc_count,
                 collection_names,
                 drift_banner,
+                store_dir,
             ))
         });
-    let (due_lines, entries, doc_count, collection_names, drift_banner) = match startup_data {
+    let (due_lines, entries, doc_count, collection_names, drift_banner, store_dir) = match startup_data {
         Some(Ok(data)) => data,
         Some(Err(error)) => {
             tracing::warn!("hook.session_start warmup failed: {error}");
@@ -3321,7 +3349,7 @@ pub async fn hook_session_start_impl(
     // Data-loss banner: surface any outstanding autoheal quarantine loudly,
     // computed before the empty-warmup early return so a freshly-rebuilt (empty)
     // store still gets the warning instead of silence.
-    let quarantine_banner = format_quarantine_banner(&handle.root.join(".mdkb"), doc_count);
+    let quarantine_banner = format_quarantine_banner(&store_dir, doc_count);
 
     // mdkb owns handoff injection: pull the newest handoff's full body out for a
     // dedicated block and drop ALL handoffs from the ranked compact list — a
@@ -7666,6 +7694,125 @@ mod tests {
         assert!(!truncated);
         assert!(text.contains("seeded-get"), "text: {text}");
         assert!(text.contains("Type:"), "text: {text}");
+    }
+
+    /// `render_document_content` now fetches through
+    /// `core::ops::get_document_content`; a blob that vanished out from under an
+    /// indexed document row must still map `ErrorKind::DocumentNotFound` to the
+    /// reindex hint, not fall through to the generic store-error message.
+    #[tokio::test]
+    async fn render_document_content_missing_blob_returns_reindex_hint() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_document(&handle, "docs/gone.md", "Gone", "line one\nline two\n").await;
+
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let mut doc = resolve_document(&ctx.conn, "docs/gone.md").expect("resolve seeded doc");
+        // The blob is content-addressable, so a document row whose hash has no
+        // `content` row is the missing-body case. The schema's
+        // `documents.hash REFERENCES content(hash)` blocks deleting the blob, so
+        // point the in-memory document at a hash that was never stored — what
+        // the caller hands `render_document_content` either way.
+        doc.hash = "0".repeat(64);
+
+        let err =
+            render_document_content(&handle, ctx, &doc, None).expect_err("missing blob errors");
+        assert!(
+            err.to_string().contains("Try `update` to reindex"),
+            "hint must survive the core::ops error mapping: {err}"
+        );
+    }
+
+    /// A `lines` range must still apply when fetched through
+    /// `core::ops::get_document_content` via the actual `get` MCP entry point.
+    #[tokio::test]
+    async fn get_impl_document_lines_range_applies_through_mcp_path() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_document(
+            &handle,
+            "docs/ranged.md",
+            "Ranged",
+            "line one\nline two\nline three\nline four\n",
+        )
+        .await;
+
+        let mut params = get_params("docs/ranged.md");
+        params.lines = Some("2:3".to_string());
+        let (text, count, truncated) = get_impl(&handle, &params).await.expect("ranged get");
+        assert_eq!(count, 1);
+        assert!(!truncated);
+        assert_eq!(text, "line two\nline three", "text: {text}");
+    }
+
+    /// The superseded-status suffix appended after the fetched content must
+    /// still render once the fetch itself goes through `core::ops`.
+    #[tokio::test]
+    async fn render_document_content_superseded_status_suffix_renders() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_document(&handle, "docs/old.md", "Old", "old body").await;
+        seed_document(&handle, "docs/new.md", "New", "new body").await;
+
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let old = resolve_document(&ctx.conn, "docs/old.md").expect("resolve old");
+        let new = resolve_document(&ctx.conn, "docs/new.md").expect("resolve new");
+        evolution::add_evolution(
+            &ctx.conn,
+            new.id,
+            old.id,
+            evolution::RelationshipType::Supersedes,
+            None,
+            Some("replaced"),
+        )
+        .expect("record supersede");
+
+        let text = render_document_content(&handle, ctx, &old, None).expect("render old doc");
+        assert!(text.contains("**Status:** Superseded"), "text: {text}");
+        assert!(
+            text.contains("**Superseded by:** docs/new.md"),
+            "text: {text}"
+        );
+    }
+
+    /// Truncation of the rendered output (content + status suffix) must still
+    /// kick in and leave its continuation marker once the fetch goes through
+    /// `core::ops::get_document_content`.
+    #[tokio::test]
+    async fn render_document_content_truncation_still_renders() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let mut config = Config::default();
+        config.hooks.user_prompt_submit_require_sigil = false;
+        // Above the continuation message's own token cost, or
+        // `truncate_with_continuation` falls back to the "Content too large"
+        // stub and never emits the line marker this test is about.
+        config.mcp.max_response_tokens = 200;
+        let handle = Arc::new(RepoHandle::from_shared(
+            root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            config,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let long_content = "line\n".repeat(2000);
+        seed_document(&handle, "docs/long.md", "Long", &long_content).await;
+
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let doc = resolve_document(&ctx.conn, "docs/long.md").expect("resolve seeded doc");
+
+        let text = render_document_content(&handle, ctx, &doc, None).expect("render long doc");
+        assert!(
+            text.contains("[Truncated at line"),
+            "truncation marker must survive: {text}"
+        );
     }
 
     #[tokio::test]

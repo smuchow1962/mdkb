@@ -6,13 +6,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_mdkb"))
-}
-
-fn run(args: &[&str], cwd: &Path) -> Output {
-    run_env(args, cwd, &[])
-}
+#[path = "common/cli.rs"]
+mod cli;
+use cli::{bin, run};
 
 fn run_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Output {
     Command::new(bin())
@@ -202,6 +198,82 @@ fn smoke_namespace_name_is_validated() {
     assert!(
         !repo.root.join(".mdkb/escape").exists() && !repo.root.join("escape").exists(),
         "a refused namespace must create nothing"
+    );
+}
+
+/// Hook telemetry is a write. It goes to the store the hook ran against, not
+/// to the default store — nothing escapes a namespace, however low the stakes.
+#[test]
+fn smoke_namespaced_hook_logs_telemetry_into_its_own_store() {
+    let repo = Repo::new();
+    let out = run_env(
+        &["hook", "session-start"],
+        &repo.root,
+        &[("MDKB_NO_DAEMON", "1"), ("MDKB_NAMESPACE", "test")],
+    );
+    assert_ok(&out, "namespaced hook session-start");
+    assert!(
+        repo.root
+            .join(".mdkb/namespaces/test/hook-events.jsonl")
+            .is_file(),
+        "telemetry must land in the namespaced store"
+    );
+    assert!(
+        !repo.root.join(".mdkb/hook-events.jsonl").exists(),
+        "the default store must not receive a namespaced hook's telemetry"
+    );
+}
+
+/// The quarantine banner reports the store the session actually opened. A
+/// namespaced session announcing the DEFAULT store's corruption is worse than
+/// saying nothing: the operator would go looking in the wrong place.
+#[test]
+fn smoke_quarantine_banner_reports_the_active_store_only() {
+    let repo = Repo::new();
+    let ns_env = [("MDKB_NO_DAEMON", "1"), ("MDKB_NAMESPACE", "test")];
+    // Create the namespaced store, then plant a quarantine marker in the
+    // DEFAULT store only.
+    assert_ok(
+        &run_env(&["hook", "session-start"], &repo.root, &ns_env),
+        "namespaced hook (creates the store)",
+    );
+    std::fs::write(repo.root.join(".mdkb/index.sqlite.corrupt-1700000000"), b"").unwrap();
+
+    // Control: the default store reports its own quarantine.
+    let out = run_env(
+        &["hook", "session-start"],
+        &repo.root,
+        &[("MDKB_NO_DAEMON", "1")],
+    );
+    assert_ok(&out, "default hook session-start");
+    assert!(
+        stdout(&out).contains("CORRUPT"),
+        "control: the default store must report its quarantine: {}",
+        stdout(&out)
+    );
+
+    // The namespaced session must not.
+    let out = run_env(&["hook", "session-start"], &repo.root, &ns_env);
+    assert_ok(&out, "namespaced hook session-start");
+    assert!(
+        !stdout(&out).contains("CORRUPT"),
+        "a namespaced session must not report the default store's quarantine: {}",
+        stdout(&out)
+    );
+
+    // And it does report its own.
+    std::fs::write(
+        repo.root
+            .join(".mdkb/namespaces/test/index.sqlite.corrupt-1700000001"),
+        b"",
+    )
+    .unwrap();
+    let out = run_env(&["hook", "session-start"], &repo.root, &ns_env);
+    assert_ok(&out, "namespaced hook session-start with own quarantine");
+    assert!(
+        stdout(&out).contains("CORRUPT"),
+        "a namespaced session must report its own quarantine: {}",
+        stdout(&out)
     );
 }
 

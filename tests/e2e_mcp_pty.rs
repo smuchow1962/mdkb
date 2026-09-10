@@ -202,6 +202,18 @@ fn test_mcp_memory_tools() {
         "memory_write should succeed"
     );
 
+    // The write projects to disk on its own, like `mdkb memory add` does. Until
+    // it did, the git-tracked projection silently diverged from the index after
+    // every MCP write until someone happened to run a sync.
+    let projected = harness
+        .root
+        .join(".mdkb/memory/entries/test-memory-entry.md");
+    assert!(
+        projected.is_file(),
+        "memory_write must project the entry: {}",
+        projected.display()
+    );
+
     // Get the memory entry back via unified get (slug resolution)
     let get_result = harness.call_tool("get", json!({"id": "test-memory-entry"}));
     let get_text = McpTestHarness::get_text_content(&get_result);
@@ -651,9 +663,8 @@ fn test_mcp_search_special_characters() {
 /// able to leave a row or a file the default store's sessions would warm up
 /// from.
 ///
-/// An MCP write is DB-only; the projection is written by reconciliation (the
-/// daemon's watcher, `mdkb update`, or `mdkb memory sync`), so the test runs
-/// `memory sync` in the same namespace to materialize it.
+/// The projection is written by the write itself, exactly as the CLI path does
+/// it: no `memory sync` is run in between.
 #[test]
 fn test_mcp_namespaced_session_projects_under_the_namespace_only() {
     let mut harness = McpTestHarness::with_env(&[("MDKB_NAMESPACE", "test")]);
@@ -686,8 +697,6 @@ fn test_mcp_namespaced_session_projects_under_the_namespace_only() {
     };
 
     // Half one: the write is in the namespaced store and projects there.
-    let out = cli(&["memory", "sync"], &[("MDKB_NAMESPACE", "test")]);
-    assert!(out.status.success(), "namespaced memory sync must succeed");
     let namespaced = harness
         .root
         .join(".mdkb/namespaces/test/memory/entries/namespaced-mcp-entry.md");
@@ -717,5 +726,49 @@ fn test_mcp_namespaced_session_projects_under_the_namespace_only() {
     assert!(
         !listed.contains("namespaced-mcp-entry"),
         "the default index must not hold the namespaced row: {listed}"
+    );
+}
+
+/// `memory_delete` retires the projection the way `mdkb memory rm` does: the
+/// file moves to `memory/archive/`. Left in `entries/`, the next reconciliation
+/// would find a file with no row and import it — the deleted entry comes back.
+#[test]
+fn test_mcp_memory_delete_archives_the_projection() {
+    let mut harness = McpTestHarness::new();
+    harness.initialize();
+    let write = harness.call_tool(
+        "memory_write",
+        json!({
+            "id": "to-be-deleted",
+            "title": "To be deleted",
+            "content": "# Gone\n\nSoon.",
+            "entry_type": "topic"
+        }),
+    );
+    assert!(
+        write["result"].is_object(),
+        "memory_write should succeed: {write}"
+    );
+    let entry = harness.root.join(".mdkb/memory/entries/to-be-deleted.md");
+    assert!(
+        entry.is_file(),
+        "precondition: the write projected the entry"
+    );
+
+    let deleted = harness.call_tool("memory_delete", json!({"id": "to-be-deleted"}));
+    assert!(
+        deleted["result"].is_object(),
+        "memory_delete should succeed: {deleted}"
+    );
+    assert!(
+        !entry.exists(),
+        "a deleted entry must leave `entries/`, or the next sync re-imports it"
+    );
+    assert!(
+        harness
+            .root
+            .join(".mdkb/memory/archive/to-be-deleted.md")
+            .is_file(),
+        "the projection is archived, not destroyed"
     );
 }

@@ -52,20 +52,17 @@ pub async fn run_http_server(
     eprintln!("mdkb MCP server listening on http://{bind}/mcp");
 
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(cancellation_token))
+        .with_graceful_shutdown(async move {
+            if let Err(e) = super::wait_for_shutdown_signal().await {
+                tracing::warn!("signal: {e}");
+            }
+            tracing::info!("Shutdown signal received, stopping server...");
+            cancellation_token.cancel();
+        })
         .await
         .map_err(|e| crate::error::Error::mcp(format!("HTTP server error: {e}")))?;
 
     Ok(())
-}
-
-/// Wait for shutdown signal (Ctrl+C).
-async fn shutdown_signal(cancellation_token: CancellationToken) {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install Ctrl+C handler");
-    tracing::info!("Shutdown signal received, stopping server...");
-    cancellation_token.cancel();
 }
 
 #[cfg(test)]

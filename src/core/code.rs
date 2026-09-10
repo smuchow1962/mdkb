@@ -3,6 +3,15 @@
 //! A separate store (`code.sqlite`) with its own lifecycle. The MCP code tools
 //! and the daemon's watcher-driven reindex both drive it, so it is not a
 //! command-line concern.
+//!
+//! Its path is `.mdkb/code.sqlite` under the project root, deliberately
+//! independent of the memory store's namespace (`store::namespace`). The code
+//! index is derived from the source tree, not from the corpus: a namespaced
+//! process indexing the same files would produce the same rows, so a second
+//! copy per namespace would be a cold rebuild for no isolation gained. Only
+//! what a process *writes about the project* is namespaced; what it *reads
+//! from the project* is shared. The same reasoning covers `vectors.bin` beside
+//! it and the legacy-file housekeeping in `core::indexing`.
 
 use std::path::Path;
 

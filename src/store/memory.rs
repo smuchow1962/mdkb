@@ -1416,6 +1416,19 @@ pub fn list_projection_state(conn: &Connection) -> Result<Vec<ProjectionRow>> {
     Ok(rows)
 }
 
+/// The hash recorded for an entry's projection: `None` when the entry is
+/// unknown or has never been projected.
+pub fn projected_hash(conn: &Connection, id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT projected_hash FROM memory_entries WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// Record that an entry's markdown projection was written at `ts` with content
 /// hashing to `hash`. Both move together — a timestamp without the bytes it
 /// describes cannot answer "did the file change since?".

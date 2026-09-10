@@ -182,6 +182,23 @@ by a session on the host that reported them.
   code stays the single place a default lives, and uncommenting a line is what
   it looks like — a deliberate override.
 
+- **An MCP `memory_write` projects its entry to disk, like `mdkb memory add`
+  always did.** The MCP path wrote the row and stopped; the `.md` appeared only
+  when the daemon's watcher, `mdkb update` or `mdkb memory sync` next ran, so
+  the git-tracked projection silently diverged from the index after every MCP
+  write. `memory_delete` had the mirror defect: the file stayed in `entries/`
+  and the next reconciliation re-imported the deleted entry. Both doors now
+  share the CLI's post-write and post-delete steps. The watcher recognises the
+  store's own projections by their recorded hash and skips the reconciliation
+  pass for them, so a write no longer costs a whole-directory scan.
+
+- **Hook telemetry and the quarantine banner follow the store the process
+  opened.** A namespaced hook appended `hook-events.jsonl` to the default
+  `.mdkb/`, and a namespaced session reported the default store's quarantine
+  markers instead of its own. Nothing escapes a namespace now, telemetry
+  included; the code index stays deliberately shared, with the reasoning
+  recorded at the site.
+
 - **`mdkb memory prune` no longer archives durable knowledge for want of a
   signal nothing writes.** It selected every active entry whose
   `last_accessed` was older than `--days`, or NULL with an old `created_at`.
