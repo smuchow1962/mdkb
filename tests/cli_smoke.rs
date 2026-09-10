@@ -6,13 +6,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_mdkb"))
-}
-
-fn run(args: &[&str], cwd: &Path) -> Output {
-    run_env(args, cwd, &[])
-}
+#[path = "common/cli.rs"]
+mod cli;
+use cli::{bin, run};
 
 fn run_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Output {
     Command::new(bin())

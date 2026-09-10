@@ -11,26 +11,14 @@
 //! variant added to `EntryType`, `SourceType` or `MemoryRelation` and forgotten
 //! in the CLI fails this file rather than shipping.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 
 use mdkb::store::memory::{EntryType, SourceType};
 use mdkb::store::memory_graph::MemoryRelation;
 
-fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_mdkb"))
-}
-
-fn run(args: &[&str], cwd: &Path) -> Output {
-    Command::new(bin())
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap_or_else(|e| panic!("spawn failed for `mdkb {}`: {e}", args.join(" ")))
-}
+#[path = "common/cli.rs"]
+mod cli;
+use cli::run;
 
 /// clap prints `--help` on stdout and usage errors on stderr; a caller only
 /// cares that the values are somewhere in the output.
