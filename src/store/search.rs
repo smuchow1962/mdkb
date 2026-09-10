@@ -34,6 +34,17 @@ pub fn escape_fts5_query_or(query: &str) -> String {
     quote_fts5_terms(query).join(" OR ")
 }
 
+/// True when an escaped FTS5 expression carries no term to match.
+///
+/// `escape_fts5_query` splits on whitespace, so an empty or whitespace-only
+/// query produces an empty expression. FTS5 answers an empty MATCH with
+/// `fts5: syntax error near ""` — a parser message for what is really "you
+/// asked for nothing". Every site that runs MATCH checks this first and
+/// answers with no rows instead of surfacing the parser error.
+pub fn fts_query_is_empty(fts_query: &str) -> bool {
+    fts_query.trim().is_empty()
+}
+
 /// Actionable hint appended to empty search/get output when the index holds
 /// nothing — so a blank result reads as "unpopulated index" (e.g. right after an
 /// autoheal quarantine), not "your query matched nothing".
@@ -68,6 +79,12 @@ pub fn search_fts(
     fts_query: &str,
     query: &SearchQuery,
 ) -> Result<Vec<SearchResult>> {
+    // No term to match: answer "nothing found" rather than letting FTS5 reject
+    // the empty MATCH.
+    if fts_query_is_empty(fts_query) {
+        return Ok(Vec::new());
+    }
+
     let mut search_results = Vec::new();
 
     // Build status filter clause
@@ -279,6 +296,41 @@ mod tests {
     fn test_escape_fts5_column_prefix() {
         // Column:term syntax should be escaped
         assert_eq!(escape_fts5_query("CSRF:token"), "\"CSRF:token\"");
+    }
+
+    #[test]
+    fn empty_and_whitespace_queries_escape_to_nothing() {
+        // The precondition for the guard below: whitespace-only input carries
+        // no term, so `escape_fts5_query` has nothing to quote.
+        assert_eq!(escape_fts5_query(""), "");
+        assert_eq!(escape_fts5_query("   "), "");
+        assert_eq!(escape_fts5_query("\t\n"), "");
+        assert!(fts_query_is_empty(&escape_fts5_query("   ")));
+        assert!(!fts_query_is_empty(&escape_fts5_query("term")));
+    }
+
+    #[test]
+    fn empty_query_returns_no_rows_instead_of_an_fts5_parser_error() {
+        // Issue #9: `mdkb search ""` used to reach FTS5 with an empty MATCH and
+        // surface `fts5: syntax error near ""` — the storage engine's parser
+        // message, for what is really "you asked for nothing". Easy to hit when
+        // scripting. The contract is now: no terms, no results, no error.
+        let conn = setup_db_with_docs();
+        for text in ["", "   ", "\t"] {
+            let query = SearchQuery {
+                text: text.to_string(),
+                limit: 5,
+                collection: None,
+                tags: vec![],
+                include_superseded: false,
+            };
+            let results = search(&conn, &query)
+                .unwrap_or_else(|e| panic!("empty query {text:?} must not error: {e}"));
+            assert!(
+                results.is_empty(),
+                "empty query {text:?} must match nothing, got {results:?}"
+            );
+        }
     }
 
     fn setup_db() -> Connection {

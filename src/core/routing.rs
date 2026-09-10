@@ -56,6 +56,7 @@ pub fn routing_for(command: &Command) -> Routing {
         Command::Collection(c) => match c {
             CollectionCommand::List => Routing::Read,
             CollectionCommand::Add { .. }
+            | CollectionCommand::Update { .. }
             | CollectionCommand::Remove { .. }
             | CollectionCommand::Rename { .. } => Routing::Mutation,
         },
@@ -133,8 +134,18 @@ pub fn unclassified_commands() -> Vec<&'static str> {
 /// `MDKB_NO_DAEMON=1` is the single documented escape hatch and the only way a
 /// CLI process writes directly — the same variable the MCP proxy and the hook
 /// client already honour, so there is one thing to remember rather than three.
+/// A namespaced process (see `store::namespace`) also writes directly: the
+/// daemon serves the default store, and sending it a namespaced write would
+/// land the write exactly where the namespace exists to keep it out of.
 pub fn should_route(command: &Command) -> bool {
-    routing_for(command) == Routing::Mutation && std::env::var_os("MDKB_NO_DAEMON").is_none()
+    routing_for(command) == Routing::Mutation && daemon_serves_this_process()
+}
+
+/// False under `MDKB_NO_DAEMON` or in a namespace. Shared by the CLI router,
+/// the MCP run-mode decision and the hook client so the three cannot disagree.
+pub fn daemon_serves_this_process() -> bool {
+    std::env::var_os("MDKB_NO_DAEMON").is_none()
+        && matches!(crate::store::namespace::active(), Ok(None))
 }
 
 /// Convert a parsed mutating command into the complete internal wire request.
@@ -182,6 +193,15 @@ pub fn mutation_request(
                 path,
                 pattern,
             } => M::CollectionAdd {
+                name: name.clone(),
+                path: path.clone(),
+                pattern: pattern.clone(),
+            },
+            CollectionCommand::Update {
+                name,
+                pattern,
+                path,
+            } => M::CollectionUpdate {
                 name: name.clone(),
                 path: path.clone(),
                 pattern: pattern.clone(),

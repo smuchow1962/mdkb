@@ -35,6 +35,11 @@ pub enum CliMutation {
         path: String,
         pattern: String,
     },
+    CollectionUpdate {
+        name: String,
+        path: Option<String>,
+        pattern: Option<String>,
+    },
     CollectionRemove {
         name: String,
     },
@@ -164,6 +169,10 @@ pub enum CliMutationResult {
         code_bytes: Option<u64>,
     },
     CollectionAdded,
+    CollectionUpdated {
+        path: String,
+        pattern: String,
+    },
     CollectionRemoved {
         removed: bool,
     },
@@ -253,6 +262,22 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
         } => {
             crate::core::graph::handle_collection_add(ctx, &name, &path, &pattern)?;
             R::CollectionAdded
+        }
+        CollectionUpdate {
+            name,
+            path,
+            pattern,
+        } => {
+            let updated = crate::core::graph::handle_collection_update(
+                ctx,
+                &name,
+                path.as_deref(),
+                pattern.as_deref(),
+            )?;
+            R::CollectionUpdated {
+                path: updated.path,
+                pattern: updated.pattern,
+            }
         }
         CollectionRemove { name } => R::CollectionRemoved {
             removed: crate::core::graph::handle_collection_remove(ctx, &name)?,

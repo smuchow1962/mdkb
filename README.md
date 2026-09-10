@@ -403,6 +403,10 @@ mdkb graph neighbors project.md --depth 2    # adjacent entities, undirected
 mdkb graph path project.md guide.md          # shortest path between two entities
 ```
 
+**[docs/graph.md](docs/graph.md)** — how edges are created, how references
+resolve, what each query is for, and when to reach for the graph instead of
+search.
+
 ### Memory
 
 ```bash
@@ -544,6 +548,14 @@ Project state stays local in `.mdkb/`:
 ```
 
 The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded on first use and cached in the platform's user cache directory.
+
+`MDKB_NAMESPACE=<name>` points a process at `.mdkb/namespaces/<name>/` instead:
+its own index, memory projection and locks, invisible to `memory list`, search
+and the SessionStart warmup of the default store, and never committed. A process
+under a test runner (`node --test`, vitest, jest, pytest) gets the `test`
+namespace without asking, so a consumer's test suite cannot pollute the store
+its sessions warm up from. `MDKB_NAMESPACE=default` opts back out. Namespaced
+processes never use the daemon.
 
 Keep `.mdkb/*` ignored at the repository root, then re-include
 `.mdkb/.gitignore` and `.mdkb/memory/`. The generated store-level ignore file

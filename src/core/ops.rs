@@ -717,6 +717,13 @@ pub fn handle_vsearch(
     limit: usize,
     collection: Option<&str>,
 ) -> Result<Vec<SearchResult>> {
+    // An empty query has no meaning to rank against: embedding it would return
+    // whichever documents happen to sit nearest the empty string. The FTS paths
+    // answer the same input with no rows, so this one does too.
+    if query_text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
     // Use cached service to avoid reloading
     let service = crate::llm::get_cached_service()?;
 
@@ -834,7 +841,7 @@ pub enum GetResult {
 /// Handle `mdkb init` command.
 pub fn handle_init(root: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
-    let mdkb_dir = root.join(".mdkb");
+    let mdkb_dir = crate::store::namespace::store_dir(root)?;
 
     if mdkb_dir.exists() {
         return Err(Error::other(format!(

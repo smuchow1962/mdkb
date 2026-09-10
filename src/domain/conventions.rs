@@ -51,12 +51,23 @@ pub fn detect_conventions(
         }
     }
 
-    // Check for root *.md files (non-recursive _root collection)
+    // Check for root *.md files, then claim the whole tree from there.
+    //
+    // The pattern is recursive because almost every project keeps its markdown
+    // in subdirectories: `*.md` indexed only the two or three files beside the
+    // README and silently ignored the other few hundred, so a fresh `mdkb init`
+    // produced a store that knew nothing (issue #8). `**/*.md` is already the
+    // default for `[indexing] default_pattern` and for `mdkb collection add`;
+    // this was the one place that disagreed.
+    //
+    // It does not double-index what `docs`/`archive` above already hold:
+    // indexing gives a file to the collection with the most specific path
+    // (`core::indexing::claimed_by_a_narrower_collection`).
     if !existing_names.contains("_root") && has_root_markdown_files(root) {
         proposals.push(ProposedCollection {
             name: "_root".to_string(),
             path: ".".to_string(),
-            pattern: "*.md".to_string(),
+            pattern: "**/*.md".to_string(),
         });
     }
 
@@ -77,6 +88,12 @@ pub fn proposal_to_collection(proposal: &ProposedCollection) -> Collection {
 }
 
 /// Check if the root directory contains any .md files (not in subdirectories).
+///
+/// Still the trigger, even though the proposed pattern is recursive: it is one
+/// `read_dir` on a path the caller is about to walk anyway, where a recursive
+/// probe would walk the whole tree just to answer "is there any markdown?".
+/// A project with no markdown at all beside its root has nothing `init` can
+/// guess about; the user registers a collection explicitly.
 fn has_root_markdown_files(root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else {
         return false;
@@ -130,7 +147,9 @@ mod tests {
         let proposals = detect_conventions(tmp.path(), &[]);
         let root = proposals.iter().find(|p| p.name == "_root");
         assert!(root.is_some());
-        assert_eq!(root.unwrap().pattern, "*.md");
+        // Recursive since issue #8: a root-level markdown file is only the
+        // trigger, and the collection it proposes covers the whole tree.
+        assert_eq!(root.unwrap().pattern, "**/*.md");
         assert_eq!(root.unwrap().path, ".");
     }
 

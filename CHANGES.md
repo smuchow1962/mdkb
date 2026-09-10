@@ -12,6 +12,12 @@ trustworthy core is the clusters at 0–3 bits apart. The numbers are under *The
 structural threshold* below, because a reader who does not have them will
 over-trust the headline.
 
+This release also closes every open issue in the tracker, plus the collection
+command their absence kept asking for. Three of them were Windows-only. Those
+three now **compile** for `x86_64-pc-windows-msvc`, but nothing here has been
+**run** on Windows: the platform rules are pinned by portable unit tests, not
+by a session on the host that reported them.
+
 ### Added
 
 - **`mdkb dup` reports duplicated code**, and `search scope="duplicates"` asks
@@ -56,6 +62,38 @@ over-trust the headline.
   pair expansion would go, a 500-file commit alone contributing ~124,750 pairs.
   15 pairs on this repository, in 0.11s of CPU after the index is open. CLI
   only; there is no MCP scope for it yet.
+
+- **Store namespaces, so a consumer's test suite cannot pollute the store its
+  sessions warm up from.** `MDKB_NAMESPACE=<name>` points a process at
+  `.mdkb/namespaces/<name>/` — its own index, projection and locks — which no
+  read of the default store can see and the store-level `.gitignore` never
+  commits. A process carrying a test runner's marker (`NODE_TEST_CONTEXT`,
+  `VITEST`, `JEST_WORKER_ID`, `PYTEST_CURRENT_TEST`) is routed to the `test`
+  namespace without asking; `MDKB_NAMESPACE=default` opts back out. Namespaced
+  processes never use the daemon, and the daemon refuses to start in one. The
+  file watcher reconciles the projection of the store it opened, namespaced or
+  not. Motivated by three `wiz-bridge-test-<timestamp>` entries and a `retest-001`
+  found active in a live store.
+
+- **Warmup eligibility is an allow-list.** The pool admits topics, problems,
+  decisions and priors (the last only for the reserved confidence-gated slot).
+  Handoffs, reminders and net-refuted entries (`corrections > confirmations`)
+  never compete for a slot; the newest handoff and due reminders still arrive
+  through their own queries.
+
+- **`mdkb collection update <name> [--path P] [--pattern G]`** changes a
+  collection in place. Changing a pattern used to mean `collection remove` +
+  `collection add`, which drops every indexed document and forces a full
+  re-embed of files whose content never changed. The update keeps `created_at`
+  and `source`, validates the new path and pattern before writing, and refuses
+  a call that names neither. The saving applies to `--pattern`: a document is
+  keyed by its path relative to the collection's base, so `--path` moves the
+  base out from under the existing rows and the new one is indexed — and
+  embedded — from scratch. *(#11, reported by Stefano Straus (@sstraus))*
+
+- **[docs/graph.md](docs/graph.md)** — how graph edges are created, how a
+  reference resolves (and what is tried before it is called dangling), what each
+  query answers, and when to reach for the graph instead of search.
 
 ### Changed
 
@@ -143,6 +181,93 @@ over-trust the headline.
   now writes the same defaults commented out: the options stay discoverable, the
   code stays the single place a default lives, and uncommenting a line is what
   it looks like — a deliberate override.
+
+- **`mdkb memory prune` no longer archives durable knowledge for want of a
+  signal nothing writes.** It selected every active entry whose
+  `last_accessed` was older than `--days`, or NULL with an old `created_at`.
+  `search` — the dominant read path — deliberately records no access, so
+  `last_accessed` was NULL for 41 of 41 entries in a live store, and
+  `prune --days 90` would have archived every topic, problem and decision older
+  than 90 days regardless of how often it was consulted. Topics, problems and
+  decisions are now retired only by an explicit `--ttl`; age applies to
+  reminders, priors and handoffs alone, sparing the newest handoff (the next
+  session's thread) and reminders not yet due. `--dry-run` lists exactly the
+  set a real run archives. Help text and the cheatsheet now describe what the
+  command does rather than a guarantee it could not keep.
+
+- **A live-connection lock probe no longer mistakes contention for a real I/O
+  error.** The probe keyed on `ErrorKind::WouldBlock`, which is what a
+  contended `flock` produces on Unix. Windows returns
+  `ERROR_LOCK_VIOLATION` (os error 33), and Rust does not map it to
+  `WouldBlock` — so a store that was merely busy read as broken, and heal,
+  quarantine and salvage ran against a database nothing was wrong with. The
+  check now asks the platform (`fs4::lock_contended_error()`) rather than one
+  error kind, and the daemon singleton uses the same predicate so both agree on
+  what "already held" means. *(#5, reported by Steve Muchow (@smuchow1962))*
+
+- **`mdkb schema` no longer overflows the main-thread stack in debug builds.**
+  Windows gives the main thread 1 MiB, against 8 MiB on Linux and macOS, and a
+  debug build of the clap command tree does not fit. All CLI work now runs on a
+  thread this program sizes itself (8 MiB), so the stack no longer depends on
+  which platform started the process. The report blamed the recursive
+  `command_to_json` serializer; measuring it on macOS aarch64 showed
+  `Cli::command()` alone needs between 768 and 896 KiB and the serializer adds
+  nothing measurable — making the serializer iterative would have fixed nothing.
+  *(#6, reported by Steve Muchow (@smuchow1962))*
+
+- **`mdkb hook` runs on platforms without a daemon instead of exiting 1.** Host
+  hooks are contractually exit-zero, and the whole hook client was compiled out
+  where unix sockets do not exist, so every lifecycle event failed loudly and
+  Claude Code surfaced the noise. Only the socket transport is unix-specific
+  now: elsewhere the same commands take the in-process route
+  `MDKB_NO_DAEMON=1` already selected. `hooks.daemon_required = true` still
+  refuses, with a message that says the platform has no daemon rather than
+  blaming an environment variable the user did not set. *(#7, reported by Steve
+  Muchow (@smuchow1962))*
+
+- **`mdkb init` indexes the whole tree, not just its top level.** The implicit
+  `_root` collection was created with the non-recursive pattern `*.md`, so a
+  repository whose documentation lives in subdirectories was indexed as almost
+  empty. It is `**/*.md` now. Because that pattern overlaps every collection
+  below it, a document is claimed by the collection with the most specific path
+  — adding `docs/` to a store no longer leaves its files indexed twice, and
+  removing it hands them back to `_root`. The single-file update path applies
+  the same rule as the full walk, so incremental and full indexing cannot
+  disagree about who owns a file. Two notes for an existing store: it keeps the
+  `_root` pattern it was created with — nothing rewrites a collection behind the
+  operator's back — so fix it with `mdkb collection update _root -p '**/*.md'`;
+  and the ownership rule applies to *every* overlapping pair on the next
+  `update`, so a document currently indexed under both an outer and an inner
+  collection loses its row (and embedding) in the outer one. That is the
+  intended de-duplication, but it is a data change, not just a query change.
+  *(#8, reported by Stefano Straus (@sstraus))*
+
+- **An empty or whitespace-only query returns no rows instead of an FTS5 parser
+  error.** FTS5 answers an empty `MATCH` with `fts5: syntax error near ""`,
+  which reached the caller verbatim through search, memory search, bm25 and the
+  hybrid paths. All of them share one guard now. The hybrid path stops before
+  the vector half too: ranking a corpus against the embedding of an empty string
+  returns arbitrary neighbours, which is worse than returning nothing. The MCP
+  hint on an empty result set now names the empty query instead of advising the
+  caller to reach for Grep over a query it never supplied. *(#9, reported by
+  Stefano Straus (@sstraus))*
+
+- **A long `update` on the daemon is no longer cut off five seconds into
+  shutdown.** In-flight requests were drained under the grace period meant for
+  idle sockets — five seconds, against the hour the CLI itself budgets for a
+  mutation. On any shutdown (a signal, or the 30-second watcher that retires the
+  daemon when its executable is replaced by `cargo install`) the client saw
+  `io: early eof` or `Connection reset by peer` while the daemon went on to
+  finish the write as its runtime drained the blocking pool: a failure reported
+  for work that succeeded. Requests that have started executing are now drained
+  on their own budget before the socket-level grace. A second signal exits the
+  process outright: tokio keeps its handler installed after the first one, so
+  the operator's second Ctrl-C would otherwise go nowhere — and merely
+  abandoning the wait would not end it either, because dropping the runtime
+  waits for the very blocking write being interrupted. SQLite's WAL recovers an
+  interrupted writer on the next open, exactly as after the SIGKILL this
+  replaces. *(#10, reported by Stefano Straus (@sstraus))*
+
 
 ## 3.8.0 (2026-08-29)
 

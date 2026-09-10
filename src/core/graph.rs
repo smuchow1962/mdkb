@@ -30,6 +30,68 @@ pub fn handle_collection_add(ctx: &Context, name: &str, path: &str, pattern: &st
     collections::add_collection(&ctx.conn, &collection)?;
     Ok(())
 }
+/// Handle `mdkb collection update` command — change a collection's path or
+/// pattern without dropping what it already holds.
+///
+/// `documents.collection` cascades on delete, so the only way to fix a wrong
+/// pattern used to be `remove` + `add`, which erased every indexed document and
+/// forced a full re-embed of the whole collection — minutes of local ONNX
+/// inference to correct one glob (issue #11). Rewriting the row in place keeps
+/// the documents and their embeddings; the next `mdkb update` reconciles
+/// incrementally, indexing what the new pattern newly matches and dropping what
+/// it no longer does.
+///
+/// That saving is real for `--pattern` only. A document is keyed by its path
+/// *relative to the collection's base*, so `--path` does not carry the old rows
+/// over to the new base: they name files the next walk will not find and are
+/// reconciled away, while the new base is indexed — and embedded — from
+/// scratch. (A relative path that exists under both bases keeps its row, but it
+/// now describes a different file and is re-read anyway.) The command still
+/// beats `remove` + `add` there because it keeps the collection's identity
+/// (`created_at`, `source`), not because it saves the inference.
+///
+/// Returns the collection as it now stands. `None` for either field means
+/// "leave it alone"; naming neither is refused rather than reported as a
+/// successful update that changed nothing.
+pub fn handle_collection_update(
+    ctx: &Context,
+    name: &str,
+    path: Option<&str>,
+    pattern: Option<&str>,
+) -> Result<Collection> {
+    if path.is_none() && pattern.is_none() {
+        return Err(Error::other(
+            "nothing to update: pass --pattern, --path, or both".to_string(),
+        ));
+    }
+
+    let Some(existing) = collections::get_collection(&ctx.conn, name)? else {
+        return Err(ErrorKind::CollectionNotFound {
+            name: name.to_string(),
+        }
+        .into());
+    };
+
+    if let Some(path) = path {
+        validate_collection_path(ctx.root(), path)?;
+    }
+    if let Some(pattern) = pattern {
+        crate::core::indexing::compile_collection_matcher(pattern)
+            .map_err(|e| Error::other(format!("Invalid glob pattern '{pattern}': {e}")))?;
+    }
+
+    // The upsert keeps `created_at` and `source`: this is the same collection,
+    // pointed somewhere else. A convention collection retargeted by hand stays
+    // a convention collection, so `apply_conventions` still leaves it alone.
+    let updated = Collection {
+        path: path.unwrap_or(&existing.path).to_string(),
+        pattern: pattern.unwrap_or(&existing.pattern).to_string(),
+        updated_at: chrono::Utc::now().timestamp(),
+        ..existing
+    };
+    collections::add_collection(&ctx.conn, &updated)?;
+    Ok(updated)
+}
 /// Handle `mdkb collection remove` command.
 pub fn handle_collection_remove(ctx: &Context, name: &str) -> Result<bool> {
     collections::remove_collection(&ctx.conn, name)

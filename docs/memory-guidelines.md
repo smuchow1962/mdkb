@@ -208,7 +208,7 @@ memory_write(
 - Expired entries are **filtered out** of `memory_list`, `search(scope="memory")`, and the warmup index.
 - Expired entries **remain accessible** via `get(id)` — the output is prefixed with `[EXPIRED]` so you can inspect or renew them.
 - Expiry is **soft**: the entry is archived, not deleted. `memory write` on the same `id` without `ttl` renews it as permanent; with a new `ttl` resets the expiry window.
-- `prune` removes expired entries alongside stale ones.
+- `prune` archives expired entries, plus reminders, priors and handoffs unread for `--days`. Topics, problems and decisions are never archived for age: `search` records no access, so absence of one is not a signal.
 
 **When to use TTL:**
 - Short-lived investigation notes (flaky test runs, one-off debugging context)

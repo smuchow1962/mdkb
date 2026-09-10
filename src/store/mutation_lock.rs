@@ -60,6 +60,24 @@ pub fn writer_lock_path(db_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// True when a `try_lock` failure means "another process holds it" rather than
+/// "the lock operation itself failed".
+///
+/// The obvious test — `e.kind() == ErrorKind::WouldBlock` — is a Unix-ism.
+/// `fs4` reports contention with whatever code the platform uses: `EWOULDBLOCK`
+/// on Unix, `ERROR_LOCK_VIOLATION` (os error 33) on Windows, which Rust does
+/// not map to `WouldBlock`. Windows therefore read every probe of a held lock
+/// as a hard I/O error, so `try_acquire_live_exclusive` reported failure where
+/// it should have reported "a connection is live". That turned "leave the files
+/// in place" into "recovery failed" — one salvage run recovered 0 entries
+/// (issue #5). Ask `fs4` what contention looks like here instead of hard-coding
+/// one platform's answer.
+pub fn is_lock_contention(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock
+        || (e.raw_os_error().is_some()
+            && e.raw_os_error() == fs4::lock_contended_error().raw_os_error())
+}
+
 /// Open (creating if needed) a lock sidecar without touching its contents.
 fn open_lock_file(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent() {
@@ -115,7 +133,7 @@ pub fn try_acquire_live_exclusive(db_path: &Path) -> Result<Option<MutationGuard
     let file = open_lock_file(&path)?;
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(Some(MutationGuard { file })),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) if is_lock_contention(&e) => Ok(None),
         Err(e) => Err(Error::from(ErrorKind::Io {
             path,
             operation: format!("probe live-connection lock: {e}"),
@@ -169,8 +187,16 @@ pub fn acquire_writer(db_path: &Path, operation: &str) -> Result<MutationGuard> 
 }
 
 /// Admit a direct CLI writer using the same lock as daemon-owned writers.
+///
+/// The lock lives in the store the write goes to, so a namespaced writer never
+/// contends with — or is mistaken for — a writer on the default store. A
+/// namespace that does not exist yet is created here, because its first write
+/// is what brings it into being.
 pub fn acquire_direct_cli(root: &Path) -> Result<MutationGuard> {
-    let mdkb_dir = root.join(".mdkb");
+    let mdkb_dir = crate::store::namespace::store_dir(root)?;
+    if !mdkb_dir.is_dir() && crate::store::namespace::active()?.is_some() {
+        std::fs::create_dir_all(&mdkb_dir)?;
+    }
     if !mdkb_dir.is_dir() {
         return Err(ErrorKind::DatabaseNotFound {
             path: mdkb_dir.join("index.sqlite"),
@@ -261,6 +287,39 @@ mod tests {
             try_acquire_live_exclusive(&db).unwrap().is_some(),
             "with the last holder gone the files can be renamed"
         );
+    }
+
+    #[test]
+    fn contention_is_recognised_by_the_platform_code_not_by_one_os_error_kind() {
+        // Issue #5: on Windows `fs4` reports a held lock with
+        // ERROR_LOCK_VIOLATION (os error 33), which Rust does not map to
+        // `ErrorKind::WouldBlock`. The probe therefore read "someone is
+        // connected" as a hard I/O error, and heal/quarantine/salvage reported
+        // failure instead of leaving the files in place — 0 entries recovered
+        // in one salvage run. Asking `fs4` for the platform's own contention
+        // error makes this assertion true on every platform, including the one
+        // it was broken on.
+        assert!(
+            is_lock_contention(&fs4::lock_contended_error()),
+            "the platform's own contention error must classify as contention"
+        );
+    }
+
+    #[test]
+    fn a_real_io_failure_is_not_mistaken_for_contention() {
+        // The other half: widening the classifier must not swallow genuine
+        // failures, or a broken lock file would read as "a connection is live"
+        // forever and recovery would never run.
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidInput,
+        ] {
+            assert!(
+                !is_lock_contention(&std::io::Error::from(kind)),
+                "{kind:?} is a failure to lock, not a contended lock"
+            );
+        }
     }
 
     #[test]

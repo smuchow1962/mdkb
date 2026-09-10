@@ -45,7 +45,72 @@ pub const HOOK_SOCKET_NAME: &str = "daemon-hook.sock";
 /// Max time to wait for in-flight connection tasks to finish on shutdown before
 /// giving up and unlinking sockets. Bounds how long SIGTERM takes while still
 /// letting a mid-flight SQLite write complete instead of being hard-aborted.
+///
+/// This is a courtesy grace for *sockets*, not for work: an MCP client keeps its
+/// connection open for a whole Claude session, so this timeout is normally
+/// reached rather than beaten. Work is drained before it, under
+/// [`WORK_DRAIN_GRACE`].
 const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Max time to wait for hook requests that are already executing.
+///
+/// `mdkb update` on a large repository legitimately runs for minutes, and the
+/// CLI that asked for it budgets an hour (`cli::hook_client::MUTATION_TIMEOUT`).
+/// Draining it under [`SHUTDOWN_DRAIN_GRACE`] cut it off after five seconds and
+/// reported a failed mutation for a write the daemon then finished anyway while
+/// the runtime dropped its blocking pool — the client saw `early eof`, the index
+/// was updated. Ten minutes covers the work while staying under the caller's own
+/// deadline. An operator who will not wait sends a second signal, which exits
+/// the process outright (see `main::ShutdownSignals`) — stopping the wait alone
+/// would not, because the runtime still owns the blocking write.
+const WORK_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Marks the window during which a hook request is executing.
+///
+/// Every dispatched request holds it shared; shutdown takes it exclusively,
+/// which resolves exactly when no handler is mid-flight. That distinction is the
+/// whole point: a hook connection idling between messages must not delay
+/// shutdown, and a `cli.mutate` halfway through rewriting the index must not be
+/// cut off by the grace period sized for idle sockets.
+#[derive(Debug, Default)]
+struct WorkGate(tokio::sync::RwLock<()>);
+
+impl WorkGate {
+    /// Hold the gate for as long as the returned guard lives.
+    async fn enter(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.0.read().await
+    }
+
+    /// Resolve once every holder has released it. Tokio's `RwLock` is
+    /// write-preferring, so a steady stream of new requests cannot starve this.
+    async fn quiesced(&self) {
+        let _exclusive = self.0.write().await;
+    }
+}
+
+/// How [`drain_in_flight_work`] stopped waiting.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainOutcome {
+    /// No handler is executing any more.
+    Quiesced,
+    /// The grace period elapsed with work still running.
+    TimedOut,
+}
+
+/// Wait for executing hook requests to finish, bounded by `grace`.
+///
+/// There is deliberately no in-band cancel here. Returning early would not end
+/// the process: `Runtime::drop` waits for `spawn_blocking` work that has already
+/// started, and that work — the document update inside `update_impl` — is
+/// exactly what a long drain is waiting for. An operator who will not wait is
+/// served by `main`, which exits the process outright on a second signal.
+async fn drain_in_flight_work(gate: &WorkGate, grace: std::time::Duration) -> DrainOutcome {
+    tokio::select! {
+        biased;
+        () = gate.quiesced() => DrainOutcome::Quiesced,
+        () = tokio::time::sleep(grace) => DrainOutcome::TimedOut,
+    }
+}
 
 /// Errors raised while serving IPC.
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +183,10 @@ pub async fn serve(
     // the runtime tears down (ARCH-F1).
     let conn_tracker = TaskTracker::new();
 
+    // Requests that are executing are drained separately from the connections
+    // carrying them, on a budget sized for the work rather than for the socket.
+    let work_gate = Arc::new(WorkGate::default());
+
     let mcp_shutdown = shutdown.clone();
     let mcp_registry = Arc::clone(&registry);
     let mcp_task = tokio::spawn(mcp_accept_loop(
@@ -135,6 +204,7 @@ pub async fn serve(
         Arc::clone(&dctx),
         MAX_HOOK_CONNECTIONS,
         conn_tracker.clone(),
+        Arc::clone(&work_gate),
     ));
 
     shutdown.cancelled().await;
@@ -143,6 +213,19 @@ pub async fn serve(
     // Stop the accept loops first so no new connections are registered.
     let _ = mcp_task.await;
     let _ = hook_task.await;
+
+    // Let requests that already started finish before the socket-level drain:
+    // the two need different budgets and the connection tracker cannot tell an
+    // executing `cli.mutate` apart from a socket idling between messages.
+    match drain_in_flight_work(&work_gate, WORK_DRAIN_GRACE).await {
+        DrainOutcome::Quiesced => {}
+        DrainOutcome::TimedOut => {
+            tracing::warn!(
+                "ipc: request(s) still executing after {}s; abandoning them",
+                WORK_DRAIN_GRACE.as_secs(),
+            );
+        }
+    }
 
     // Drain in-flight connection tasks with a bounded grace period.
     conn_tracker.close();
@@ -158,9 +241,15 @@ pub async fn serve(
     }
 
     tracing::info!("ipc: unlinking sockets");
-    let _ = std::fs::remove_file(&mcp_path);
-    let _ = std::fs::remove_file(&hook_path);
+    unlink_sockets(base_dir);
     Ok(())
+}
+
+/// Remove both socket files. Idempotent, and safe to call from a shutdown path
+/// that is about to end the process rather than let `serve` return.
+pub fn unlink_sockets(base_dir: &Path) {
+    let _ = std::fs::remove_file(base_dir.join(MCP_SOCKET_NAME));
+    let _ = std::fs::remove_file(base_dir.join(HOOK_SOCKET_NAME));
 }
 
 /// Create `base_dir` if it does not exist, then enforce mode `0700`.
@@ -298,6 +387,7 @@ async fn hook_accept_loop(
     dctx: Arc<DispatchContext>,
     max_connections: usize,
     conn_tracker: TaskTracker,
+    work_gate: Arc<WorkGate>,
 ) {
     let semaphore = Arc::new(Semaphore::new(max_connections));
     loop {
@@ -310,9 +400,10 @@ async fn hook_accept_loop(
                     };
                     let registry = Arc::clone(&registry);
                     let dctx = Arc::clone(&dctx);
+                    let work_gate = Arc::clone(&work_gate);
                     // Registered in the tracker so shutdown can drain it.
                     conn_tracker.spawn(async move {
-                        handle_hook_conn(stream, registry, dctx).await;
+                        handle_hook_conn(stream, registry, dctx, work_gate).await;
                         drop(permit);
                     });
                 }
@@ -328,6 +419,7 @@ async fn handle_hook_conn(
     mut stream: UnixStream,
     registry: Arc<RepoRegistry>,
     dctx: Arc<DispatchContext>,
+    work_gate: Arc<WorkGate>,
 ) {
     loop {
         let mut hdr = [0u8; 4];
@@ -345,6 +437,11 @@ async fn handle_hook_conn(
             return;
         }
 
+        // Held from here until the reply is on the wire. A mutation the daemon
+        // completed but never answered is indistinguishable, to the client, from
+        // one that never ran — so shutdown has to wait for the answer too, not
+        // just for the write.
+        let executing = work_gate.enter().await;
         let response = dispatch_hook_message(&body, &registry, &dctx).await;
         let resp_bytes = response.as_bytes();
         let Ok(resp_len_u32) = u32::try_from(resp_bytes.len()) else {
@@ -360,6 +457,7 @@ async fn handle_hook_conn(
         if stream.write_all(resp_bytes).await.is_err() {
             return;
         }
+        drop(executing);
     }
 }
 
@@ -677,6 +775,81 @@ mod tests {
         );
     }
 
+    /// The bug behind issue #10: a `cli.mutate` that runs for minutes was drained
+    /// under the five-second grace meant for idle sockets. The CLI reported a
+    /// failed mutation while the daemon finished the write anyway as its runtime
+    /// dropped. The work drain must wait for the handler, not for a clock.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_a_request_that_outlives_the_socket_grace() {
+        let gate = Arc::new(WorkGate::default());
+        let executing = gate.enter().await;
+
+        let drain = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                drain_in_flight_work(&gate, WORK_DRAIN_GRACE).await
+            })
+        };
+
+        // Well past the socket grace, the drain is still holding on for the
+        // handler — which is exactly what the five-second version failed to do.
+        tokio::time::sleep(SHUTDOWN_DRAIN_GRACE * 10).await;
+        assert!(
+            !drain.is_finished(),
+            "drain gave up on an executing request within the socket grace"
+        );
+
+        drop(executing);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("drain did not finish after the request returned")
+            .unwrap();
+        assert_eq!(outcome, DrainOutcome::Quiesced);
+    }
+
+    /// Unlinking must not depend on `serve` returning: the second-signal path in
+    /// `main` exits the process instead of unwinding through here, and still has
+    /// to leave the directory without stale sockets.
+    #[tokio::test]
+    async fn unlink_sockets_clears_both_paths_and_tolerates_their_absence() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        let mcp = base.join(MCP_SOCKET_NAME);
+        let hook = base.join(HOOK_SOCKET_NAME);
+        let _mcp_listener = UnixListener::bind(&mcp).unwrap();
+        let _hook_listener = UnixListener::bind(&hook).unwrap();
+
+        unlink_sockets(base);
+        assert!(!mcp.exists() && !hook.exists());
+
+        // Idempotent: shutdown may run it after `serve` already did.
+        unlink_sockets(base);
+    }
+
+    /// With nothing executing, shutdown must not pay the work grace at all.
+    #[tokio::test]
+    async fn an_idle_daemon_drains_immediately() {
+        let gate = WorkGate::default();
+        let outcome =
+            drain_in_flight_work(&gate, WORK_DRAIN_GRACE).await;
+        assert_eq!(outcome, DrainOutcome::Quiesced);
+    }
+
+    /// The grace is an upper bound, not a suggestion: a handler that never
+    /// returns must not keep the daemon alive forever.
+    #[tokio::test]
+    async fn a_handler_that_never_returns_is_abandoned_at_the_grace() {
+        let gate = WorkGate::default();
+        let _executing = gate.enter().await;
+
+        let outcome = drain_in_flight_work(
+            &gate,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome, DrainOutcome::TimedOut);
+    }
+
     #[tokio::test]
     async fn ping_dispatch_returns_pong() {
         let body = br#"{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}"#;
@@ -961,7 +1134,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_hook_conn(stream, registry, dctx).await;
+            handle_hook_conn(stream, registry, dctx, Arc::new(WorkGate::default())).await;
         });
 
         let mut client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();

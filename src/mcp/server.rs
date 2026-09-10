@@ -1269,6 +1269,19 @@ impl ChangeRoutes {
     }
 }
 
+/// The projection directory the watcher reconciles for `root` in `namespace`.
+///
+/// Derived the same way `Context` derives its store, so the directory the
+/// watcher routes to reconciliation is the one the context actually projects
+/// into. Resolving it from the default store root would have the watcher of a
+/// namespaced session reconcile the default store's files into the namespaced
+/// index, and ignore every edit under its own.
+fn watched_memory_entries_dir(root: &Path, namespace: Option<&str>) -> PathBuf {
+    crate::store::namespace::store_dir_for(root, namespace)
+        .join("memory")
+        .join("entries")
+}
+
 fn classify_change(
     path: &Path,
     collection_paths: &[PathBuf],
@@ -1393,8 +1406,10 @@ pub async fn run_file_watcher_inner(
     // Build exclude matcher for code changes (node_modules, dist, target, etc.)
     let code_excludes = build_code_excludes(&root, &code_ignore_patterns);
 
-    // The memory projection this watcher reconciles, `.mdkb/memory/entries/`.
-    let memory_entries_dir = root.join(".mdkb/memory/entries");
+    // The memory projection this watcher reconciles: `memory/entries/` of the
+    // store `ctx` opened, which in a namespace is `.mdkb/namespaces/<name>/`.
+    let memory_entries_dir =
+        watched_memory_entries_dir(&root, crate::store::namespace::active()?.as_deref());
 
     // Watch root recursively — it covers code, collections inside root, AND the
     // memory entry projection. This registration must NOT be gated on any one
@@ -1936,7 +1951,17 @@ const OOD_SCORE_THRESHOLD: f64 = 0.3;
 ///
 /// Returns `None` when results are strong enough to be useful.
 /// Returns a hint string when results are absent or weak — to be appended to output.
-pub(super) fn ood_hint(result_count: usize, top_score: Option<f64>) -> Option<&'static str> {
+pub(super) fn ood_hint(
+    query: &str,
+    result_count: usize,
+    top_score: Option<f64>,
+) -> Option<&'static str> {
+    // An empty query returns no rows by contract (it carries no term to match),
+    // so it lands here — where the generic advice is worse than none: it sends
+    // the caller to Grep for a query it never supplied.
+    if query.trim().is_empty() {
+        return Some("\n> The query is empty. Pass search terms — an empty query matches nothing.");
+    }
     if result_count == 0 {
         return Some(
             "\n> No results. mdkb is semantic search — it won't match literal strings. \
@@ -2189,9 +2214,27 @@ mod tests {
 
     #[test]
     fn test_ood_hint_zero_results() {
-        let hint = ood_hint(0, None);
+        let hint = ood_hint("rust async runtime", 0, None);
         assert!(hint.is_some());
         assert!(hint.unwrap().contains("No results"));
+    }
+
+    /// An empty query returns no rows by contract (issue #9), so it reaches the
+    /// zero-results branch — where the standard advice is actively wrong: it
+    /// tells the caller to reach for Grep over a query it never supplied.
+    #[test]
+    fn an_empty_query_is_named_as_such_instead_of_being_blamed_on_semantic_search() {
+        for query in ["", "   ", "\t\n"] {
+            let hint = ood_hint(query, 0, None).expect("an empty query must be reported");
+            assert!(
+                hint.contains("query is empty"),
+                "expected the empty-query hint for {query:?}, got: {hint}"
+            );
+            assert!(
+                !hint.contains("Grep"),
+                "an empty query must not be blamed on literal-string matching: {hint}"
+            );
+        }
     }
 
     #[test]
@@ -2225,13 +2268,13 @@ mod tests {
     #[test]
     fn test_ood_hint_zero_results_with_score() {
         // score is irrelevant when count is 0
-        let hint = ood_hint(0, Some(0.9));
+        let hint = ood_hint("rust async runtime", 0, Some(0.9));
         assert!(hint.is_some());
     }
 
     #[test]
     fn test_ood_hint_low_score() {
-        let hint = ood_hint(3, Some(0.1));
+        let hint = ood_hint("rust async runtime", 3, Some(0.1));
         assert!(hint.is_some());
         assert!(hint.unwrap().contains("Low-confidence"));
     }
@@ -2239,26 +2282,26 @@ mod tests {
     #[test]
     fn test_ood_hint_score_at_threshold_is_low() {
         // score exactly at threshold (< 0.3) → hint
-        let hint = ood_hint(1, Some(0.29));
+        let hint = ood_hint("rust async runtime", 1, Some(0.29));
         assert!(hint.is_some());
     }
 
     #[test]
     fn test_ood_hint_score_above_threshold_no_hint() {
-        let hint = ood_hint(3, Some(0.5));
+        let hint = ood_hint("rust async runtime", 3, Some(0.5));
         assert!(hint.is_none());
     }
 
     #[test]
     fn test_ood_hint_good_results_no_hint() {
-        let hint = ood_hint(5, Some(0.85));
+        let hint = ood_hint("rust async runtime", 5, Some(0.85));
         assert!(hint.is_none());
     }
 
     #[test]
     fn test_ood_hint_results_no_score_no_hint() {
         // memory search passes None score — only triggers on zero count
-        let hint = ood_hint(2, None);
+        let hint = ood_hint("rust async runtime", 2, None);
         assert!(hint.is_none());
     }
 
@@ -3848,6 +3891,40 @@ if (require.main === module) {
                 noisy.display()
             );
         }
+    }
+
+    /// The watcher reconciles the projection of the store it opened. In a
+    /// namespace that store is `.mdkb/namespaces/<name>/`, so a file landing
+    /// there must route to reconciliation and a file in the DEFAULT store's
+    /// projection must not: reconciling the wrong directory would import the
+    /// default store's entries into the namespaced index — or, from the other
+    /// side, silently ignore every edit to the namespaced projection.
+    #[test]
+    fn watched_memory_entries_dir_follows_the_namespace() {
+        let root = Path::new("/project");
+        let collections: Vec<PathBuf> = vec![];
+        let excludes = build_code_excludes(root, &[]);
+
+        assert_eq!(
+            watched_memory_entries_dir(root, None),
+            Path::new("/project/.mdkb/memory/entries")
+        );
+        let namespaced = watched_memory_entries_dir(root, Some("test"));
+        assert_eq!(
+            namespaced,
+            Path::new("/project/.mdkb/namespaces/test/memory/entries")
+        );
+
+        let in_namespace = Path::new("/project/.mdkb/namespaces/test/memory/entries/x.md");
+        let in_default = Path::new("/project/.mdkb/memory/entries/x.md");
+        assert!(
+            classify_change(in_namespace, &collections, &excludes, &namespaced).memory,
+            "a projected entry in the namespaced store must trigger reconciliation"
+        );
+        assert!(
+            !classify_change(in_default, &collections, &excludes, &namespaced).memory,
+            "the default store's projection is not this watcher's to reconcile"
+        );
     }
 
     #[test]

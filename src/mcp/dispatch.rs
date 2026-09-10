@@ -1258,7 +1258,7 @@ pub async fn search_impl(
 
             let top_score = results.first().map(|r| r.score);
             let mut output = format_search_results(&results, limit);
-            if let Some(hint) = ood_hint(results.len(), top_score) {
+            if let Some(hint) = ood_hint(&params.query, results.len(), top_score) {
                 output.push_str(hint);
             }
             crate::core::run_guarded_read(&mut ctx_guard, "empty-index hint", |ctx| {
@@ -1286,7 +1286,7 @@ pub async fn search_impl(
             let entries = apply_min_confidence(entries, params.min_confidence);
 
             let mut output = format_memory_search_results(&entries);
-            if let Some(hint) = ood_hint(entries.len(), None) {
+            if let Some(hint) = ood_hint(&params.query, entries.len(), None) {
                 output.push_str(hint);
             }
             crate::core::run_guarded_read(&mut ctx_guard, "empty-index hint", |ctx| {
@@ -1340,7 +1340,7 @@ pub async fn search_impl(
                 }
                 s
             };
-            if let Some(hint) = ood_hint(total, top_score) {
+            if let Some(hint) = ood_hint(&params.query, total, top_score) {
                 output.push_str(hint);
             }
             crate::core::run_guarded_read(&mut ctx_guard, "empty-index hint", |ctx| {
@@ -2973,10 +2973,11 @@ fn rank_warmup_entries(
     now: i64,
     scope: Option<&str>,
 ) -> Vec<crate::store::memory::MemoryEntry> {
-    // Handoffs never appear here: the newest one is injected in full as a body
-    // block by hook_session_start_impl, and the caller strips all handoffs before
-    // ranking. This operates purely on topic/problem/decision/reminder/prior
-    // entries, so a truncated handoff title-line can never crowd the list.
+    // Handoffs never appear here: the pool query admits only durable types and
+    // priors, the newest handoff is injected in full as a body block by
+    // hook_session_start_impl, and the caller strips all handoffs before
+    // ranking. This operates purely on topic/problem/decision/prior entries,
+    // so a truncated handoff title-line can never crowd the list.
     if min_confidence > 0.0 {
         entries.retain(|e| e.confidence_at(now) >= min_confidence);
     }

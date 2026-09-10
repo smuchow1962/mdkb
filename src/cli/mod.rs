@@ -2,7 +2,8 @@
 
 pub mod daemon;
 pub mod handlers;
-#[cfg(unix)]
+// Portable: only the daemon socket transport inside is unix-gated. Hooks run
+// their work in-process everywhere else (issue #7).
 pub mod hook_client;
 pub mod hook_logic;
 pub mod journal;
@@ -592,6 +593,23 @@ pub enum CollectionCommand {
         pattern: String,
     },
 
+    /// Change a collection's path or pattern in place, without dropping it
+    Update {
+        /// Collection name
+        name: String,
+
+        /// New glob pattern for files (unchanged when omitted). Documents that
+        /// still match keep their index entry and embedding.
+        #[arg(short, long)]
+        pattern: Option<String>,
+
+        /// New path to directory (unchanged when omitted). Document paths are
+        /// stored against the old base, so the next `update` re-indexes and
+        /// re-embeds the collection's contents.
+        #[arg(long)]
+        path: Option<String>,
+    },
+
     /// Remove a collection
     Remove {
         /// Collection name
@@ -830,13 +848,15 @@ pub enum MemoryCommand {
         skip_duplicates: bool,
     },
 
-    /// Archive unused memory entries
+    /// Archive expired entries and aged lifecycle entries (reminder, prior, handoff)
     Prune {
-        /// Days since last access to consider entry stale (default: 90)
+        /// Age in days after which an unread reminder, prior or handoff is archived.
+        /// Topics, problems and decisions are never archived for age: only their
+        /// --ttl retires them (default: 90)
         #[arg(short, long, default_value = "90")]
         days: u32,
 
-        /// Show what would be pruned without making changes
+        /// List exactly what would be archived without archiving anything
         #[arg(long)]
         dry_run: bool,
     },

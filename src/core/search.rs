@@ -27,6 +27,13 @@ pub fn hybrid_search_fts(
     collection: Option<&str>,
     include_superseded: bool,
 ) -> Result<Vec<SearchResult>> {
+    // An empty expression is not a query, so neither leg runs: the vector leg
+    // would otherwise rank the whole corpus against the embedding of an empty
+    // string and return arbitrary documents.
+    if search::fts_query_is_empty(fts_query) {
+        return Ok(Vec::new());
+    }
+
     // Get BM25 results
     let bm25_query = SearchQuery {
         text: String::new(), // ignored: `fts_query` is already escaped

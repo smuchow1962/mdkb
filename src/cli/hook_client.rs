@@ -18,33 +18,48 @@
 //! `MDKB_NO_DAEMON=1` requests an in-process dispatch that opens an ephemeral
 //! `RepoRegistry` and calls `dispatch_call` directly. Project policy still wins:
 //! `[hooks] daemon_required = true` refuses that fallback.
+//!
+//! Off Unix there is no daemon socket to talk to, so every call takes that same
+//! in-process route unconditionally. The dispatch layer is portable — only the
+//! transport below is not — so a hook on Windows does the work rather than
+//! refusing it (issue #7). Refusing broke the contract this file opens with:
+//! hosts surface a nonzero hook exit on every session start, prompt and tool
+//! call.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64};
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde_json::{Value, json};
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 use crate::DaemonConfig;
+#[cfg(unix)]
 use crate::daemon::ipc_server::DISPATCHED_ERROR_CODE;
 use crate::daemon::registry::RepoRegistry;
+#[cfg(unix)]
 use crate::daemon::spawn::ensure_daemon_running;
 use crate::error::Result;
 use crate::mcp::dispatch::{DispatchContext, dispatch_call};
 use crate::metrics::UsageMetrics;
 
 /// Hook socket filename, relative to the daemon base dir.
+#[cfg(unix)]
 const HOOK_SOCKET_NAME: &str = "daemon-hook.sock";
 
 /// Upper bound on a single JSON-RPC message. Matches the daemon side so
 /// oversized payloads fail fast with a clear error instead of hanging.
+#[cfg(unix)]
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Per-call socket I/O timeout. Generous; the daemon should answer in
 /// single-digit ms. A timeout here means the daemon hung.
+#[cfg(unix)]
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for a routed mutation to come back.
@@ -55,6 +70,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// rather than a tuned figure: `mdkb update` on a large store walks the tree,
 /// embeds through ONNX and reindexes the whole code graph, and guessing low
 /// costs a spurious failure on exactly the command that most needs to finish.
+#[cfg(unix)]
 const MUTATION_TIMEOUT: Duration = Duration::from_hours(1);
 
 // ── Public entry points ──────────────────────────────────────────────────────
@@ -190,6 +206,7 @@ pub fn resolve_hook_root(event: &Value, explicit: Option<PathBuf>) -> Option<Pat
     resolve_root(None)
 }
 
+#[cfg(unix)]
 fn hook_socket_path() -> PathBuf {
     // Hook socket always lives beside daemon.sock under ~/.mdkb — see
     // `daemon::ipc_server::serve(base_dir = lock.parent())` and
@@ -200,15 +217,21 @@ fn hook_socket_path() -> PathBuf {
 
 // ── Per-event hook timeouts (daemon must answer within these) ────────────────
 
+#[cfg(unix)]
 const HOOK_TIMEOUT_SESSION_START: Duration = Duration::from_secs(2);
+#[cfg(unix)]
 const HOOK_TIMEOUT_USER_PROMPT_SUBMIT: Duration = Duration::from_secs(1);
+#[cfg(unix)]
 const HOOK_TIMEOUT_POST_TOOL_USE: Duration = Duration::from_millis(500);
+#[cfg(unix)]
 const HOOK_TIMEOUT_PRE_TOOL_USE: Duration = Duration::from_millis(300);
 // Stop returns immediately: distillation is spawned as a detached background
 // task in the daemon, so the socket only has to cover the enqueue.
+#[cfg(unix)]
 const HOOK_TIMEOUT_STOP: Duration = Duration::from_millis(500);
 
 /// Return the per-event socket timeout for a hook method.
+#[cfg(unix)]
 fn hook_timeout(method: &str) -> Duration {
     match method {
         "hook.session_start" => HOOK_TIMEOUT_SESSION_START,
@@ -239,19 +262,26 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
     params["root"] = json!(root.display().to_string());
     let daemon_required = hook_requires_daemon(&root);
 
-    if std::env::var_os("MDKB_NO_DAEMON").is_some() {
+    if !daemon_is_reachable_here() {
+        // No socket to reach: off Unix there is no daemon at all, and
+        // `MDKB_NO_DAEMON` asks for the same route. Project policy still wins —
+        // a repo that declares `daemon_required` gets a skip, not an unpoliced
+        // writer.
         if daemon_required {
-            tracing::warn!(
-                "hook {method}: MDKB_NO_DAEMON ignored because hooks.daemon_required is true"
-            );
+            tracing::warn!("hook {method}: {DAEMON_REQUIRED_BUT_ABSENT}; skipping");
             return Ok(());
         }
         return run_hook_in_process(method, params, &root).await;
     }
 
-    let socket_path = hook_socket_path();
-    let timeout = hook_timeout(method);
-    match call_daemon_phased(&socket_path, method, &params, timeout).await {
+    // Off Unix `daemon_is_reachable_here` is const-false, so this whole block is
+    // unreachable and compiled out. It must not be an `unreachable!()` tail: a
+    // panic is the one exit code this function's contract forbids, so the shape
+    // that cannot panic is the only correct one here.
+    #[cfg(unix)]
+    return match call_daemon_phased(&hook_socket_path(), method, &params, hook_timeout(method))
+        .await
+    {
         Ok(response) => {
             emit_hook_response(&response);
             Ok(())
@@ -275,7 +305,40 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
             );
             Ok(())
         }
-    }
+    };
+
+    // Not reached: the early return above covers every off-Unix call.
+    #[cfg(not(unix))]
+    Ok(())
+}
+
+/// Why a `daemon_required` repo is being skipped rather than served in-process.
+const DAEMON_REQUIRED_BUT_ABSENT: &str = if cfg!(unix) {
+    "MDKB_NO_DAEMON ignored because hooks.daemon_required is true"
+} else {
+    "hooks.daemon_required is true, but this platform has no daemon"
+};
+
+/// Whether a daemon route exists for this process at all.
+///
+/// False off Unix — there is no socket to bind, let alone connect to — and
+/// false anywhere `MDKB_NO_DAEMON` asks for the in-process route. Both answers
+/// send the caller down the same path, so they are one question.
+fn daemon_is_reachable_here() -> bool {
+    daemon_route_available(
+        cfg!(unix),
+        !crate::core::routing::daemon_serves_this_process(),
+    )
+}
+
+/// The rule behind [`daemon_is_reachable_here`], as a pure function.
+///
+/// Split out for the same reason `resolve_mcp_run_mode` is: the daemon is
+/// unix-only, but the rule for reaching it is portable, so every platform's CI
+/// executes the whole truth table — including the rows its own platform never
+/// takes.
+fn daemon_route_available(platform_has_daemon: bool, no_daemon_env: bool) -> bool {
+    platform_has_daemon && !no_daemon_env
 }
 
 /// Whether project policy forbids an in-process hook fallback.
@@ -344,12 +407,12 @@ async fn run(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<(
     };
     params["root"] = json!(root.display().to_string());
 
-    if std::env::var_os("MDKB_NO_DAEMON").is_some() {
+    if !daemon_is_reachable_here() {
         return run_in_process(method, params, &root).await;
     }
 
-    let socket_path = hook_socket_path();
-    match call_daemon(&socket_path, method, &params).await {
+    #[cfg(unix)]
+    match call_daemon(&hook_socket_path(), method, &params).await {
         Ok(response) => print_tool_text(method, &response),
         Err(e) => eprintln!("mdkb hook {method}: {e}"),
     }
@@ -397,6 +460,7 @@ pub fn print_tool_text(method: &str, result: &Value) {
 ///
 /// Returns `Err` for transport failures and for JSON-RPC `error` envelopes;
 /// the caller is expected to log and swallow both.
+#[cfg(unix)]
 async fn call_daemon(
     socket_path: &Path,
     method: &str,
@@ -407,6 +471,7 @@ async fn call_daemon(
 
 /// [`call_daemon_phased`] flattened to one error string for non-hook RPC callers
 /// that do not perform an in-process fallback.
+#[cfg(unix)]
 async fn call_daemon_with_timeout(
     socket_path: &Path,
     method: &str,
@@ -428,6 +493,7 @@ async fn call_daemon_with_timeout(
 /// (`daemon::ipc_server::handle_hook_conn`), so a frame that was cut short can
 /// never have started a mutation: the peer is still blocked in `read_exact`
 /// and aborts when this side drops the stream.
+#[cfg(unix)]
 async fn send_request(
     stream: &mut UnixStream,
     body: &[u8],
@@ -442,6 +508,7 @@ async fn send_request(
 }
 
 /// Read one length-prefixed frame back.
+#[cfg(unix)]
 async fn read_response(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr).await?;
@@ -470,6 +537,7 @@ async fn read_response(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
 /// only a means of answering the one question that matters: can the daemon have
 /// started writing?
 #[derive(Debug)]
+#[cfg(unix)]
 pub enum MutationFailure {
     /// The daemon provably did not run it — the request never got there, or it
     /// arrived and was refused before dispatch. Running in-process is safe, and
@@ -484,6 +552,7 @@ pub enum MutationFailure {
     Undetermined(String),
 }
 
+#[cfg(unix)]
 impl std::fmt::Display for MutationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -498,6 +567,7 @@ impl std::fmt::Display for MutationFailure {
 /// Everything up to and including the last byte of the request is
 /// [`MutationFailure::Unstarted`]; after that only the daemon's own refusals
 /// are, and every remaining failure is [`MutationFailure::Undetermined`].
+#[cfg(unix)]
 async fn call_daemon_phased(
     socket_path: &Path,
     method: &str,
@@ -593,6 +663,7 @@ async fn call_daemon_phased(
 /// sized so an editor keystroke never stalls, and applying it to a write means
 /// abandoning `mdkb update` half a minute into a job that legitimately runs for
 /// many.
+#[cfg(unix)]
 pub async fn call_store_mutation(
     method: &str,
     params: Value,
@@ -606,6 +677,7 @@ pub async fn call_store_mutation(
 }
 
 /// Send the one typed internal CLI mutation request and decode its typed result.
+#[cfg(unix)]
 pub async fn call_cli_mutation(
     mutation: &crate::core::cli_mutation::CliMutation,
     root: &Path,
@@ -617,7 +689,43 @@ pub async fn call_cli_mutation(
         .map_err(|e| MutationFailure::Undetermined(format!("decode cli mutation result: {e}")))
 }
 
+/// Truth table for `daemon_route_available(platform_has_daemon, no_daemon_env)`.
+/// Portable on purpose: the rows a given platform never takes are still the
+/// rows a refactor is most likely to break.
 #[cfg(test)]
+mod routing_tests {
+    use super::daemon_route_available;
+
+    #[test]
+    fn the_daemon_route_needs_both_a_platform_and_permission() {
+        assert!(
+            daemon_route_available(true, false),
+            "unix without MDKB_NO_DAEMON is the only row that reaches the daemon"
+        );
+        assert!(
+            !daemon_route_available(true, true),
+            "MDKB_NO_DAEMON is the escape hatch: it must keep the daemon out of the path"
+        );
+    }
+
+    #[test]
+    fn a_platform_without_a_daemon_takes_the_in_process_route() {
+        // Issue #7: `mdkb hook session-start` used to exit 1 on Windows with
+        // "Hook commands require Unix domain sockets". Hosts surface a nonzero
+        // hook exit on every session start, prompt and tool call, so the
+        // wiring `mdkb setup hooks` writes failed on every event. There is no
+        // socket to reach off Unix, but the dispatch layer is portable, so the
+        // hook runs the work in-process — the same route MDKB_NO_DAEMON picks.
+        assert!(
+            !daemon_route_available(false, false),
+            "no daemon on this platform means no daemon route, whatever the env says"
+        );
+        assert!(!daemon_route_available(false, true));
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
