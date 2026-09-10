@@ -1455,6 +1455,11 @@ pub async fn search_impl(
                         Some(&ctx.conn),
                         &handle.config,
                         &crate::core::dup::DupOverrides {
+                            // No `semantic` field on the MCP schema: it would be
+                            // charged on every turn for an audit run rarely.
+                            // `threshold` is the opt-in, and it is the only
+                            // knob the pass has.
+                            semantic: false,
                             threshold: params.threshold,
                             min_nodes: None,
                             // An empty query sweeps the repository; `file` is what

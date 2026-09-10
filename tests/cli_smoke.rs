@@ -469,6 +469,63 @@ fn smoke_dup_since_rejects_an_option_like_ref() {
     );
 }
 
+/// The semantic pass is opt-in, and both switches that turn it on reach the
+/// handler.
+///
+/// `mdkb dup` used to load a 160M-parameter model on every run: measured on
+/// this repository the semantic half took 817 s of an 818 s run. It now runs
+/// only when `--semantic` or a `--threshold` override asks for it.
+///
+/// The model is made unreachable on purpose — an empty cache directory plus an
+/// endpoint on a closed port. A run that asks for the semantic pass then warns
+/// and degrades to the structural half; a run that does not ask stays silent.
+/// That warning is what separates the three cases here without downloading
+/// weights or reaching the network.
+#[test]
+fn smoke_dup_semantic_pass_is_opt_in() {
+    let repo = Repo::new();
+    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+
+    let cache_dir = repo.root.join("fastembed-empty");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let cache = cache_dir.to_str().unwrap();
+    let offline = [
+        ("FASTEMBED_CACHE_DIR", cache),
+        // fastembed prefers HF_HOME over the cache directory it is handed, so
+        // a developer with one exported would otherwise hit their real cache.
+        ("HF_HOME", cache),
+        ("HF_ENDPOINT", "http://127.0.0.1:1"),
+    ];
+    const REACHED_FOR_A_MODEL: &str = "duplication model unavailable";
+
+    let plain = run_env(&["dup"], &repo.root, &offline);
+    assert_ok(&plain, "dup");
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        !stderr.contains(REACHED_FOR_A_MODEL),
+        "a default run must not reach for a model: {stderr}"
+    );
+
+    for args in [
+        ["dup", "--semantic"].as_slice(),
+        ["dup", "--threshold", "0.8"].as_slice(),
+    ] {
+        let label = args.join(" ");
+        let out = run_env(args, &repo.root, &offline);
+        assert_ok(&out, &label);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(REACHED_FOR_A_MODEL),
+            "`mdkb {label}` must ask for the semantic pass: {stderr}"
+        );
+        let text = stdout(&out);
+        assert!(
+            text.starts_with("# Duplication"),
+            "and must still report: {text}"
+        );
+    }
+}
+
 /// `mdkb coupling` before anyone ran `mdkb code index`.
 ///
 /// Same contract as `dup`: nothing to correlate is not a failure. The tempdir

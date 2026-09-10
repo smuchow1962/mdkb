@@ -416,6 +416,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Dup {
+            semantic,
             threshold,
             min_nodes,
             file,
@@ -430,6 +431,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 Some(&ctx.conn),
                 &ctx.config_path,
                 &mdkb::core::dup::DupOverrides {
+                    semantic,
                     threshold,
                     min_nodes,
                     file,
@@ -1176,6 +1178,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} code search <query>                                # fuzzy symbol search
 {0} code find <name>                                   # exact symbol lookup; --kind and --file narrow it
 {0} code info                                          # code index counts
+
+# Audits (both read the code index)
+{0} dup                                                # duplication sweep; structural pass only, no model
+{0} dup --semantic                                     # add the embedding pass: minutes, not seconds ([code.duplication] semantic = true makes it standing)
+{0} dup --since HEAD                                   # review mode: only clusters the change touched
+{0} coupling                                           # files that change together without referencing each other
 
 # Knowledge graph (frontmatter + wikilink edges; refs accept collection-prefixed paths)
 {0} graph links <entity>                               # outgoing edges (endpoints shown as paths, with 'via' relation)

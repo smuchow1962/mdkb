@@ -80,7 +80,11 @@ pub enum Command {
 
     /// Report duplicated code
     Dup {
-        /// Cosine floor for the semantic pass. Omit to use code.duplication.similarity_threshold
+        /// Also run the semantic pass: loads a model, costs minutes on a large repository. Off unless asked for
+        #[arg(long)]
+        semantic: bool,
+
+        /// Cosine floor for the semantic pass, which it also enables. Omit to use code.duplication.similarity_threshold
         #[arg(long)]
         threshold: Option<f32>,
 

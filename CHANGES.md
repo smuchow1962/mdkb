@@ -149,6 +149,19 @@ by a session on the host that reported them.
   wrong two times in three. It orders by bucket first now, then the same
   spread-before-reach tie-breakers, so a single-module 0-bit finding outranks
   a twelve-module 6-bit one instead of losing to it.
+- **The semantic pass is opt-in: `mdkb dup --semantic`.** `dup` runs a
+  structural pass over fingerprints and a semantic pass that embeds every
+  body. On this repository the second one took **817 s of an 818 s run** to
+  add 69 of 767 clusters — 4% of the findings for 99.8% of the time. It is now
+  off unless asked for: `--semantic` or any `--threshold` override turns it on
+  for one run, and `semantic = true` under `[code.duplication]` is the standing
+  opt-in (the key was `enabled` earlier in this cycle, and never shipped under
+  that name). Over MCP there is no new field — passing `threshold` to
+  `search(scope="duplicates")` is the opt-in, which is what the parameter's
+  schema now says. A default `dup` never constructs the embedder at all, so a
+  machine with no model on disk and no network gets the structural report in
+  seconds instead of a download; a model that is configured but will not load
+  still degrades the run rather than failing it.
 - **Thirteen language parsers share one parse-and-collect helper, and their
   walks are data.** `mdkb dup` found the same four lines — parse, bail quietly
   on unreadable source, allocate, hand over the root — written out 50 times.

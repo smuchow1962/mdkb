@@ -33,7 +33,7 @@ pub struct SearchParams {
     #[serde(default)]
     pub kind: Option<String>,
 
-    /// Minimum similarity score 0.0-1.0 when scope is "code" or "duplicates". Omit to use the configured threshold.
+    /// Minimum similarity score 0.0-1.0 when scope is "code" or "duplicates". Omit to use the configured threshold. For scope="duplicates" it also enables the semantic pass, which loads a model and takes minutes on a large repository — omit it for the fast structural sweep.
     #[serde(default)]
     pub threshold: Option<f32>,
 

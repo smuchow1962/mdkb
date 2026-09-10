@@ -19,10 +19,29 @@ use crate::error::{Error, Result};
 #[derive(Debug, Default, Clone)]
 pub struct DupOverrides {
     pub threshold: Option<f32>,
+    /// Ask for the semantic pass on this run alone.
+    pub semantic: bool,
     pub min_nodes: Option<u32>,
     pub file: Option<String>,
     /// Review mode: a git ref whose changed files the report is narrowed to.
     pub since: Option<String>,
+}
+
+/// Whether this run loads a model.
+///
+/// The pass costs about 2.4 CPU-seconds per body and produced 69 of 767
+/// clusters on the run that motivated this, so it is loaded only when asked
+/// for: `--semantic`, or a threshold override, which tunes the semantic pass
+/// and means nothing without it. Config `semantic = true` is the standing
+/// opt-in.
+///
+/// Pure so both surfaces decide identically and the decision can be tested
+/// without a model on disk.
+pub fn semantic_requested(
+    settings: &crate::config::CodeDuplicationConfig,
+    overrides: &DupOverrides,
+) -> bool {
+    settings.semantic || overrides.semantic || overrides.threshold.is_some()
 }
 
 /// The audit, ready to print.
@@ -128,7 +147,7 @@ pub fn handle_dup(
     // rather than failing it. That half needs no weights and, on a repository
     // of copy-paste, finds most of the answer — refusing to report anything
     // because a download failed would be the worse trade.
-    let embedder: Option<std::sync::Arc<_>> = if settings.enabled {
+    let embedder: Option<std::sync::Arc<_>> = if semantic_requested(settings, overrides) {
         match get_dup_embedder(&settings.model) {
             Ok(embedder) => Some(embedder),
             Err(e) => {
@@ -222,11 +241,39 @@ mod tests {
         drop(code);
     }
 
+    /// An index holding one function, and the file it was read from.
+    ///
+    /// Enough to get past `handle_dup`'s "nobody has indexed this" guard and
+    /// reach the point where it decides whether to build an embedder.
+    fn index_with_one_symbol(root: &Path) {
+        empty_index(root);
+        let body = "fn alpha_total(xs: &[i64]) -> i64 {\n    xs.iter().sum()\n}\n";
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), body).unwrap();
+
+        let code = Connection::open(root.join(".mdkb/code.sqlite")).unwrap();
+        code.execute(
+            "INSERT INTO code_files (id, path, rel_path, hash, language) \
+             VALUES (1, 'src/a.rs', 'src/a.rs', 'h', 'rust')",
+            [],
+        )
+        .unwrap();
+        code.execute(
+            "INSERT INTO code_symbols \
+             (id, name, kind, file_id, file_path, module_path, owner_name, visibility, line_start, line_end) \
+             VALUES (1, 'alpha_total', 'Function', 1, 'src/a.rs', 'alpha', NULL, 0, 1, 3)",
+            [],
+        )
+        .unwrap();
+    }
+
     /// No model: these fixtures have nothing worth embedding, and a unit test
-    /// must not reach the network to download weights.
+    /// must not reach the network to download weights. This is the default
+    /// now — the call stays so the intent is on the page rather than resting
+    /// on a default that could change.
     fn structural_only() -> Config {
         let mut config = Config::default();
-        config.code.duplication.enabled = false;
+        config.code.duplication.semantic = false;
         config
     }
 
@@ -289,12 +336,79 @@ mod tests {
         );
     }
 
+    /// The four ways the semantic pass can be asked for, and the one way it is
+    /// not. Pure, so this needs no model on disk — which is the point: the
+    /// decision to load one is made before anything touches the network.
+    #[test]
+    fn the_semantic_pass_is_off_unless_something_asks_for_it() {
+        let mut settings = crate::config::CodeDuplicationConfig::default();
+
+        assert!(
+            !semantic_requested(&settings, &DupOverrides::default()),
+            "a default run must not load a model"
+        );
+        assert!(
+            semantic_requested(
+                &settings,
+                &DupOverrides {
+                    semantic: true,
+                    ..Default::default()
+                }
+            ),
+            "--semantic asks for it"
+        );
+        assert!(
+            semantic_requested(
+                &settings,
+                &DupOverrides {
+                    threshold: Some(0.8),
+                    ..Default::default()
+                }
+            ),
+            "a threshold tunes the semantic pass, so it implies it"
+        );
+
+        settings.semantic = true;
+        assert!(
+            semantic_requested(&settings, &DupOverrides::default()),
+            "config semantic = true is the standing opt-in"
+        );
+    }
+
+    /// A default `mdkb dup` never constructs the embedder.
+    ///
+    /// The model name is one `fastembed_model` rejects outright, so building it
+    /// would fail without reaching the network. `handle_dup` swallows that
+    /// failure by design — it degrades to the structural half rather than
+    /// refusing to report — so the report alone cannot distinguish "never
+    /// loaded" from "tried and gave up". What it does prove is the guarantee a
+    /// caller has: the default path returns a complete structural report on a
+    /// store whose configured model could never load. The guard itself is
+    /// `semantic_requested`, tested exhaustively above, at its single call site.
+    #[test]
+    fn a_default_run_reports_even_when_the_configured_model_cannot_load() {
+        let root = tempfile::tempdir().unwrap();
+        index_with_one_symbol(root.path());
+
+        let mut config = Config::default();
+        config.code.duplication.model = "not-a-model-anyone-ships".to_string();
+        assert!(
+            !config.code.duplication.semantic,
+            "the default this test rests on"
+        );
+
+        let report = handle_dup(root.path(), None, &config, &DupOverrides::default())
+            .expect("a default run must not fail on a model it never loads");
+        assert!(report.indexed, "{}", report.markdown);
+    }
+
     #[test]
     fn command_line_options_win_over_the_configured_ones() {
         // Proven through the option struct the scan actually receives, rather
         // than by reading the report: the two numbers do not show up there.
         let settings = crate::config::CodeDuplicationConfig::default();
         let overrides = DupOverrides {
+            semantic: false,
             threshold: Some(0.9),
             min_nodes: Some(3),
             file: Some("src/a.rs".into()),

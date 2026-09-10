@@ -379,10 +379,20 @@ between them in the code graph.
 mdkb dup                          # sweep the repository
 mdkb dup --file src/code/parsing  # scope the candidates
 mdkb dup --since HEAD             # review mode: only clusters your change touched
+mdkb dup --semantic               # add the embedding pass (minutes, not seconds)
 mdkb coupling                     # 5+ shared commits over the last year
 mdkb coupling --since 6.months --min-cochanges 3
 mdkb dup --format json               # findings with their distance, for bucketing
 ```
+
+`dup` runs two passes. The structural one compares fingerprints, needs no
+model, and finishes in seconds. The semantic one embeds every body and is
+**off by default**: measured on this repository it took 817 s of an 818 s run
+to add 69 of 767 clusters. Turn it on for a single run with `--semantic` or
+any `--threshold` override, or standing with `semantic = true` under
+`[code.duplication]` in `.mdkb/config.toml`. Over MCP, passing `threshold` to
+`search(scope="duplicates")` is the opt-in. A model that will not load
+degrades the run to the structural pass rather than failing it.
 
 Read `dup` knowing where its signal is: the report says so itself. After the
 headline, a bucket table breaks the clusters down by structural distance

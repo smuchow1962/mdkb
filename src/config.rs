@@ -303,8 +303,14 @@ pub struct CodeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeDuplicationConfig {
-    /// Enable `mdkb dup`. Never runs during `mdkb index` either way.
-    pub enabled: bool,
+    /// Enable the semantic pass — the embedding half of `mdkb dup`, which
+    /// loads a model and costs roughly 2.4 CPU-seconds per body. The
+    /// structural pass runs either way and needs no weights; measured on this
+    /// repository the semantic half took 817 s of an 818 s run and found 69 of
+    /// 767 clusters. Off by default: `mdkb dup --semantic`, or a
+    /// `--threshold` override, turns it on for a single run, and this key is
+    /// the standing opt-in. Never runs during `mdkb index` either way.
+    pub semantic: bool,
 
     /// Embedding model for bodies. Must be one of the models the duplication
     /// pass supports; an unknown name is rejected at load rather than mid-run.
@@ -381,7 +387,7 @@ impl Default for CodeConfig {
 impl Default for CodeDuplicationConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            semantic: false,
             model: crate::code::duplication::embed::DEFAULT_DUP_MODEL.to_string(),
             similarity_threshold: DEFAULT_DUP_SIMILARITY_THRESHOLD,
             hamming_threshold: crate::code::duplication::body::SIMHASH_HAMMING_THRESHOLD,
@@ -1569,7 +1575,7 @@ threshold = 0.5
         let config = Config::default();
         let dup = &config.code.duplication;
 
-        assert!(dup.enabled);
+        assert!(!dup.semantic, "the semantic pass is opt-in");
         assert_eq!(dup.model, "JinaEmbeddingsV2BaseCode");
         assert!((dup.similarity_threshold - 0.70).abs() < f32::EPSILON);
         assert_eq!(dup.hamming_threshold, 6);

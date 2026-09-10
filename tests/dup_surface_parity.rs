@@ -79,7 +79,7 @@ impl Repo {
         run(&["init"], &root);
         std::fs::write(
             root.join(".mdkb/config.toml"),
-            "[code.duplication]\nenabled = false\n",
+            "[code.duplication]\nsemantic = false\n",
         )
         .expect("write config");
 
@@ -96,7 +96,7 @@ impl Repo {
     fn handle(&self) -> Arc<RepoHandle> {
         let config = Config::load_or_default(self.root.join(".mdkb/config.toml"));
         assert!(
-            !config.code.duplication.enabled,
+            !config.code.duplication.semantic,
             "the fixture must not reach for a model"
         );
         Arc::new(RepoHandle::from_shared(
