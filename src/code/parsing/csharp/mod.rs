@@ -958,7 +958,10 @@ class App {
             (s.kind, s.signature.as_deref().unwrap_or("").to_string())
         };
 
-        assert_eq!(of("Point"), (SymbolKind::Struct, "record struct Point".into()));
+        assert_eq!(
+            of("Point"),
+            (SymbolKind::Struct, "record struct Point".into())
+        );
         assert_eq!(
             of("Person"),
             (SymbolKind::Class, "record class Person".into())

@@ -1975,8 +1975,8 @@ export namespace Ext {}
         // than failing one file.
         let mut parser = TypeScriptParser::new().unwrap();
 
-        let chain = "a".to_string()
-            + &".b".repeat(crate::code::parsing::parser::MAX_AST_DEPTH * 40);
+        let chain =
+            "a".to_string() + &".b".repeat(crate::code::parsing::parser::MAX_AST_DEPTH * 40);
         let code = format!("function run() {{ {chain}.c(); }}");
 
         let calls = parser.find_calls_impl(&code);

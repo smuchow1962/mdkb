@@ -725,7 +725,13 @@ mod tests {
         );
 
         for member in [
-            "Box.plain", "Box.ptr", "Box.arr", "Box.cb", "Box.flag", "Box.a", "Box.b",
+            "Box.plain",
+            "Box.ptr",
+            "Box.arr",
+            "Box.cb",
+            "Box.flag",
+            "Box.a",
+            "Box.b",
         ] {
             assert!(
                 names.iter().any(|n| n == member),
