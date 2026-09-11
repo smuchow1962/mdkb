@@ -374,6 +374,12 @@ impl CodeDb {
     /// `site` is what the call site said about its target beyond the name —
     /// empty ([`CallSite::default`]) for every relationship that is not a
     /// call.
+    ///
+    /// The row is eleven columns wide and the four that describe the target
+    /// are already grouped; the rest name different things (who, what, where,
+    /// which kind) and bundling them further would only hide them behind a
+    /// struct nobody else builds.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_relationship(
         &self,
         from_symbol_id: Option<i64>,
@@ -1038,6 +1044,32 @@ fn io_as_sqlite(operation: &str, error: std::io::Error) -> rusqlite::Error {
 /// symbol. 3041 edges in this repository would gain a target they never called
 /// if it did.
 ///
+/// The receiver arms read the type the call was made on and place the call the
+/// same way, for the same reason: the type of `store` in `store.get(1)` says
+/// where `get` lives as surely as a written `Store::get` does. They sit before
+/// the unqualified rules because a type beats proximity — a same-file `get`
+/// belonging to something else is a wrong target, and tiers 4 to 6 would
+/// prefer it. `to_receiver_type` is a bare name and `owner_name` may be a path
+/// (`impl crate::store::Store`), so the suffix arms run the opposite way round
+/// from the qualifier's.
+///
+/// Two types in two files can carry the same name — a test helper called `Env`
+/// in each integration test is the common case — and a name is all the owner
+/// match has. So a matching owner in the calling file is tier 1 and one
+/// elsewhere is tier 2, which is the ordinal the whole cascade is built on:
+/// nearer wins. Without the split, 47 edges of this repository that proximity
+/// alone had answered correctly gained the other file's same-named method as a
+/// second target.
+///
+/// `to_receiver_call` is the leftover: a receiver whose type is whatever a
+/// function returns, where the pass that resolves those names found nothing of
+/// that name in the index — see
+/// [`resolve_types`](crate::code::indexing::receiver::resolve_types). The
+/// receiver is a value from outside the index, so the call on it is too. The
+/// pass also leaves the name alone when several symbols answer to it and
+/// disagree, which is why this asks whether the name is indexed rather than
+/// trusting the empty type: disagreement is not absence.
+///
 /// Tier 7 is "no rule placed it": those candidates are kept rather than
 /// dropped, because a call the index cannot place is still better answered with
 /// every same-named symbol than with an empty list. Tier 3 is the opposite —
@@ -1068,6 +1100,16 @@ pub(crate) const RESOLUTION_TIER: &str = "CASE \
                          OR i.path = s.module_path || '::' || s.name \
                          OR i.path = s.module_path || '.' || s.name)))) THEN 2 \
          ELSE 3 END ) \
+     WHEN r.to_receiver_type IS NOT NULL THEN ( CASE \
+         WHEN s.owner_name IS NOT NULL AND ( \
+             s.owner_name = r.to_receiver_type \
+             OR substr(s.owner_name, -length(r.to_receiver_type) - 2) = '::' || r.to_receiver_type \
+             OR substr(s.owner_name, -length(r.to_receiver_type) - 1) = '.' || r.to_receiver_type \
+             OR substr(s.owner_name, -length(r.to_receiver_type) - 1) = '\\' || r.to_receiver_type) \
+             THEN ( CASE WHEN s.file_id = r.file_id THEN 1 ELSE 2 END ) \
+         ELSE 3 END ) \
+     WHEN r.to_receiver_call IS NOT NULL AND NOT EXISTS ( \
+         SELECT 1 FROM code_symbols o WHERE o.name = r.to_receiver_call) THEN 3 \
      WHEN s.file_id = r.file_id THEN 4 \
      WHEN s.module_path IS NOT NULL AND EXISTS ( \
          SELECT 1 FROM code_imports i WHERE i.file_id = r.file_id AND ( \
@@ -1089,10 +1131,16 @@ pub const TIER_EXTERNAL: i64 = 3;
 
 /// The tier that says "no rule placed this call".
 ///
-/// Its candidates are every symbol of that name anywhere in the index. Measured
-/// on this repository: 5230 edges at an average of 6.95 candidates each, against
-/// 1.03 to 1.54 for the tiers a rule reached. Narrowing them needs the type of
-/// the receiver, which is story 012-a344, not another rule over names.
+/// Its candidates are every symbol of that name anywhere in the index, so it
+/// is the widest answer the cascade gives: 3907 edges at 4.19 candidates each
+/// on this repository, against 1.01 to 1.42 for the tiers a rule reached.
+///
+/// What remains here is what no rule can read. The receiver arms took 2383
+/// edges out of it at 7.24 candidates each, and no rule over *names* would
+/// have: the receivers left are `self.field` bindings, `for` and closure
+/// bindings, and method chains whose producing method a name cannot identify —
+/// each listed with its reason in
+/// [`rust::receiver`](crate::code::parsing::rust::receiver).
 pub const TIER_UNPLACED: i64 = 7;
 
 /// Every `Calls` edge matching `filter`, paired with each candidate target and
@@ -1880,7 +1928,7 @@ mod tests {
                 "caller",
                 name,
                 &CallSite {
-                    qualifier: qualifier,
+                    qualifier,
                     ..CallSite::default()
                 },
                 "Calls",
@@ -2136,6 +2184,247 @@ mod tests {
             called_ids(&db, caller),
             Vec::<i64>::new(),
             "myastore is not my_store: the underscore is text, not a wildcard"
+        );
+    }
+
+    /// `store.get(1)` never writes `Store`, and the type of `store` says the
+    /// same thing. The local `get` is the trap: proximity is tier 4 and would
+    /// answer with a function belonging to nothing, which is a call that was
+    /// never made.
+    #[test]
+    fn a_call_on_a_typed_receiver_resolves_to_that_types_member() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let local = function_in(&db, "get", (here_file, "here.rs"), "crate::here", 10);
+        let (store_file, _) = file_with_function(&db, "unrelated", "store.rs", "crate::store");
+        let member = method_in(
+            &db,
+            "get",
+            "Store",
+            (store_file, "store.rs"),
+            "crate::store",
+            5,
+        );
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "get",
+            &CallSite {
+                receiver: Some("store"),
+                receiver_type: Some("Store"),
+                ..CallSite::default()
+            },
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![member],
+            "expected Store::get, not the neighbouring free get {local}"
+        );
+    }
+
+    /// Every integration test file here defines its own `Env` helper, so the
+    /// receiver's type name matches two owners and the type alone cannot say
+    /// which. The one in the calling file can: proximity answered these
+    /// correctly before the receiver arms existed, and an arm that read the
+    /// type and forgot where it was would hand 47 edges of this repository a
+    /// second target in a file they never reach into.
+    #[test]
+    fn a_receiver_type_two_files_share_resolves_to_the_one_at_hand() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let near = method_in(&db, "add", "Env", (here_file, "here.rs"), "crate::here", 30);
+        let (other_file, _) = file_with_function(&db, "unrelated", "other.rs", "crate::other");
+        let far = method_in(
+            &db,
+            "add",
+            "Env",
+            (other_file, "other.rs"),
+            "crate::other",
+            5,
+        );
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "add",
+            &CallSite {
+                receiver: Some("env"),
+                receiver_type: Some("Env"),
+                ..CallSite::default()
+            },
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![near],
+            "expected this file's Env::add, not also the other file's {far}"
+        );
+    }
+
+    /// `impl crate::store::Store` records the path it was written as, while the
+    /// receiver's type is inferred as a bare name. The suffix arms therefore run
+    /// the opposite way round from the qualifier's, and a cascade that only
+    /// compared the two for equality would miss every impl written out in full.
+    #[test]
+    fn a_receiver_type_reaches_an_owner_written_as_a_path() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let (store_file, _) = file_with_function(&db, "unrelated", "store.rs", "crate::store");
+        let member = method_in(
+            &db,
+            "get",
+            "crate::store::Store",
+            (store_file, "store.rs"),
+            "crate::store",
+            5,
+        );
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "get",
+            &CallSite {
+                receiver: Some("store"),
+                receiver_type: Some("Store"),
+                ..CallSite::default()
+            },
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(called_ids(&db, caller), vec![member]);
+    }
+
+    /// `FooStore` is its own type. A receiver arm that took a suffix for a type
+    /// would answer `foo_store.get()` with `Store::get`, which is the invented
+    /// call the whole cascade exists to prevent.
+    #[test]
+    fn a_receiver_type_that_only_ends_with_an_owner_name_is_not_that_owner() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let (store_file, _) = file_with_function(&db, "unrelated", "store.rs", "crate::store");
+        method_in(
+            &db,
+            "get",
+            "Store",
+            (store_file, "store.rs"),
+            "crate::store",
+            5,
+        );
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "get",
+            &CallSite {
+                receiver: Some("foo"),
+                receiver_type: Some("FooStore"),
+                ..CallSite::default()
+            },
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            Vec::<i64>::new(),
+            "FooStore is not Store, and a suffix is not a type"
+        );
+    }
+
+    /// `path.join(x)` on a `PathBuf` is a call this index does not contain. A
+    /// known type whose member is absent is the same situation as a qualifier
+    /// that named something unindexed: the target is named, just not here. The
+    /// local `join` must not be offered in its place.
+    #[test]
+    fn a_call_on_a_type_with_no_such_member_is_external_not_local() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        function_in(&db, "join", (here_file, "here.rs"), "crate::here", 10);
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "join",
+            &CallSite {
+                receiver: Some("path"),
+                receiver_type: Some("PathBuf"),
+                ..CallSite::default()
+            },
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(called_ids(&db, caller), Vec::<i64>::new());
+    }
+
+    /// `tempdir().path()` — the receiver's type is whatever `tempdir` returns,
+    /// and nothing in this index declares `tempdir`. The receiver came from
+    /// outside, so the call on it did too.
+    #[test]
+    fn a_receiver_produced_by_an_unindexed_function_is_external() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        function_in(&db, "path", (here_file, "here.rs"), "crate::here", 10);
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "path",
+            &CallSite {
+                receiver: Some("tempdir()"),
+                receiver_call: Some("tempdir"),
+                ..CallSite::default()
+            },
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(called_ids(&db, caller), Vec::<i64>::new());
+    }
+
+    /// The resolution pass leaves a name alone for two different reasons, and
+    /// only one of them means "external". Two indexed functions named `store`
+    /// that return different types say nothing about which one ran, so the call
+    /// falls back to the name rules rather than being declared to leave the
+    /// index on the strength of a coin toss.
+    #[test]
+    fn a_receiver_call_the_index_does_hold_is_not_declared_external() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let local = function_in(&db, "path", (here_file, "here.rs"), "crate::here", 10);
+        function_in(&db, "store", (here_file, "here.rs"), "crate::here", 20);
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "path",
+            &CallSite {
+                receiver: Some("store()"),
+                receiver_call: Some("store"),
+                ..CallSite::default()
+            },
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![local],
+            "an unresolved type is not an absent one: disagreement is not absence"
         );
     }
 

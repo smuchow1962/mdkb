@@ -88,7 +88,7 @@ pub fn resolve_types(db: &CodeDb) -> rusqlite::Result<u32> {
         .collect::<rusqlite::Result<_>>()?;
 
     let mut signatures = conn.prepare(
-        "SELECT s.signature FROM code_symbols s \
+        "SELECT s.signature, s.owner_name FROM code_symbols s \
          JOIN code_files f ON f.id = s.file_id \
          WHERE s.name = ?1 AND s.signature IS NOT NULL AND f.language = 'rust'",
     )?;
@@ -96,7 +96,16 @@ pub fn resolve_types(db: &CodeDb) -> rusqlite::Result<u32> {
     for name in pending {
         let declared: Vec<Option<String>> = signatures
             .query_map([&name], |row| {
-                Ok(rust_receiver::return_type(&row.get::<_, String>(0)?))
+                let signature: String = row.get(0)?;
+                let owner: Option<String> = row.get(1)?;
+                // `-> Self` names the type the `impl` is for, which the
+                // signature alone does not hold. Left as written it said
+                // "Self", and 73 edges then looked for a method on a type of
+                // that name — `Store::open` and `Child::spawn` among them.
+                Ok(match rust_receiver::return_type(&signature) {
+                    Some(declared) if declared == "Self" => owner,
+                    other => other,
+                })
             })?
             .collect::<rusqlite::Result<_>>()?;
 

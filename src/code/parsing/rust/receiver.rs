@@ -19,13 +19,15 @@
 //! | `x` bound by `let x = T::new()`, `let x = T { .. }` | the path or struct name |
 //! | `x` bound by `let x = f()` | what `f` returns, once the index is complete |
 //! | `x` declared as a parameter `x: T` | the signature |
-//! | `f()`, `f().unwrap()`, `x.m()` | what `f` or `m` returns |
+//! | `f()`, `f().unwrap()` | what `f` returns, once the index is complete |
 //!
 //! **Not covered**, and left to the cascade that placed these edges before:
 //! `self` and `self.field`, because a call on `self` is in the same file as
 //! its own `impl` and tier 4 already resolves it at a fan-out of 1.03; a
 //! binding from a `for` loop, a closure parameter or a `match` arm, because
-//! none of them writes a type; and an index or a literal receiver.
+//! none of them writes a type; an index or a literal receiver; and a receiver
+//! produced by a method rather than a function — `x.build().close()` — because
+//! `build` alone does not say which `build`.
 
 use tree_sitter::Node;
 
@@ -65,12 +67,33 @@ pub fn return_type(signature: &str) -> Option<String> {
 /// Answering "unknown" with a guess is the one outcome worth avoiding, because
 /// a wrong type reports a call as leaving the index when it did not.
 pub fn infer<'a>(fn_node: Option<Node>, code: &'a str, receiver: Node) -> Option<ReceiverType<'a>> {
-    match receiver.kind() {
+    let inferred = match receiver.kind() {
         // A name: the type is wherever the name was bound.
         "identifier" => binding_type(fn_node?, code, &code[receiver.byte_range()], receiver),
         // Anything that produces a value: the type is what produced it.
         _ => value_type(receiver, code),
+    }?;
+    match inferred {
+        // `Self` is not a name anything is indexed under; it stands for the
+        // type of the `impl` the call was written in, which is a lookup away.
+        ReceiverType::Named("Self") => Some(ReceiverType::Named(self_type(fn_node?, code)?)),
+        other => Some(other),
     }
+}
+
+/// The type the `impl` around `fn_node` is for — what `Self` means there.
+fn self_type<'a>(fn_node: Node, code: &'a str) -> Option<&'a str> {
+    let mut current = fn_node;
+    for depth in 0.. {
+        if !check_recursion_depth(depth, current) {
+            return None;
+        }
+        if current.kind() == "impl_item" {
+            return type_name(current.child_by_field_name("type")?, code);
+        }
+        current = current.parent()?;
+    }
+    None
 }
 
 /// The type of the value `node` evaluates to.
@@ -88,18 +111,39 @@ fn value_type<'a>(node: Node, code: &'a str) -> Option<ReceiverType<'a>> {
         "call_expression" => {
             let callee = node.child_by_field_name("function")?;
             match callee.kind() {
-                // `TempDir::new()`: an associated function is reached through
-                // the type it belongs to, and that type is the answer without
-                // asking the index anything.
-                "scoped_identifier" => Some(ReceiverType::Named(last_path_segment(
-                    &code[callee.child_by_field_name("path")?.byte_range()],
-                ))),
-                // `tempdir()`: only the index knows what it returns.
+                // `TempDir::new()` reaches an associated function through the
+                // type it belongs to, and that type is the answer without
+                // asking the index anything. `tempfile::tempdir()` is the same
+                // shape and means something else: the path is a module, so the
+                // callee is a plain function and only its return type answers.
+                //
+                // Case is what tells the two apart. It is a convention rather
+                // than grammar, and it is the convention `non_camel_case_types`
+                // warns on by default, so Rust source that breaks it is rarer
+                // than the 533 edges reading `tempfile::tempdir()` that being
+                // wrong here mistyped as a `tempfile`.
+                "scoped_identifier" => {
+                    let path =
+                        last_path_segment(&code[callee.child_by_field_name("path")?.byte_range()]);
+                    Some(if path.starts_with(char::is_uppercase) {
+                        ReceiverType::Named(path)
+                    } else {
+                        ReceiverType::ReturnOf(
+                            &code[callee.child_by_field_name("name")?.byte_range()],
+                        )
+                    })
+                }
+                // `tempdir()`: only the index knows what it returns, and the
+                // name is enough to ask.
                 "identifier" => Some(ReceiverType::ReturnOf(&code[callee.byte_range()])),
-                // `x.build()`: likewise, by the method's name.
-                "field_expression" => Some(ReceiverType::ReturnOf(
-                    &code[callee.child_by_field_name("field")?.byte_range()],
-                )),
+                // `x.build()` is deliberately unknown. A method's name does
+                // not identify a method — that is the ambiguity this whole
+                // module exists to remove, and answering it from the name
+                // alone reintroduces it one step further back. Measured on
+                // this repository: `Command::args` resolved to the `Vec` a
+                // free function named `args` returns, `HashMap::entry` to a
+                // `MemoryEntry`, `Command::stdout` to a `String`. Against
+                // that, the shape gave 6 edges a target.
                 _ => None,
             }
         }
@@ -395,6 +439,11 @@ mod tests {
             receiver_type("fn f() { let d = setup_temp_dir(); d.path(); }"),
             Some(ReceiverType::ReturnOf("setup_temp_dir"))
         );
+        assert_eq!(
+            receiver_type("fn f() { let d = tempfile::tempdir().unwrap(); d.path(); }"),
+            Some(ReceiverType::ReturnOf("tempdir")),
+            "the 533 edges that read a module path as a type named `tempfile`"
+        );
     }
 
     /// A parameter's type is in the signature, and 44 % of the ambiguous
@@ -465,6 +514,27 @@ mod tests {
         );
     }
 
+    /// `Self` is a name no symbol is indexed under, so reading it as a type
+    /// reports the call as leaving the index. It is a lookup away: the `impl`
+    /// the call sits in says which type it is.
+    #[test]
+    fn self_is_read_as_the_type_the_impl_is_for() {
+        assert_eq!(
+            receiver_type("impl Store { fn f() { let s = Self::open(); s.get(); } }"),
+            Some(ReceiverType::Named("Store"))
+        );
+        assert_eq!(
+            receiver_type("impl Deref for Store { fn f() { let s: Self = make(); s.get(); } }"),
+            Some(ReceiverType::Named("Store")),
+            "the impl's type, not the trait it implements"
+        );
+        assert_eq!(
+            receiver_type("fn f() { let s = Self::open(); s.get(); }"),
+            None,
+            "outside an impl, Self stands for nothing this file names"
+        );
+    }
+
     /// What this file cannot answer has to stay unanswered: a guess would
     /// report a call as leaving the index when it did not.
     #[test]
@@ -491,17 +561,22 @@ mod tests {
         );
     }
 
-    /// A chain is 844 ambiguous edges at 2.48 candidates each: worth placing,
-    /// and the same peeling serves it.
+    /// A chain off a function is placed by that function's name. A chain off a
+    /// method is not placed at all: `handle` names a method, and a method name
+    /// matched against every same-named symbol is the ambiguity this module
+    /// removes. Measured on this repository, doing it anyway typed
+    /// `Command::args(..)` as the `Vec` an unrelated `args` returns.
     #[test]
-    fn a_chained_receiver_names_the_call_that_produced_it() {
+    fn a_chained_receiver_is_placed_only_when_a_function_produced_it() {
         assert_eq!(
             receiver_type("fn f() { build().close(); }"),
             Some(ReceiverType::ReturnOf("build"))
         );
         assert_eq!(
-            receiver_type("fn f() { store.handle().close(); }"),
-            Some(ReceiverType::ReturnOf("handle"))
+            receiver_type("fn f() { make::build().close(); }"),
+            Some(ReceiverType::ReturnOf("build")),
+            "a lower-case path is a module, so the callee is a plain function"
         );
+        assert_eq!(receiver_type("fn f() { store.handle().close(); }"), None);
     }
 }
