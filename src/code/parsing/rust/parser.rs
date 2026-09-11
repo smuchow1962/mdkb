@@ -4,7 +4,9 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{EdgeWalk, LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    Call, CallWalk, EdgeWalk, LanguageParser, check_recursion_depth, node_range,
+};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -778,7 +780,7 @@ impl RustParser {
         code: &'a str,
         current_fn: Option<&'a str>,
         depth: usize,
-        calls: &mut Vec<(&'a str, &'a str, Range)>,
+        calls: &mut Vec<Call<'a>>,
     ) {
         if !check_recursion_depth(depth, node) {
             return;
@@ -795,16 +797,27 @@ impl RustParser {
 
         if node.kind() == "call_expression" {
             if let Some(fn_node) = node.child_by_field_name("function") {
-                let target = match fn_node.kind() {
-                    "field_expression" => fn_node
-                        .child_by_field_name("field")
-                        .map(|f| &code[f.byte_range()]),
-                    "identifier" | "scoped_identifier" => Some(&code[fn_node.byte_range()]),
-                    _ => None,
+                // A `field_expression` callee is a method call, and its `value`
+                // is what the method was called on. Recording it is what lets
+                // `self.db.get(x)` say more than `get`: the name alone matched
+                // every `get` in the index, 6.95 of them on average.
+                let (target, receiver) = match fn_node.kind() {
+                    "field_expression" => (
+                        fn_node
+                            .child_by_field_name("field")
+                            .map(|f| &code[f.byte_range()]),
+                        fn_node
+                            .child_by_field_name("value")
+                            .map(|v| code[v.byte_range()].trim()),
+                    ),
+                    "identifier" | "scoped_identifier" => {
+                        (Some(&code[fn_node.byte_range()]), None)
+                    }
+                    _ => (None, None),
                 };
 
                 if let (Some(target), Some(caller)) = (target, current_fn) {
-                    calls.push((caller, target, node_range(node)));
+                    calls.push(Call::on(caller, target, receiver, node_range(node)));
                 }
             }
         }
@@ -1067,7 +1080,7 @@ impl LanguageParser for RustParser {
         }
     }
 
-    fn calls_walk(&self) -> Option<EdgeWalk> {
+    fn calls_walk(&self) -> Option<CallWalk> {
         Some(|root, code, found| {
             Self::find_calls_in_node(*root, code, Some("<module>"), 0, found);
         })
@@ -1331,17 +1344,63 @@ fn process() {}
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+                .any(|c| c.caller == "main" && c.target == "process")
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "String::new")
+                .any(|c| c.caller == "main" && c.target == "String::new")
         );
-        assert!(
+        assert!(calls.iter().any(|c| c.caller == "main" && c.target == "push"));
+    }
+
+    /// A method call used to record its name and nothing else, so the call site
+    /// said nothing about what the method was called on. That is the whole of
+    /// tier 7: `get` matched every `get` in the index, 6.95 of them on average.
+    /// The receiver expression is what a later pass reduces to a type.
+    #[test]
+    fn a_method_call_records_the_expression_it_was_called_on() {
+        let mut parser = RustParser::new().unwrap();
+        let code = "impl Store {\n\
+                    \x20   fn run(&self) {\n\
+                    \x20       self.db.get(1);\n\
+                    \x20       self.reload();\n\
+                    \x20       let temp = tempdir();\n\
+                    \x20       temp.path();\n\
+                    \x20       build().close();\n\
+                    \x20       items[0].close();\n\
+                    \x20       helper();\n\
+                    \x20       Store::open();\n\
+                    \x20   }\n\
+                    }\n";
+
+        let calls = parser.find_calls(code);
+        let receiver = |target: &str| {
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "push")
+                .find(|c| c.target == target)
+                .unwrap_or_else(|| panic!("no call to {target} was recorded"))
+                .receiver
+        };
+
+        assert_eq!(receiver("get"), Some("self.db"), "a field receiver");
+        assert_eq!(receiver("reload"), Some("self"), "a self receiver");
+        assert_eq!(receiver("path"), Some("temp"), "a local variable receiver");
+        assert_eq!(
+            receiver("close"),
+            Some("build()"),
+            "a computed receiver is still written down: its type is the return \
+             type of the call, which the index can look up"
+        );
+        assert_eq!(
+            receiver("helper"),
+            None,
+            "a free function is called on nothing"
+        );
+        assert_eq!(
+            receiver("Store::open"),
+            None,
+            "an associated function names its type in the path, not in a receiver"
         );
     }
 
@@ -1555,7 +1614,7 @@ fn m() {
         assert!(
             found
                 .iter()
-                .any(|(caller, target, _)| *caller == "m" && *target == "println"),
+                .any(|(from, to, _)| *from == "m" && *to == "println"),
             "expected m -> println, got {found:?}"
         );
     }
@@ -1567,7 +1626,7 @@ fn m() {
         assert!(
             found
                 .iter()
-                .any(|(caller, target, _)| *caller == "m" && *target == "tracing::warn"),
+                .any(|(from, to, _)| *from == "m" && *to == "tracing::warn"),
             "expected m -> tracing::warn, got {found:?}"
         );
     }
@@ -1579,7 +1638,7 @@ fn m() {
         assert!(
             found
                 .iter()
-                .any(|(caller, target, _)| *caller == "m" && *target == "anyhow"),
+                .any(|(from, to, _)| *from == "m" && *to == "anyhow"),
             "expected m -> anyhow, got {found:?}"
         );
     }
@@ -1593,7 +1652,7 @@ fn m() {
         assert!(
             !calls
                 .iter()
-                .any(|(_, target, _)| matches!(*target, "println" | "anyhow" | "tracing::warn")),
+                .any(|c| matches!(c.target, "println" | "anyhow" | "tracing::warn")),
             "macros must not appear among calls, got {calls:?}"
         );
     }
@@ -1609,13 +1668,13 @@ fn m() {
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "m" && *target == "write"),
+                .any(|c| c.caller == "m" && c.target == "write"),
             "the function call must stay a call, got {calls:?}"
         );
         assert_eq!(
             calls
                 .iter()
-                .filter(|(caller, target, _)| *caller == "m" && *target == "write")
+                .filter(|c| c.caller == "m" && c.target == "write")
                 .count(),
             1,
             "the macro must not add a second call edge, got {calls:?}"
@@ -1624,7 +1683,7 @@ fn m() {
             parser
                 .find_macro_expansions(code)
                 .iter()
-                .any(|(caller, target, _)| *caller == "m" && *target == "write"),
+                .any(|(from, to, _)| *from == "m" && *to == "write"),
             "the macro invocation must still be recorded as an expansion"
         );
     }
@@ -1642,13 +1701,13 @@ fn inside() { helper(); }
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "<module>" && *target == "compute"),
+                .any(|c| c.caller == "<module>" && c.target == "compute"),
             "expected <module> -> compute, got {calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "<module>" && *target == "derive_limit"),
+                .any(|c| c.caller == "<module>" && c.target == "derive_limit"),
             "expected <module> -> derive_limit, got {calls:?}"
         );
     }
@@ -1660,13 +1719,13 @@ fn inside() { helper(); }
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "inside" && *target == "helper"),
+                .any(|c| c.caller == "inside" && c.target == "helper"),
             "expected inside -> helper, got {calls:?}"
         );
         assert!(
             !calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "<module>" && *target == "helper"),
+                .any(|c| c.caller == "<module>" && c.target == "helper"),
             "helper() must not be attributed to the module, got {calls:?}"
         );
     }

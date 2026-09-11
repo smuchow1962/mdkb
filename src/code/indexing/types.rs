@@ -55,6 +55,11 @@ pub struct RawRelationship {
     /// names nothing indexed makes the target external rather than letting it
     /// match a same-named local symbol.
     pub to_qualifier: Option<Box<str>>,
+    /// The expression the call was made on, as the call site wrote it and
+    /// normalized by [`receiver::normalize`](super::receiver::normalize):
+    /// `self.db`, `temp`, `build()`. `None` for every relationship that is not
+    /// a call, and for a call whose parser does not record receivers.
+    pub to_receiver: Option<Box<str>>,
     pub to_range: Range,
     pub kind: RelationKind,
 }
@@ -106,6 +111,7 @@ pub struct CollectedRelationship {
     pub from_name: Box<str>,
     pub to_name: Box<str>,
     pub to_qualifier: Option<Box<str>>,
+    pub to_receiver: Option<Box<str>>,
     pub file_id: FileId,
     pub kind: RelationKind,
     pub to_range: Option<Range>,

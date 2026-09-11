@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS code_relationships (
     file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
     to_line INTEGER,
     to_col INTEGER,
-    to_qualifier TEXT
+    to_qualifier TEXT,
+    to_receiver TEXT
 );
 
 CREATE TABLE IF NOT EXISTS code_imports (
@@ -123,11 +124,13 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// TypeScript members that produced no symbol at all - interface signatures,
 /// abstract signatures, namespaces and whatever a static block declares;
 /// version 13 is the call forms three parsers dropped - every TypeScript
-/// constructor call, and every call dispatched through an index or a value.
+/// constructor call, and every call dispatched through an index or a value;
+/// version 14 is the receiver a method call was made on, which no index held
+/// and which is the only thing that tells 5210 bare method names apart.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 13;
+pub const RESOLUTION_VERSION: i64 = 14;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///
@@ -196,6 +199,7 @@ pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     add_column(conn, "code_files", "token_estimate", "INTEGER")?;
     add_column(conn, "code_symbols", "owner_name", "TEXT")?;
     add_column(conn, "code_relationships", "to_qualifier", "TEXT")?;
+    add_column(conn, "code_relationships", "to_receiver", "TEXT")?;
     conn.execute_batch(CREATE_ADDED_INDEXES)?;
 
     // Triggers don't support IF NOT EXISTS — check before creating.

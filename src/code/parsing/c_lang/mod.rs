@@ -4,9 +4,7 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{
-    EdgeWalk, LanguageParser, check_recursion_depth, extract_c_family_doc, node_range,
-};
+use crate::code::parsing::parser::{Call, CallWalk, LanguageParser, check_recursion_depth, extract_c_family_doc, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -511,7 +509,7 @@ impl CParser {
         code: &'a str,
         current_fn: Option<&'a str>,
         depth: usize,
-        calls: &mut Vec<(&'a str, &'a str, Range)>,
+        calls: &mut Vec<Call<'a>>,
     ) {
         if !check_recursion_depth(depth, *node) {
             return;
@@ -528,7 +526,7 @@ impl CParser {
             if let Some(func) = node.child_by_field_name("function") {
                 let target = &code[func.byte_range()];
                 if let Some(ctx) = fn_ctx {
-                    calls.push((ctx, target, node_range(*node)));
+                    calls.push(Call::bare(ctx, target, node_range(*node)));
                 }
             }
         }
@@ -627,7 +625,7 @@ impl LanguageParser for CParser {
         extract_c_family_doc(node, code)
     }
 
-    fn calls_walk(&self) -> Option<EdgeWalk> {
+    fn calls_walk(&self) -> Option<CallWalk> {
         Some(|root, code, found| {
             Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
         })
@@ -967,12 +965,12 @@ int main() {
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+                .any(|c| c.caller == "main" && c.target == "process")
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "printf")
+                .any(|c| c.caller == "main" && c.target == "printf")
         );
     }
 

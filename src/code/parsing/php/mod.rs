@@ -5,8 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    EdgeWalk, LanguageParser, check_recursion_depth, find_modifier_keyword, last_name_segment,
-    node_range, receiver_call_target,
+    Call, CallWalk, EdgeWalk, LanguageParser, check_recursion_depth, find_modifier_keyword, last_name_segment, node_range, receiver_call_target,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -515,7 +514,7 @@ impl PhpParser {
         code: &'a str,
         current_fn: Option<&'a str>,
         depth: usize,
-        calls: &mut Vec<(&'a str, &'a str, Range)>,
+        calls: &mut Vec<Call<'a>>,
     ) {
         if !check_recursion_depth(depth, *node) {
             return;
@@ -552,7 +551,7 @@ impl PhpParser {
         };
 
         if let (Some(target), Some(ctx)) = (target, fn_ctx) {
-            calls.push((ctx, target, node_range(*node)));
+            calls.push(Call::bare(ctx, target, node_range(*node)));
         }
 
         for child in node.children(&mut node.walk()) {
@@ -791,7 +790,7 @@ impl LanguageParser for PhpParser {
         extract_phpdoc(node, code)
     }
 
-    fn calls_walk(&self) -> Option<EdgeWalk> {
+    fn calls_walk(&self) -> Option<CallWalk> {
         Some(|root, code, found| {
             Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
         })
@@ -995,7 +994,7 @@ class App extends Base {
 "#;
 
         let calls = parser.find_calls(code);
-        let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
+        let edges: Vec<(&str, &str)> = calls.iter().map(|c| (c.caller, c.target)).collect();
 
         assert!(edges.contains(&("run", "Foo")), "new Foo(): {edges:?}");
         assert!(
@@ -1035,7 +1034,7 @@ class App extends Base {
         let defines: Vec<(&str, &str)> = parser
             .find_defines(code)
             .iter()
-            .map(|(c, t, _)| (*c, *t))
+            .map(|(from, to, _)| (*from, *to))
             .collect();
 
         assert!(
@@ -1062,7 +1061,7 @@ class App extends Base {
         let uses: Vec<(&str, &str)> = parser
             .find_uses(code)
             .iter()
-            .map(|(c, t, _)| (*c, *t))
+            .map(|(from, to, _)| (*from, *to))
             .collect();
 
         assert!(uses.contains(&("Box", "Cache")), "nullable: {uses:?}");

@@ -5,8 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    EdgeWalk, LanguageParser, check_recursion_depth, node_range, receiver_call_target,
-    unnamed_call_target,
+    Call, CallWalk, EdgeWalk, LanguageParser, check_recursion_depth, node_range, receiver_call_target, unnamed_call_target,
 };
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -1165,7 +1164,7 @@ impl GoParser {
         node: &Node,
         code: &'a str,
         current_function: Option<&'a str>,
-        calls: &mut Vec<(&'a str, &'a str, Range)>,
+        calls: &mut Vec<Call<'a>>,
         depth: usize,
     ) {
         if !check_recursion_depth(depth, *node) {
@@ -1200,7 +1199,7 @@ impl GoParser {
                 }
                 .or_else(|| unnamed_call_target(function_node, code, &["func_literal"]));
                 if let (Some(target), Some(context)) = (target, function_context) {
-                    calls.push((context, target, node_range(*node)));
+                    calls.push(Call::bare(context, target, node_range(*node)));
                 }
             }
         }
@@ -1478,7 +1477,7 @@ impl LanguageParser for GoParser {
         Self::extract_doc_comment_impl(node, code)
     }
 
-    fn calls_walk(&self) -> Option<EdgeWalk> {
+    fn calls_walk(&self) -> Option<CallWalk> {
         Some(|root, code, found| {
             Self::extract_calls_recursive(root, code, Some("<module>"), found, 0);
         })
@@ -1528,7 +1527,7 @@ mod tests {
         let calls: Vec<(&str, &str)> = parser
             .find_calls(code)
             .into_iter()
-            .map(|(caller, callee, _)| (caller, callee))
+            .map(|c| (c.caller, c.target))
             .collect();
 
         assert!(
@@ -1564,7 +1563,7 @@ mod tests {
         let calls: Vec<(&str, &str)> = parser
             .find_calls(code)
             .into_iter()
-            .map(|(caller, callee, _)| (caller, callee))
+            .map(|c| (c.caller, c.target))
             .collect();
 
         assert!(
@@ -1592,7 +1591,7 @@ mod tests {
         let calls: Vec<&str> = parser
             .find_calls(code)
             .into_iter()
-            .map(|(_, callee, _)| callee)
+            .map(|c| c.target)
             .collect();
 
         assert_eq!(
@@ -1956,7 +1955,7 @@ func Load[T any](c Container[T]) Result[T] {
 
         // A generic type used in a signature is a use of its base type.
         let uses = parser.find_uses(code);
-        let edges: Vec<(&str, &str)> = uses.iter().map(|(c, t, _)| (*c, *t)).collect();
+        let edges: Vec<(&str, &str)> = uses.iter().map(|(from, to, _)| (*from, *to)).collect();
         assert!(
             edges.contains(&("Load", "Container")),
             "generic parameter type: {edges:?}"
@@ -2062,12 +2061,12 @@ func getData() string { return "" }
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+                .any(|c| c.caller == "main" && c.target == "process")
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "getData")
+                .any(|c| c.caller == "main" && c.target == "getData")
         );
     }
 
@@ -2097,13 +2096,13 @@ func main() {
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "s.Start"),
+                .any(|c| c.caller == "main" && c.target == "s.Start"),
             "got {calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "fmt.Println"),
+                .any(|c| c.caller == "main" && c.target == "fmt.Println"),
             "got {calls:?}"
         );
     }

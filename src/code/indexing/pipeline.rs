@@ -32,6 +32,7 @@ use crate::code::parsing::java::JavaParser;
 use crate::code::parsing::kotlin::KotlinParser;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::lua::LuaParser;
+use crate::code::indexing::receiver;
 use crate::code::parsing::parser::{LanguageParser, split_call_target};
 use crate::code::parsing::php::PhpParser;
 use crate::code::parsing::python::PythonParser;
@@ -448,16 +449,17 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
         // Collect all relationships from parser results
         let mut raw_relationships = Vec::new();
 
-        for (caller, callee, range) in calls {
+        for call in calls {
             // The qualifier is kept, not stripped: `std::fs::write` must not be
             // recorded as a call into this crate's own `write`.
-            let (name, qualifier) = split_call_target(callee);
+            let (name, qualifier) = split_call_target(call.target);
             raw_relationships.push(RawRelationship {
-                from_name: caller.into(),
-                from_range: range,
+                from_name: call.caller.into(),
+                from_range: call.range,
                 to_name: name.into(),
                 to_qualifier: qualifier.map(Into::into),
-                to_range: range,
+                to_receiver: call.receiver.and_then(receiver::normalize),
+                to_range: call.range,
                 kind: RelationKind::Calls,
             });
         }
@@ -468,6 +470,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 from_range: range,
                 to_name: macro_name.into(),
                 to_qualifier: None,
+                to_receiver: None,
                 to_range: range,
                 kind: RelationKind::Expands,
             });
@@ -479,6 +482,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 from_range: range,
                 to_name: trait_name.into(),
                 to_qualifier: None,
+                to_receiver: None,
                 to_range: range,
                 kind: RelationKind::Implements,
             });
@@ -490,6 +494,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 from_range: range,
                 to_name: base.into(),
                 to_qualifier: None,
+                to_receiver: None,
                 to_range: range,
                 kind: RelationKind::Extends,
             });
@@ -501,6 +506,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 from_range: range,
                 to_name: used_type.into(),
                 to_qualifier: None,
+                to_receiver: None,
                 to_range: range,
                 kind: RelationKind::Uses,
             });
@@ -512,6 +518,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 from_range: range,
                 to_name: method.into(),
                 to_qualifier: None,
+                to_receiver: None,
                 to_range: range,
                 kind: RelationKind::Defines,
             });
@@ -674,6 +681,7 @@ fn stage_collect(
                 from_name: raw_rel.from_name,
                 to_name: raw_rel.to_name,
                 to_qualifier: raw_rel.to_qualifier,
+                to_receiver: raw_rel.to_receiver,
                 file_id,
                 kind: raw_rel.kind,
                 to_range: Some(raw_rel.to_range),
@@ -822,6 +830,7 @@ fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyho
             &rel.from_name,
             &rel.to_name,
             rel.to_qualifier.as_deref(),
+            rel.to_receiver.as_deref(),
             &rel.kind.to_string(),
             real_file_id,
             (

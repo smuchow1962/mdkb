@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    EdgeWalk, LanguageParser, check_recursion_depth, node_range, unnamed_call_target,
+    Call, CallWalk, EdgeWalk, LanguageParser, check_recursion_depth, node_range, unnamed_call_target,
 };
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -510,7 +510,7 @@ impl PythonParser {
         code: &'a str,
         current_fn: Option<&'a str>,
         depth: usize,
-        calls: &mut Vec<(&'a str, &'a str, Range)>,
+        calls: &mut Vec<Call<'a>>,
     ) {
         if !check_recursion_depth(depth, *node) {
             return;
@@ -530,7 +530,7 @@ impl PythonParser {
                     .or_else(|| unnamed_call_target(function_node, code, &["lambda"]))
                 {
                     if let Some(ctx) = fn_ctx {
-                        calls.push((ctx, target, node_range(*node)));
+                        calls.push(Call::bare(ctx, target, node_range(*node)));
                     }
                 }
             }
@@ -828,7 +828,7 @@ impl LanguageParser for PythonParser {
         }
     }
 
-    fn calls_walk(&self) -> Option<EdgeWalk> {
+    fn calls_walk(&self) -> Option<CallWalk> {
         Some(|root, code, found| {
             Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
         })
@@ -1037,7 +1037,7 @@ def f():
         let calls: Vec<(&str, &str)> = parser
             .find_calls(code)
             .into_iter()
-            .map(|(caller, target, _)| (caller, target))
+            .map(|c| (c.caller, c.target))
             .collect();
 
         assert!(
@@ -1080,17 +1080,17 @@ def get_data():
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+                .any(|c| c.caller == "main" && c.target == "process")
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "get_data")
+                .any(|c| c.caller == "main" && c.target == "get_data")
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "print")
+                .any(|c| c.caller == "main" && c.target == "print")
         );
     }
 
@@ -1115,7 +1115,7 @@ def main():
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "s.start"),
+                .any(|c| c.caller == "main" && c.target == "s.start"),
             "got {calls:?}"
         );
     }

@@ -9,6 +9,7 @@
 pub mod hasher;
 pub mod module_path;
 pub mod pipeline;
+pub mod receiver;
 pub mod types;
 pub mod walker;
 
@@ -1102,6 +1103,49 @@ pub fn world() {
         assert!(stats.symbols_indexed >= 2);
         assert!(facade.symbol_count() >= 2);
         assert_eq!(facade.file_count(), 1);
+    }
+
+    /// The receiver the parser read has to reach the column the resolver
+    /// reads, through four stages that each rebuild the row. Recording it in
+    /// the parser and losing it in COLLECT would leave every measurement
+    /// unchanged and look like an inference that does not work.
+    #[test]
+    fn indexing_stores_the_receiver_each_call_was_made_on() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            src_dir.path().join("main.rs"),
+            "struct Store { db: Db }\n\
+             impl Store {\n\
+             \x20   fn run(&self) {\n\
+             \x20       self.db.get(1);\n\
+             \x20       helper();\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        let receiver = |to_name: &str| -> Option<String> {
+            facade
+                .db
+                .conn()
+                .query_row(
+                    "SELECT to_receiver FROM code_relationships \
+                     WHERE kind = 'Calls' AND to_name = ?1",
+                    [to_name],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(receiver("get").as_deref(), Some("self.db"));
+        assert_eq!(
+            receiver("helper"),
+            None,
+            "a call on nothing stores no receiver rather than an empty string"
+        );
     }
 
     /// A project tree with one file at `src/lib.rs`, plus an open facade.

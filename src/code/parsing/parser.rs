@@ -15,6 +15,67 @@ use tree_sitter::{Node, Tree};
 /// One edge of the relationship graph: (source, target, where it was written).
 pub type Edge<'a> = (&'a str, &'a str, Range);
 
+/// One call, and the expression it was called on.
+///
+/// A call is the one edge kind whose target is not fully named by the source:
+/// `get` says nothing without knowing what `get` was called on. `receiver`
+/// holds that expression as the call site wrote it — `self`, `self.db`,
+/// `temp`, `build()`.
+///
+/// `receiver` is `None` when the walk recorded none, which covers both a call
+/// made on nothing — a free function, an associated function reached through a
+/// path — and a language whose walk does not record receivers yet. Resolution
+/// therefore reads `None` as "no more is known about this call", never as
+/// "this call had no receiver": the receiver rule adds precision where an
+/// expression is present and leaves every other edge to the cascade that
+/// placed it before.
+///
+/// The expression is kept verbatim rather than reduced to a type here: the
+/// parser sees one file and a type usually comes from another, so naming the
+/// expression is the part a parser can do honestly, and reducing it to a type
+/// is the part the index does once every file is in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Call<'a> {
+    pub caller: &'a str,
+    pub target: &'a str,
+    pub receiver: Option<&'a str>,
+    pub range: Range,
+}
+
+impl<'a> Call<'a> {
+    /// A call with no receiver: `helper()`, `Store::open()`.
+    pub fn bare(caller: &'a str, target: &'a str, range: Range) -> Self {
+        Self {
+            caller,
+            target,
+            receiver: None,
+            range,
+        }
+    }
+
+    /// A call made on `receiver`, which is `None` when the grammar gives the
+    /// walk no receiver node to point at.
+    pub fn on(
+        caller: &'a str,
+        target: &'a str,
+        receiver: Option<&'a str>,
+        range: Range,
+    ) -> Self {
+        Self {
+            caller,
+            target,
+            receiver,
+            range,
+        }
+    }
+}
+
+/// The walk that collects calls out of a parsed tree.
+///
+/// Separate from [`EdgeWalk`] because a call carries the receiver and the other
+/// five relationship kinds have nothing to put there.
+pub type CallWalk = for<'a> fn(&Node<'_>, &'a str, &mut Vec<Call<'a>>);
+
 /// The walk that collects edges of one kind out of a parsed tree.
 ///
 /// A plain `fn` pointer, not a generic and not an associated function reached
@@ -70,15 +131,22 @@ pub trait LanguageParser: Send {
         }
     }
 
-    /// The walk that collects calls: (caller_name, callee_name, range).
-    fn calls_walk(&self) -> Option<EdgeWalk> {
+    /// The walk that collects calls.
+    fn calls_walk(&self) -> Option<CallWalk> {
         None
     }
 
-    /// Find function/method calls: (caller_name, callee_name, range).
-    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<Edge<'a>> {
-        let walk = self.calls_walk();
-        self.collect_edges(code, walk)
+    /// Find function/method calls, each with the receiver it was made on.
+    ///
+    /// Its own body rather than [`collect_edges`](LanguageParser::collect_edges)
+    /// because a call is a [`Call`] and not an [`Edge`]: making one method serve
+    /// both would need a generic, and this trait is used as
+    /// `Box<dyn LanguageParser>`.
+    fn find_calls<'a>(&mut self, code: &'a str) -> Vec<Call<'a>> {
+        match self.calls_walk() {
+            Some(walk) => self.parser().collect(code, walk),
+            None => Vec::new(),
+        }
     }
 
     /// Find macro invocations: (invoker_name, macro_name, range).

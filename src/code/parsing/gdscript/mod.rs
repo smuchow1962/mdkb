@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    EdgeWalk, LanguageParser, check_recursion_depth, is_plain_path, node_range,
+    Call, CallWalk, EdgeWalk, LanguageParser, check_recursion_depth, is_plain_path, node_range,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -390,7 +390,7 @@ impl GdscriptParser {
         code: &'a str,
         current_fn: Option<&'a str>,
         depth: usize,
-        calls: &mut Vec<(&'a str, &'a str, Range)>,
+        calls: &mut Vec<Call<'a>>,
     ) {
         if !check_recursion_depth(depth, *node) {
             return;
@@ -421,7 +421,7 @@ impl GdscriptParser {
                     .filter(|text| is_plain_path(text));
                 let target = whole.unwrap_or(&code[func.byte_range()]);
                 if let Some(ctx) = fn_ctx {
-                    calls.push((ctx, target, node_range(*node)));
+                    calls.push(Call::bare(ctx, target, node_range(*node)));
                 }
             }
         }
@@ -527,7 +527,7 @@ impl LanguageParser for GdscriptParser {
         extract_gdscript_doc(node, code)
     }
 
-    fn calls_walk(&self) -> Option<EdgeWalk> {
+    fn calls_walk(&self) -> Option<CallWalk> {
         Some(|root, code, found| {
             Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
         })
@@ -661,8 +661,8 @@ func helper():
         parser
             .find_calls(code)
             .iter()
-            .filter(|(c, _, _)| *c == caller)
-            .map(|(_, target, _)| (*target).to_string())
+            .filter(|c| c.caller == caller)
+            .map(|c| c.target.to_string())
             .collect()
     }
 
@@ -798,7 +798,7 @@ func outer_func():
         let uses: Vec<(&str, &str)> = parser
             .find_uses(code)
             .iter()
-            .map(|(c, t, _)| (*c, *t))
+            .map(|(from, to, _)| (*from, *to))
             .collect();
 
         assert!(
@@ -822,7 +822,7 @@ func outer_func():
         let defines: Vec<(&str, &str)> = parser
             .find_defines(code)
             .iter()
-            .map(|(c, t, _)| (*c, *t))
+            .map(|(from, to, _)| (*from, *to))
             .collect();
         assert!(
             defines.contains(&("Player", "hit")),

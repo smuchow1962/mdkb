@@ -7,8 +7,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    EdgeWalk, LanguageParser, check_recursion_depth, find_modifier_keyword, node_range,
-    receiver_call_target, unnamed_call_target,
+    Call, CallWalk, EdgeWalk, LanguageParser, check_recursion_depth, find_modifier_keyword, node_range, receiver_call_target, unnamed_call_target,
 };
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -910,7 +909,7 @@ impl TypeScriptParser {
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
-        calls: &mut Vec<(&'a str, &'a str, Range)>,
+        calls: &mut Vec<Call<'a>>,
         depth: usize,
     ) {
         if !check_recursion_depth(depth, *node) {
@@ -965,7 +964,7 @@ impl TypeScriptParser {
                     )
                 });
                 if let (Some(target), Some(ctx)) = (target, fn_ctx) {
-                    calls.push((ctx, target, node_range(*node)));
+                    calls.push(Call::bare(ctx, target, node_range(*node)));
                 }
             }
         }
@@ -1360,7 +1359,7 @@ impl LanguageParser for TypeScriptParser {
         extract_jsdoc(node, code)
     }
 
-    fn calls_walk(&self) -> Option<EdgeWalk> {
+    fn calls_walk(&self) -> Option<CallWalk> {
         Some(|root, code, found| {
             Self::extract_calls_recursive(root, code, Some("<module>"), found, 0);
         })
@@ -1409,7 +1408,7 @@ mod tests {
         let calls: Vec<(&str, &str)> = parser
             .find_calls(code)
             .into_iter()
-            .map(|(caller, callee, _)| (caller, callee))
+            .map(|c| (c.caller, c.target))
             .collect();
 
         assert!(
@@ -1433,7 +1432,7 @@ mod tests {
         let targets: Vec<&str> = parser
             .find_calls(code)
             .into_iter()
-            .map(|(_, callee, _)| callee)
+            .map(|c| c.target)
             .collect();
 
         assert!(targets.contains(&"c"), "expected a bare c, got {targets:?}");
@@ -1457,7 +1456,7 @@ mod tests {
         let targets: Vec<&str> = parser
             .find_calls(code)
             .into_iter()
-            .map(|(_, callee, _)| callee)
+            .map(|c| c.target)
             .collect();
 
         assert_eq!(targets, vec!["Namespace.other"], "got {targets:?}");
@@ -1474,7 +1473,7 @@ mod tests {
         let calls: Vec<(&str, &str)> = parser
             .find_calls(code)
             .into_iter()
-            .map(|(caller, callee, _)| (caller, callee))
+            .map(|c| (c.caller, c.target))
             .collect();
 
         assert_eq!(
@@ -1627,7 +1626,7 @@ function boot() {
         let calls: Vec<(&str, &str)> = parser
             .find_calls(code)
             .into_iter()
-            .map(|(caller, target, _)| (caller, target))
+            .map(|c| (c.caller, c.target))
             .collect();
 
         assert!(
@@ -1672,12 +1671,12 @@ function getData(): string { return ""; }
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+                .any(|c| c.caller == "main" && c.target == "process")
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "getData")
+                .any(|c| c.caller == "main" && c.target == "getData")
         );
     }
 
@@ -1701,15 +1700,14 @@ if (require.main === module) {
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "<module>"
-                    && *target == "setupHookBoilerplate"),
+                .any(|c| c.caller == "<module>" && c.target == "setupHookBoilerplate"),
             "Top-level call to setupHookBoilerplate should have <module> as caller: {:?}",
             calls
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "<module>" && *target == "getStories"),
+                .any(|c| c.caller == "<module>" && c.target == "getStories"),
             "Top-level call to getStories should have <module> as caller: {:?}",
             calls
         );
@@ -1768,13 +1766,13 @@ function main(): void {
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "s.start"),
+                .any(|c| c.caller == "main" && c.target == "s.start"),
             "got {calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "console.log"),
+                .any(|c| c.caller == "main" && c.target == "console.log"),
             "got {calls:?}"
         );
     }
@@ -1977,7 +1975,7 @@ function run() {
 "#;
 
         let calls = parser.find_calls(code);
-        let targets: Vec<&str> = calls.iter().map(|(_, t, _)| *t).collect();
+        let targets: Vec<&str> = calls.iter().map(|c| c.target).collect();
 
         assert!(
             !targets.iter().any(|t| t.contains("yield")),

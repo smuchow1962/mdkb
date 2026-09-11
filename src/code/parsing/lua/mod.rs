@@ -4,7 +4,7 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::ParserContext;
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{EdgeWalk, LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{Call, CallWalk, LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -294,7 +294,7 @@ impl LuaParser {
         code: &'a str,
         current_fn: Option<&'a str>,
         depth: usize,
-        calls: &mut Vec<(&'a str, &'a str, Range)>,
+        calls: &mut Vec<Call<'a>>,
     ) {
         if !check_recursion_depth(depth, *node) {
             return;
@@ -311,7 +311,7 @@ impl LuaParser {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let target = &code[name_node.byte_range()];
                 if let Some(ctx) = fn_ctx {
-                    calls.push((ctx, target, node_range(*node)));
+                    calls.push(Call::bare(ctx, target, node_range(*node)));
                 }
             }
         }
@@ -382,7 +382,7 @@ impl LanguageParser for LuaParser {
         &mut self.parser
     }
 
-    fn calls_walk(&self) -> Option<EdgeWalk> {
+    fn calls_walk(&self) -> Option<CallWalk> {
         Some(|root, code, found| {
             Self::find_calls_in_node(root, code, Some("<module>"), 0, found);
         })
