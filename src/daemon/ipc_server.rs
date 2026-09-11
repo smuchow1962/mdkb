@@ -786,9 +786,7 @@ mod tests {
 
         let drain = {
             let gate = Arc::clone(&gate);
-            tokio::spawn(async move {
-                drain_in_flight_work(&gate, WORK_DRAIN_GRACE).await
-            })
+            tokio::spawn(async move { drain_in_flight_work(&gate, WORK_DRAIN_GRACE).await })
         };
 
         // Well past the socket grace, the drain is still holding on for the
@@ -830,8 +828,7 @@ mod tests {
     #[tokio::test]
     async fn an_idle_daemon_drains_immediately() {
         let gate = WorkGate::default();
-        let outcome =
-            drain_in_flight_work(&gate, WORK_DRAIN_GRACE).await;
+        let outcome = drain_in_flight_work(&gate, WORK_DRAIN_GRACE).await;
         assert_eq!(outcome, DrainOutcome::Quiesced);
     }
 
@@ -842,11 +839,7 @@ mod tests {
         let gate = WorkGate::default();
         let _executing = gate.enter().await;
 
-        let outcome = drain_in_flight_work(
-            &gate,
-            std::time::Duration::from_millis(50),
-        )
-        .await;
+        let outcome = drain_in_flight_work(&gate, std::time::Duration::from_millis(50)).await;
         assert_eq!(outcome, DrainOutcome::TimedOut);
     }
 

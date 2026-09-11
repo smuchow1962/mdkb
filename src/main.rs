@@ -19,10 +19,9 @@ use mdkb::cli::CodeCommand;
 use mdkb::cli::daemon as daemon_cli;
 use mdkb::cli::handlers::{
     EmbedResult, EvolutionHistoryEntry, handle_collection_add, handle_collection_list,
-    handle_collection_remove, handle_collection_rename, handle_collection_update,
-    handle_current, handle_embed,
-    handle_eval_judge, handle_eval_recall, handle_evolve_corrects, handle_evolve_extends,
-    handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
+    handle_collection_remove, handle_collection_rename, handle_collection_update, handle_current,
+    handle_embed, handle_eval_judge, handle_eval_recall, handle_evolve_corrects,
+    handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
     handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
     handle_graph_dangling, handle_graph_hubs, handle_graph_links, handle_graph_neighbors,
@@ -276,12 +275,8 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     pattern,
                     path,
                 } => {
-                    let updated = handle_collection_update(
-                        &ctx,
-                        &name,
-                        path.as_deref(),
-                        pattern.as_deref(),
-                    )?;
+                    let updated =
+                        handle_collection_update(&ctx, &name, path.as_deref(), pattern.as_deref())?;
                     println!(
                         "{}",
                         collection_updated_line(&name, &updated.path, &updated.pattern)
@@ -1429,44 +1424,42 @@ MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<n
             DaemonCommand::Stop => daemon_cli::handle_stop().await?,
             DaemonCommand::Restart => daemon_cli::handle_restart().await?,
         },
-        Command::Hook(hook_cmd) => {
-            match hook_cmd {
-                HookCommand::SessionStart => dispatch_hook("hook.session_start").await?,
-                HookCommand::UserPromptSubmit => dispatch_hook("hook.user_prompt_submit").await?,
-                HookCommand::PostToolUse => dispatch_hook("hook.post_tool_use").await?,
-                HookCommand::PreToolUse => dispatch_hook("hook.pre_tool_use").await?,
-                HookCommand::Stop => dispatch_hook("hook.stop").await?,
-                HookCommand::Reindex { files, root } => {
-                    hook_client::call_reindex(files, root).await?;
-                }
-                HookCommand::Search {
-                    query,
-                    scope,
-                    limit,
-                    root,
-                } => {
-                    hook_client::call_search(query, scope, limit, root).await?;
-                }
-                HookCommand::MemoryWrite {
-                    id,
-                    title,
-                    entry_type,
-                    content,
-                    tags,
-                    ttl,
-                    root,
-                } => {
-                    hook_client::call_memory_write(id, title, entry_type, content, tags, ttl, root)
-                        .await?;
-                }
-                HookCommand::MemoryConfirm { id, outcome, root } => {
-                    hook_client::call_memory_confirm(id, outcome, root).await?;
-                }
-                HookCommand::Status { root } => {
-                    hook_client::call_status(root).await?;
-                }
+        Command::Hook(hook_cmd) => match hook_cmd {
+            HookCommand::SessionStart => dispatch_hook("hook.session_start").await?,
+            HookCommand::UserPromptSubmit => dispatch_hook("hook.user_prompt_submit").await?,
+            HookCommand::PostToolUse => dispatch_hook("hook.post_tool_use").await?,
+            HookCommand::PreToolUse => dispatch_hook("hook.pre_tool_use").await?,
+            HookCommand::Stop => dispatch_hook("hook.stop").await?,
+            HookCommand::Reindex { files, root } => {
+                hook_client::call_reindex(files, root).await?;
             }
-        }
+            HookCommand::Search {
+                query,
+                scope,
+                limit,
+                root,
+            } => {
+                hook_client::call_search(query, scope, limit, root).await?;
+            }
+            HookCommand::MemoryWrite {
+                id,
+                title,
+                entry_type,
+                content,
+                tags,
+                ttl,
+                root,
+            } => {
+                hook_client::call_memory_write(id, title, entry_type, content, tags, ttl, root)
+                    .await?;
+            }
+            HookCommand::MemoryConfirm { id, outcome, root } => {
+                hook_client::call_memory_confirm(id, outcome, root).await?;
+            }
+            HookCommand::Status { root } => {
+                hook_client::call_status(root).await?;
+            }
+        },
     }
 
     Ok(())
@@ -4130,7 +4123,11 @@ mod tests {
     fn burn_stack(frames: usize) -> usize {
         let mut block = [0u8; 64 * 1024];
         std::hint::black_box(&mut block);
-        if frames == 0 { 0 } else { 1 + burn_stack(frames - 1) }
+        if frames == 0 {
+            0
+        } else {
+            1 + burn_stack(frames - 1)
+        }
     }
 
     #[test]

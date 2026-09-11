@@ -492,7 +492,10 @@ mod tests {
         }
         impl BodyEmbedder for Recording {
             fn embed_bodies(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-                self.seen.lock().unwrap().extend(texts.iter().map(|t| t.len()));
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .extend(texts.iter().map(|t| t.len()));
                 // A vector that names the text it came from, so a misplaced
                 // one is visible rather than merely present.
                 Ok(texts.iter().map(|t| vec![t.len() as f32]).collect())

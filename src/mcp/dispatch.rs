@@ -41,8 +41,8 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 use super::mcp_error;
 use super::server::{
     apply_min_confidence, format_memory_search_results, format_search_results, format_symbol,
-    format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago,
-    resolve_document, truncate_text,
+    format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago, resolve_document,
+    truncate_text,
 };
 
 /// Pick the JSON-RPC code a store error must travel under.
@@ -1656,14 +1656,13 @@ fn render_document_content(
     doc: &crate::domain::Document,
     lines: Option<&str>,
 ) -> Result<String, McpError> {
-    let mut output = crate::core::ops::get_document_content(ctx, doc, lines).map_err(|e| {
-        match e.kind() {
+    let mut output =
+        crate::core::ops::get_document_content(ctx, doc, lines).map_err(|e| match e.kind() {
             ErrorKind::DocumentNotFound { .. } => {
                 mcp_error("Content missing for document. Try `update` to reindex.")
             }
             _ => mcp_store_error("Failed to get document content", e),
-        }
-    })?;
+        })?;
 
     let document_status = match evolution::get_document_status(&ctx.conn, doc.id) {
         Ok(status) => status,
@@ -3339,14 +3338,15 @@ pub async fn hook_session_start_impl(
                 store_dir,
             ))
         });
-    let (due_lines, entries, doc_count, collection_names, drift_banner, store_dir) = match startup_data {
-        Some(Ok(data)) => data,
-        Some(Err(error)) => {
-            tracing::warn!("hook.session_start warmup failed: {error}");
-            return json!({});
-        }
-        None => return json!({}),
-    };
+    let (due_lines, entries, doc_count, collection_names, drift_banner, store_dir) =
+        match startup_data {
+            Some(Ok(data)) => data,
+            Some(Err(error)) => {
+                tracing::warn!("hook.session_start warmup failed: {error}");
+                return json!({});
+            }
+            None => return json!({}),
+        };
     drop(ctx_guard);
 
     let scope = project_scope_token(&handle.root, session_cwd, &collection_names);

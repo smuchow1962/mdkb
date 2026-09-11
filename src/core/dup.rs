@@ -129,7 +129,11 @@ pub fn handle_dup(
     // report reads as "your change duplicated nothing", which is the one
     // answer a typo must never be able to produce.
     let changed = match &overrides.since {
-        Some(git_ref) => Some(crate::git::changed_files(root, git_ref)?.into_iter().collect()),
+        Some(git_ref) => Some(
+            crate::git::changed_files(root, git_ref)?
+                .into_iter()
+                .collect(),
+        ),
         None => None,
     };
 
@@ -187,11 +191,19 @@ pub fn handle_dup(
         chrono::Utc::now().timestamp(),
     )?;
 
-    let markdown = render(&outcome.clusters, options.hamming_threshold, &mut |candidate| {
-        let source = read_indexed(&repo, &candidate.file_path)?;
-        crate::code::duplication::body::body_text(&source, candidate.line_start, candidate.line_end)
+    let markdown = render(
+        &outcome.clusters,
+        options.hamming_threshold,
+        &mut |candidate| {
+            let source = read_indexed(&repo, &candidate.file_path)?;
+            crate::code::duplication::body::body_text(
+                &source,
+                candidate.line_start,
+                candidate.line_end,
+            )
             .map(str::to_string)
-    });
+        },
+    );
 
     Ok(DupReport {
         markdown,

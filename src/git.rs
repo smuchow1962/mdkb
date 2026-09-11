@@ -1090,7 +1090,10 @@ mod tests {
 
         // Nothing changed since HEAD: an empty list, and not an error. This is
         // the one case where empty is the honest answer.
-        assert_eq!(changed_files(tmp.path(), "HEAD").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            changed_files(tmp.path(), "HEAD").unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

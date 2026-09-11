@@ -13,8 +13,7 @@ pub use crate::core::code::{
 pub use crate::core::graph::{
     CollectionInfo, handle_collection_add, handle_collection_list, handle_collection_remove,
     handle_collection_rename, handle_collection_update, handle_evolve_corrects,
-    handle_evolve_extends,
-    handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
+    handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_graph_backlinks, handle_graph_dangling, handle_graph_hubs, handle_graph_links,
     handle_graph_neighbors, handle_graph_path, handle_superseded_by,
 };

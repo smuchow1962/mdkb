@@ -589,7 +589,10 @@ fn smoke_dup_honours_the_global_format_flag() {
     // text and markdown stay the prose report, which is markdown already.
     let text = stdout(&run(&["dup"], &repo.root));
     assert!(text.starts_with("# Duplication"), "{text}");
-    assert_eq!(text, stdout(&run(&["dup", "--format", "markdown"], &repo.root)));
+    assert_eq!(
+        text,
+        stdout(&run(&["dup", "--format", "markdown"], &repo.root))
+    );
 }
 
 #[test]

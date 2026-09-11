@@ -257,7 +257,10 @@ async fn review_mode_reports_nothing_when_the_ref_changed_nothing() {
         .await
         .expect("duplicates scope");
 
-    assert_eq!(count, 0, "nothing changed, so nothing is under review:\n{mcp}");
+    assert_eq!(
+        count, 0,
+        "nothing changed, so nothing is under review:\n{mcp}"
+    );
     assert!(
         !cli.contains("aggregate"),
         "and the CLI must not fall back to the full sweep:\n{cli}"

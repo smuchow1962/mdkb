@@ -270,7 +270,10 @@ fn bucket_summary(clusters: &[Cluster], cut: u32) -> Vec<(Bucket, usize, u32)> {
     Bucket::ALL
         .into_iter()
         .filter_map(|bucket| {
-            let members: Vec<&Cluster> = clusters.iter().filter(|c| c.bucket(cut) == bucket).collect();
+            let members: Vec<&Cluster> = clusters
+                .iter()
+                .filter(|c| c.bucket(cut) == bucket)
+                .collect();
             if members.is_empty() {
                 return None;
             }
@@ -912,7 +915,9 @@ mod tests {
         ]);
         let hash = c.cluster_hash();
 
-        let out = render(&[c], 6, &mut |_| Some("fn parse() {\n    todo!()\n}\n".into()));
+        let out = render(&[c], 6, &mut |_| {
+            Some("fn parse() {\n    todo!()\n}\n".into())
+        });
 
         assert!(out.contains(&hash), "the cluster hash:\n{out}");
         // 1-based display over 0-based storage: line_start 10 renders as 11.
@@ -1025,10 +1030,13 @@ mod tests {
 
     #[test]
     fn json_reports_a_semantic_finding_as_a_cosine_and_no_hamming() {
-        let out = render_json(&[cluster(vec![
-            member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 3),
-            member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
-        ])], 6);
+        let out = render_json(
+            &[cluster(vec![
+                member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 3),
+                member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
+            ])],
+            6,
+        );
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
 
         let evidence = &value["findings"][0]["evidence"];
@@ -1073,7 +1081,11 @@ mod tests {
         for row in &rows[1..] {
             assert!(row.starts_with(&format!("{hash},parse,3,")), "{row}");
         }
-        assert!(rows[1].contains("src/a.rs,11,13,alpha::parse"), "{}", rows[1]);
+        assert!(
+            rows[1].contains("src/a.rs,11,13,alpha::parse"),
+            "{}",
+            rows[1]
+        );
         assert!(rows[3].contains("src/c.rs"), "{}", rows[3]);
     }
 
@@ -1115,7 +1127,10 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&render_json(&clusters, 6)).unwrap();
 
         // 8 duplicated in the first cluster, 4 in the second.
-        assert!(prose.contains("2 clusters, 12 duplicated lines."), "{prose}");
+        assert!(
+            prose.contains("2 clusters, 12 duplicated lines."),
+            "{prose}"
+        );
         assert_eq!(value["clusters"], 2);
         assert_eq!(value["duplicated_lines"], 12);
         assert_eq!(
@@ -1208,7 +1223,10 @@ mod tests {
     /// past the named bands was ever part of the hand-classified sample.
     #[test]
     fn a_distance_past_every_named_band_falls_back_to_at_cut() {
-        assert_eq!(Evidence::Structural { hamming: 7 }.bucket(10), Bucket::AtCut);
+        assert_eq!(
+            Evidence::Structural { hamming: 7 }.bucket(10),
+            Bucket::AtCut
+        );
     }
 
     #[test]
@@ -1235,7 +1253,9 @@ mod tests {
         ];
 
         let out = render(&clusters, 6, &mut |_| None);
-        let table_start = out.find("| bucket |").unwrap_or_else(|| panic!("a bucket table:\n{out}"));
+        let table_start = out
+            .find("| bucket |")
+            .unwrap_or_else(|| panic!("a bucket table:\n{out}"));
         let rows: Vec<&str> = out[table_start..]
             .lines()
             .skip(2) // header row, then the `|---|---:|---:|` separator
@@ -1322,8 +1342,22 @@ mod tests {
     fn a_0_bit_single_module_cluster_outranks_a_6_bit_12_module_one() {
         let trustworthy = Cluster {
             members: vec![
-                member(1, "trustworthy", "src/a.rs", Some("alpha"), Visibility::Private, 10),
-                member(2, "trustworthy", "src/a.rs", Some("alpha"), Visibility::Private, 10),
+                member(
+                    1,
+                    "trustworthy",
+                    "src/a.rs",
+                    Some("alpha"),
+                    Visibility::Private,
+                    10,
+                ),
+                member(
+                    2,
+                    "trustworthy",
+                    "src/a.rs",
+                    Some("alpha"),
+                    Visibility::Private,
+                    10,
+                ),
             ],
             evidence: Evidence::Structural { hamming: 0 },
         };
@@ -1332,7 +1366,14 @@ mod tests {
                 .map(|i| {
                     let file = format!("src/m{i}.rs");
                     let module = format!("mod{i}");
-                    member(100 + i, "noisy", &file, Some(&module), Visibility::Public, 10)
+                    member(
+                        100 + i,
+                        "noisy",
+                        &file,
+                        Some(&module),
+                        Visibility::Public,
+                        10,
+                    )
                 })
                 .collect(),
             evidence: Evidence::Structural { hamming: 6 },

@@ -316,7 +316,12 @@ mod tests {
         // free. Bodies over 256 tokens are what that question needs, and this
         // case set has none.
         let variants: Vec<(&str, EmbeddingModel, Option<usize>, usize)> = vec![
-            ("AllMiniLML6V2-384", EmbeddingModel::AllMiniLML6V2, None, 512),
+            (
+                "AllMiniLML6V2-384",
+                EmbeddingModel::AllMiniLML6V2,
+                None,
+                512,
+            ),
             (
                 "JinaEmbeddingsV2BaseCode-768",
                 EmbeddingModel::JinaEmbeddingsV2BaseCode,
