@@ -7,6 +7,7 @@ use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
     Call, CallWalk, EdgeWalk, LanguageParser, check_recursion_depth, node_range,
 };
+use crate::code::parsing::rust::receiver as receiver_type;
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -775,10 +776,15 @@ impl RustParser {
 
     // ── Calls ───────────────────────────────────────────────────────────
 
-    fn find_calls_in_node<'a>(
-        node: Node,
+    fn find_calls_in_node<'a, 't>(
+        node: Node<'t>,
         code: &'a str,
         current_fn: Option<&'a str>,
+        // The node the name belongs to, threaded for the same reason the name
+        // is: a receiver's type is written in the function that binds it, and
+        // walking back up to find that function at every call site is the
+        // O(n·depth) the name already avoids.
+        current_fn_node: Option<Node<'t>>,
         depth: usize,
         calls: &mut Vec<Call<'a>>,
     ) {
@@ -787,12 +793,13 @@ impl RustParser {
         }
         // Thread the innermost enclosing function name down the walk instead of
         // re-walking ancestors to the root at every node (PERF-C1: O(n) not O(n·depth)).
-        let current_fn = if node.kind() == "function_item" {
-            node.child_by_field_name("name")
-                .map(|n| &code[n.byte_range()])
-                .or(current_fn)
+        let (current_fn, current_fn_node) = if node.kind() == "function_item" {
+            match node.child_by_field_name("name") {
+                Some(name) => (Some(&code[name.byte_range()]), Some(node)),
+                None => (current_fn, current_fn_node),
+            }
         } else {
-            current_fn
+            (current_fn, current_fn_node)
         };
 
         if node.kind() == "call_expression" {
@@ -806,24 +813,27 @@ impl RustParser {
                         fn_node
                             .child_by_field_name("field")
                             .map(|f| &code[f.byte_range()]),
-                        fn_node
-                            .child_by_field_name("value")
-                            .map(|v| code[v.byte_range()].trim()),
+                        fn_node.child_by_field_name("value"),
                     ),
-                    "identifier" | "scoped_identifier" => {
-                        (Some(&code[fn_node.byte_range()]), None)
-                    }
+                    "identifier" | "scoped_identifier" => (Some(&code[fn_node.byte_range()]), None),
                     _ => (None, None),
                 };
 
                 if let (Some(target), Some(caller)) = (target, current_fn) {
-                    calls.push(Call::on(caller, target, receiver, node_range(node)));
+                    calls.push(Call {
+                        caller,
+                        target,
+                        receiver: receiver.map(|r| code[r.byte_range()].trim()),
+                        receiver_type: receiver
+                            .and_then(|r| receiver_type::infer(current_fn_node, code, r)),
+                        range: node_range(node),
+                    });
                 }
             }
         }
 
         for child in node.children(&mut node.walk()) {
-            Self::find_calls_in_node(child, code, current_fn, depth + 1, calls);
+            Self::find_calls_in_node(child, code, current_fn, current_fn_node, depth + 1, calls);
         }
     }
 
@@ -1082,7 +1092,7 @@ impl LanguageParser for RustParser {
 
     fn calls_walk(&self) -> Option<CallWalk> {
         Some(|root, code, found| {
-            Self::find_calls_in_node(*root, code, Some("<module>"), 0, found);
+            Self::find_calls_in_node(*root, code, Some("<module>"), None, 0, found);
         })
     }
 
@@ -1351,7 +1361,11 @@ fn process() {}
                 .iter()
                 .any(|c| c.caller == "main" && c.target == "String::new")
         );
-        assert!(calls.iter().any(|c| c.caller == "main" && c.target == "push"));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.caller == "main" && c.target == "push")
+        );
     }
 
     /// A method call used to record its name and nothing else, so the call site
@@ -1666,9 +1680,7 @@ fn m() {
 
         let calls = parser.find_calls(code);
         assert!(
-            calls
-                .iter()
-                .any(|c| c.caller == "m" && c.target == "write"),
+            calls.iter().any(|c| c.caller == "m" && c.target == "write"),
             "the function call must stay a call, got {calls:?}"
         );
         assert_eq!(

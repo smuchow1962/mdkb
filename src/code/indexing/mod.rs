@@ -185,12 +185,40 @@ impl IndexFacade {
             stats
         };
 
+        self.resolve_receiver_types();
         self.db.mark_index_scan_completed()?;
         self.verify_sound()?;
         Ok(IndexStats {
             files_removed: stats.files_removed + files_removed,
             ..stats
         })
+    }
+
+    /// Turn the receiver names the parser could not type into types.
+    ///
+    /// A receiver bound by `let d = tempdir()` has the type `tempdir` returns,
+    /// which the file holding the call cannot see. The parser writes the
+    /// function's name down and this runs once the pipeline is finished, when
+    /// every signature of this run is in the index — see
+    /// [`receiver::resolve_types`].
+    ///
+    /// Only after a run that indexed something. The pass is index-wide, so the
+    /// run that brought a signature in is the run that resolves every call
+    /// waiting on it, wherever those calls live; a run that changed nothing has
+    /// nothing new to offer them.
+    ///
+    /// A failure is logged, not returned: the symbols and relationships are
+    /// already committed, and reporting the whole index as failed over a
+    /// resolution pass would make a caller discard a good index. The next run
+    /// tries again.
+    fn resolve_receiver_types(&self) {
+        match receiver::resolve_types(&self.db) {
+            Ok(resolved) => tracing::debug!("Resolved {resolved} receiver types"),
+            Err(e) => tracing::warn!(
+                "Failed to resolve receiver types: {e}. \
+                 Impact: calls on those receivers stay ambiguous until the next run."
+            ),
+        }
     }
 
     /// Drop every vector whose symbol id is gone from the database.
@@ -334,6 +362,7 @@ impl IndexFacade {
     ) -> anyhow::Result<IndexStats> {
         let stats = pipeline::index_files(paths, root, &self.db, &self.config)?;
         self.generate_symbol_embeddings_for_files(paths, root, reusable);
+        self.resolve_receiver_types();
         self.db.mark_index_scan_completed()?;
         Ok(stats)
     }
@@ -1145,6 +1174,62 @@ pub fn world() {
             receiver("helper"),
             None,
             "a call on nothing stores no receiver rather than an empty string"
+        );
+    }
+
+    /// The type a receiver has is worth more than the expression it was
+    /// written as, and the two arrive by different routes: a declared type
+    /// comes out of the file the call is in, a called one needs the signature
+    /// that a later file may hold. Both end in the same column, and a resolver
+    /// that reads one and not the other sees half the receivers.
+    #[test]
+    fn indexing_types_the_receivers_the_file_declares_and_the_index_explains() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            src_dir.path().join("main.rs"),
+            "fn declared() {\n\
+             \x20   let store: Store = build();\n\
+             \x20   store.get(1);\n\
+             }\n\
+             fn called() {\n\
+             \x20   let made = open_store();\n\
+             \x20   made.put(2);\n\
+             }\n",
+        )
+        .unwrap();
+        // A second file, so the signature `open_store` needs is one no parse of
+        // the call site could have seen.
+        fs::write(
+            src_dir.path().join("store.rs"),
+            "pub fn open_store() -> Store { Store }\n",
+        )
+        .unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        let call_site = |to_name: &str| -> (Option<String>, Option<String>) {
+            facade
+                .db
+                .conn()
+                .query_row(
+                    "SELECT to_receiver_type, to_receiver_call FROM code_relationships \
+                     WHERE kind = 'Calls' AND to_name = ?1",
+                    [to_name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(
+            call_site("get"),
+            (Some("Store".to_string()), None),
+            "a receiver the file declares is typed by the parser alone"
+        );
+        assert_eq!(
+            call_site("put"),
+            (Some("Store".to_string()), Some("open_store".to_string())),
+            "a receiver bound by a call is typed once the signature is indexed"
         );
     }
 

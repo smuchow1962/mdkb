@@ -18,6 +18,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::code::indexing::hasher;
 use crate::code::indexing::module_path::module_path_for;
+use crate::code::indexing::receiver;
 use crate::code::indexing::types::{
     CollectedImport, CollectedRelationship, FileContent, FileRegistration, IndexBatch, IndexStats,
     ParsedFile, RawImport, RawRelationship, RawSymbol,
@@ -32,15 +33,14 @@ use crate::code::parsing::java::JavaParser;
 use crate::code::parsing::kotlin::KotlinParser;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::lua::LuaParser;
-use crate::code::indexing::receiver;
-use crate::code::parsing::parser::{LanguageParser, split_call_target};
+use crate::code::parsing::parser::{LanguageParser, ReceiverType, split_call_target};
 use crate::code::parsing::php::PhpParser;
 use crate::code::parsing::python::PythonParser;
 use crate::code::parsing::rust::RustParser;
 use crate::code::parsing::swift::SwiftParser;
 use crate::code::parsing::typescript::TypeScriptParser;
 use crate::code::relationship::RelationKind;
-use crate::code::storage::CodeDb;
+use crate::code::storage::{CallSite, CodeDb};
 use crate::code::symbol::Symbol;
 use crate::code::symbol::Visibility;
 use crate::code::types::{FileId, SymbolCounter, SymbolId};
@@ -459,6 +459,14 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 to_name: name.into(),
                 to_qualifier: qualifier.map(Into::into),
                 to_receiver: call.receiver.and_then(receiver::normalize),
+                to_receiver_type: match call.receiver_type {
+                    Some(ReceiverType::Named(name)) => Some(name.into()),
+                    _ => None,
+                },
+                to_receiver_call: match call.receiver_type {
+                    Some(ReceiverType::ReturnOf(name)) => Some(name.into()),
+                    _ => None,
+                },
                 to_range: call.range,
                 kind: RelationKind::Calls,
             });
@@ -471,6 +479,8 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 to_name: macro_name.into(),
                 to_qualifier: None,
                 to_receiver: None,
+                to_receiver_type: None,
+                to_receiver_call: None,
                 to_range: range,
                 kind: RelationKind::Expands,
             });
@@ -483,6 +493,8 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 to_name: trait_name.into(),
                 to_qualifier: None,
                 to_receiver: None,
+                to_receiver_type: None,
+                to_receiver_call: None,
                 to_range: range,
                 kind: RelationKind::Implements,
             });
@@ -495,6 +507,8 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 to_name: base.into(),
                 to_qualifier: None,
                 to_receiver: None,
+                to_receiver_type: None,
+                to_receiver_call: None,
                 to_range: range,
                 kind: RelationKind::Extends,
             });
@@ -507,6 +521,8 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 to_name: used_type.into(),
                 to_qualifier: None,
                 to_receiver: None,
+                to_receiver_type: None,
+                to_receiver_call: None,
                 to_range: range,
                 kind: RelationKind::Uses,
             });
@@ -519,6 +535,8 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 to_name: method.into(),
                 to_qualifier: None,
                 to_receiver: None,
+                to_receiver_type: None,
+                to_receiver_call: None,
                 to_range: range,
                 kind: RelationKind::Defines,
             });
@@ -682,6 +700,8 @@ fn stage_collect(
                 to_name: raw_rel.to_name,
                 to_qualifier: raw_rel.to_qualifier,
                 to_receiver: raw_rel.to_receiver,
+                to_receiver_type: raw_rel.to_receiver_type,
+                to_receiver_call: raw_rel.to_receiver_call,
                 file_id,
                 kind: raw_rel.kind,
                 to_range: Some(raw_rel.to_range),
@@ -829,8 +849,12 @@ fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyho
             real_from_id,
             &rel.from_name,
             &rel.to_name,
-            rel.to_qualifier.as_deref(),
-            rel.to_receiver.as_deref(),
+            &CallSite {
+                qualifier: rel.to_qualifier.as_deref(),
+                receiver: rel.to_receiver.as_deref(),
+                receiver_type: rel.to_receiver_type.as_deref(),
+                receiver_call: rel.to_receiver_call.as_deref(),
+            },
             &rel.kind.to_string(),
             real_file_id,
             (

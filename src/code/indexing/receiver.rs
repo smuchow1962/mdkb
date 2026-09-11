@@ -10,6 +10,9 @@
 //!
 //! [`Call::receiver`]: crate::code::parsing::parser::Call::receiver
 
+use crate::code::parsing::rust::receiver as rust_receiver;
+use crate::code::storage::CodeDb;
+
 /// The longest receiver expression kept, in bytes.
 ///
 /// A receiver is normally a name or two. A multi-line builder chain is the
@@ -53,6 +56,68 @@ pub fn normalize(expr: &str) -> Option<Box<str>> {
         out = out[cut..].to_string();
     }
     Some(out.into())
+}
+
+/// Fill in every receiver type that needed the whole index to know.
+///
+/// A receiver bound by `let d = tempdir()` has the type `tempdir` returns, and
+/// which file declares `tempdir` — or whether any does — is not something the
+/// file holding the call can see. So the parser records the function's name
+/// and this runs once every file is in, resolving the name against the
+/// signatures now present.
+///
+/// It reruns over every unresolved row, not only the rows of this run's files:
+/// a call written last week becomes resolvable the moment the function it
+/// names is indexed today, and a pass that only looked at new rows would
+/// leave it unresolved forever.
+///
+/// A name several symbols answer to is only resolved when they agree on the
+/// type. Two functions named `store` returning different types say nothing
+/// about which one the call site meant, and guessing one would report the call
+/// as leaving the index on the strength of a coin toss.
+///
+/// Returns how many rows gained a type.
+pub fn resolve_types(db: &CodeDb) -> rusqlite::Result<u32> {
+    let conn = db.conn();
+    let pending: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT to_receiver_call FROM code_relationships \
+             WHERE to_receiver_call IS NOT NULL AND to_receiver_type IS NULL",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut signatures = conn.prepare(
+        "SELECT s.signature FROM code_symbols s \
+         JOIN code_files f ON f.id = s.file_id \
+         WHERE s.name = ?1 AND s.signature IS NOT NULL AND f.language = 'rust'",
+    )?;
+    let mut resolved = 0;
+    for name in pending {
+        let declared: Vec<Option<String>> = signatures
+            .query_map([&name], |row| {
+                Ok(rust_receiver::return_type(&row.get::<_, String>(0)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        // One type, agreed by every symbol of that name. An empty set is not
+        // agreement: nothing in this index declares the function, which the
+        // resolver reads for itself.
+        let mut agreed = declared.iter().flatten();
+        let Some(first) = agreed.next() else {
+            continue;
+        };
+        if agreed.any(|other| other != first) || declared.iter().any(Option::is_none) {
+            continue;
+        }
+
+        resolved += conn.execute(
+            "UPDATE code_relationships SET to_receiver_type = ?2 \
+             WHERE to_receiver_call = ?1 AND to_receiver_type IS NULL",
+            rusqlite::params![&name, first],
+        )? as u32;
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]

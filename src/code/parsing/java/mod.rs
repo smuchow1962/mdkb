@@ -5,7 +5,8 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    Call, CallWalk, EdgeWalk, LanguageParser, check_recursion_depth, last_name_segment, node_range, receiver_call_target,
+    Call, CallWalk, EdgeWalk, LanguageParser, check_recursion_depth, last_name_segment, node_range,
+    receiver_call_target,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};

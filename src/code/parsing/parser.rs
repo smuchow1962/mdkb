@@ -39,6 +39,8 @@ pub struct Call<'a> {
     pub caller: &'a str,
     pub target: &'a str,
     pub receiver: Option<&'a str>,
+    /// The receiver's type, as far as the file the call is in can tell.
+    pub receiver_type: Option<ReceiverType<'a>>,
     pub range: Range,
 }
 
@@ -49,25 +51,26 @@ impl<'a> Call<'a> {
             caller,
             target,
             receiver: None,
+            receiver_type: None,
             range,
         }
     }
+}
 
-    /// A call made on `receiver`, which is `None` when the grammar gives the
-    /// walk no receiver node to point at.
-    pub fn on(
-        caller: &'a str,
-        target: &'a str,
-        receiver: Option<&'a str>,
-        range: Range,
-    ) -> Self {
-        Self {
-            caller,
-            target,
-            receiver,
-            range,
-        }
-    }
+/// What a receiver's type is, when one file is all there is to read.
+///
+/// Two answers, because a type is named in two different places. `let d =
+/// TempDir::new()` names it at the call site and needs nothing else. `let d =
+/// tempdir()` names only the function, and what it returns is written in
+/// whichever file declares it — or in no file in the index, which is itself
+/// the answer: a value built outside the index has a type outside the index,
+/// and a method on it is not one of this index's symbols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverType<'a> {
+    /// The type is this name.
+    Named(&'a str),
+    /// The type is whatever this function or method returns.
+    ReturnOf(&'a str),
 }
 
 /// The walk that collects calls out of a parsed tree.

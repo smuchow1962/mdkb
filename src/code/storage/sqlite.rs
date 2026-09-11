@@ -30,6 +30,32 @@ pub enum NameMatch<'a> {
     Any,
 }
 
+/// What a call site said about its target, beyond the name.
+///
+/// One argument rather than four, because the four are one fact — "what does
+/// the source say about where this call goes" — and they arrive together from
+/// the parser, travel together through the pipeline and are read together by
+/// the resolver. A relationship that is not a call carries
+/// [`CallSite::default`], which says nothing and resolves by name alone.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CallSite<'a> {
+    /// Everything written before the target's last separator, `None` for a
+    /// bare name — see
+    /// [`split_call_target`](crate::code::parsing::parser::split_call_target).
+    /// It narrows the target and never widens it.
+    pub qualifier: Option<&'a str>,
+    /// The expression a method was called on, as written: `self.db`, `temp`,
+    /// `build()`.
+    pub receiver: Option<&'a str>,
+    /// The name of the receiver's type, when the file the call is in says it.
+    pub receiver_type: Option<&'a str>,
+    /// The function whose return type is the receiver's type, when the file
+    /// only names that. Resolved into `receiver_type` once every file is in
+    /// the index — see
+    /// [`resolve_types`](crate::code::indexing::receiver::resolve_types).
+    pub receiver_call: Option<&'a str>,
+}
+
 /// SQLite-backed code intelligence index.
 ///
 /// Write-capable constructors initialize the schema; [`CodeDb::open_read_only`]
@@ -345,23 +371,15 @@ impl CodeDb {
 
     /// Insert a relationship between symbols.
     ///
-    /// `to_qualifier` is everything the call site wrote before the last
-    /// separator, `None` for a bare name — see
-    /// [`split_call_target`](crate::code::parsing::parser::split_call_target).
-    ///
-    /// `to_receiver` is the expression a method was called on, `None` for a
-    /// call with no receiver and for one whose parser records none. The two are
-    /// different facts and are stored apart: a qualifier names a path the call
-    /// site wrote, while a receiver is a value whose type has to be worked out
-    /// before it names anything.
-    #[allow(clippy::too_many_arguments)]
+    /// `site` is what the call site said about its target beyond the name —
+    /// empty ([`CallSite::default`]) for every relationship that is not a
+    /// call.
     pub fn insert_relationship(
         &self,
         from_symbol_id: Option<i64>,
         from_name: &str,
         to_name: &str,
-        to_qualifier: Option<&str>,
-        to_receiver: Option<&str>,
+        site: &CallSite<'_>,
         kind: &str,
         file_id: i64,
         to_position: (Option<u32>, Option<u16>),
@@ -370,8 +388,8 @@ impl CodeDb {
         self.conn.execute(
             "INSERT INTO code_relationships \
              (from_symbol_id, from_name, to_name, kind, file_id, to_line, to_col, to_qualifier, \
-              to_receiver) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              to_receiver, to_receiver_type, to_receiver_call) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 from_symbol_id,
                 from_name,
@@ -380,8 +398,10 @@ impl CodeDb {
                 file_id,
                 to_line,
                 to_col.map(i64::from),
-                to_qualifier,
-                to_receiver,
+                site.qualifier,
+                site.receiver,
+                site.receiver_type,
+                site.receiver_call,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -1528,11 +1548,11 @@ mod tests {
                 Some(sym_id),
                 "caller",
                 "callee",
-                None,
-                None,
+                &CallSite::default(),
                 "Calls",
                 file_id,
-                (Some(5), Some(10)))
+                (Some(5), Some(10)),
+            )
             .unwrap();
         assert!(rel_id > 0);
         assert_eq!(db.relationship_count().unwrap(), 1);
@@ -1756,21 +1776,21 @@ mod tests {
             Some(caller_id),
             "caller",
             "callee_a",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             file_id,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
         db.insert_relationship(
             Some(caller_id),
             "caller",
             "callee_b",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             file_id,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         let called = db.get_called_functions(caller_id).unwrap();
@@ -1825,11 +1845,11 @@ mod tests {
             Some(caller),
             "caller",
             "helper",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
         (here_file, caller, imported, elsewhere)
     }
@@ -1859,11 +1879,14 @@ mod tests {
                 Some(caller),
                 "caller",
                 name,
-                qualifier,
-                None,
+                &CallSite {
+                    qualifier: qualifier,
+                    ..CallSite::default()
+                },
                 "Calls",
                 here_file,
-                (None, None))
+                (None, None),
+            )
             .unwrap();
         }
 
@@ -1894,11 +1917,14 @@ mod tests {
             Some(caller),
             "caller",
             "open",
-            Some("Store"),
-            None,
+            &CallSite {
+                qualifier: Some("Store"),
+                ..CallSite::default()
+            },
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert_eq!(
@@ -1958,11 +1984,14 @@ mod tests {
             Some(caller),
             "caller",
             "open",
-            Some("Store"),
-            None,
+            &CallSite {
+                qualifier: Some("Store"),
+                ..CallSite::default()
+            },
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert_eq!(
@@ -1985,11 +2014,14 @@ mod tests {
             Some(caller),
             "caller",
             "write",
-            Some("std::fs"),
-            None,
+            &CallSite {
+                qualifier: Some("std::fs"),
+                ..CallSite::default()
+            },
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert_eq!(
@@ -2014,11 +2046,14 @@ mod tests {
             Some(caller),
             "caller",
             "run",
-            Some("\\App\\Util"),
-            None,
+            &CallSite {
+                qualifier: Some("\\App\\Util"),
+                ..CallSite::default()
+            },
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert_eq!(
@@ -2049,11 +2084,14 @@ mod tests {
             Some(caller),
             "caller",
             "open",
-            Some("FooStore"),
-            None,
+            &CallSite {
+                qualifier: Some("FooStore"),
+                ..CallSite::default()
+            },
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert_eq!(
@@ -2084,11 +2122,14 @@ mod tests {
             Some(caller),
             "caller",
             "open",
-            Some("crate::myastore"),
-            None,
+            &CallSite {
+                qualifier: Some("crate::myastore"),
+                ..CallSite::default()
+            },
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert_eq!(
@@ -2113,11 +2154,14 @@ mod tests {
             Some(caller),
             "caller",
             "helper",
-            Some("imported"),
-            None,
+            &CallSite {
+                qualifier: Some("imported"),
+                ..CallSite::default()
+            },
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert_eq!(
@@ -2139,11 +2183,14 @@ mod tests {
             Some(caller),
             "caller",
             "write",
-            Some("std::fs"),
-            None,
+            &CallSite {
+                qualifier: Some("std::fs"),
+                ..CallSite::default()
+            },
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert!(
@@ -2300,11 +2347,11 @@ mod tests {
             Some(caller),
             "caller",
             "helper",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             here_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert_eq!(called_ids(&db, caller), vec![far]);
@@ -2363,11 +2410,11 @@ mod tests {
             Some(caller_id),
             "caller",
             "callee",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             file_id,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         let callers = db.get_calling_functions(callee_id).unwrap();
@@ -2399,12 +2446,26 @@ mod tests {
             )
             .unwrap();
 
-        db.insert_relationship(Some(b_id), "b", "a", None,
-            None, "Calls", file_id, (None, None))
-            .unwrap();
-        db.insert_relationship(Some(c_id), "c", "b", None,
-            None, "Calls", file_id, (None, None))
-            .unwrap();
+        db.insert_relationship(
+            Some(b_id),
+            "b",
+            "a",
+            &CallSite::default(),
+            "Calls",
+            file_id,
+            (None, None),
+        )
+        .unwrap();
+        db.insert_relationship(
+            Some(c_id),
+            "c",
+            "b",
+            &CallSite::default(),
+            "Calls",
+            file_id,
+            (None, None),
+        )
+        .unwrap();
 
         // Impact of "a" with depth 0: just "b" (direct caller)
         let impact = db.get_impact_radius(a_id, 0).unwrap();
@@ -2464,41 +2525,41 @@ mod tests {
             Some(near),
             "near",
             "root",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             near_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
         db.insert_relationship(
             Some(far),
             "far",
             "root",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             far_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
         db.insert_relationship(
             Some(shared),
             "shared",
             "near",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             near_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
         db.insert_relationship(
             Some(shared),
             "shared",
             "far",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             near_file,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         let by_tier = db.get_impact_by_tier(root, 1).unwrap();
@@ -2525,9 +2586,16 @@ mod tests {
             "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
         )
         .unwrap();
-        db.insert_relationship(None, "a", "b", None,
-            None, "Calls", file_id, (None, None))
-            .unwrap();
+        db.insert_relationship(
+            None,
+            "a",
+            "b",
+            &CallSite::default(),
+            "Calls",
+            file_id,
+            (None, None),
+        )
+        .unwrap();
 
         db.clear().unwrap();
         assert_eq!(db.file_count().unwrap(), 0);
@@ -2549,11 +2617,11 @@ mod tests {
             Some(sym_id),
             "fn1",
             "fn2",
-            None,
-            None,
+            &CallSite::default(),
             "Calls",
             file_id,
-            (None, None))
+            (None, None),
+        )
         .unwrap();
 
         assert_eq!(db.symbol_count().unwrap(), 1);
@@ -2580,9 +2648,16 @@ mod tests {
         .unwrap();
         assert_eq!(db.symbol_count().unwrap(), 1);
 
-        db.insert_relationship(None, "a", "b", None,
-            None, "Calls", file_id, (None, None))
-            .unwrap();
+        db.insert_relationship(
+            None,
+            "a",
+            "b",
+            &CallSite::default(),
+            "Calls",
+            file_id,
+            (None, None),
+        )
+        .unwrap();
         assert_eq!(db.relationship_count().unwrap(), 1);
     }
 
@@ -2834,12 +2909,26 @@ mod tests {
                 None,
             )
             .unwrap();
-        db.insert_relationship(Some(a_id), "a", "b", None,
-            None, "Calls", file_id, (None, None))
-            .unwrap();
-        db.insert_relationship(Some(b_id), "b", "a", None,
-            None, "Calls", file_id, (None, None))
-            .unwrap();
+        db.insert_relationship(
+            Some(a_id),
+            "a",
+            "b",
+            &CallSite::default(),
+            "Calls",
+            file_id,
+            (None, None),
+        )
+        .unwrap();
+        db.insert_relationship(
+            Some(b_id),
+            "b",
+            "a",
+            &CallSite::default(),
+            "Calls",
+            file_id,
+            (None, None),
+        )
+        .unwrap();
 
         // The walk stops at symbols already seen, so this terminates.
         let impact = db.get_impact_radius(a_id, 10).unwrap();

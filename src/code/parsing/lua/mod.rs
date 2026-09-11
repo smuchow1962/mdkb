@@ -4,7 +4,9 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::ParserContext;
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{Call, CallWalk, LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    Call, CallWalk, LanguageParser, check_recursion_depth, node_range,
+};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;

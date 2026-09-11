@@ -48,7 +48,9 @@ CREATE TABLE IF NOT EXISTS code_relationships (
     to_line INTEGER,
     to_col INTEGER,
     to_qualifier TEXT,
-    to_receiver TEXT
+    to_receiver TEXT,
+    to_receiver_type TEXT,
+    to_receiver_call TEXT
 );
 
 CREATE TABLE IF NOT EXISTS code_imports (
@@ -163,6 +165,10 @@ END;
 const CREATE_ADDED_INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_symbols_addr ON code_symbols(name, owner_name, module_path);
 CREATE INDEX IF NOT EXISTS idx_rels_to_qual ON code_relationships(to_name, to_qualifier);
+-- The receiver-typing pass reads every row that named a function and has no
+-- type yet. Without this it is a full scan of code_relationships per run.
+CREATE INDEX IF NOT EXISTS idx_rels_receiver_call
+    ON code_relationships(to_receiver_call) WHERE to_receiver_call IS NOT NULL;
 "#;
 
 /// Add `column` to `table` unless it is already there.
@@ -200,6 +206,8 @@ pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     add_column(conn, "code_symbols", "owner_name", "TEXT")?;
     add_column(conn, "code_relationships", "to_qualifier", "TEXT")?;
     add_column(conn, "code_relationships", "to_receiver", "TEXT")?;
+    add_column(conn, "code_relationships", "to_receiver_type", "TEXT")?;
+    add_column(conn, "code_relationships", "to_receiver_call", "TEXT")?;
     conn.execute_batch(CREATE_ADDED_INDEXES)?;
 
     // Triggers don't support IF NOT EXISTS — check before creating.
