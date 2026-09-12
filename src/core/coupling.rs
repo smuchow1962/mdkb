@@ -11,12 +11,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::code::duplication::candidates::MAX_SUPPRESSING_TIER;
 use crate::code::storage::resolved_edges;
 use crate::error::{Error, Result};
-use crate::git::{co_change_history, CoChangeHistory};
+use crate::git::{CoChangeHistory, co_change_history};
 
 /// Fewest co-changing commits before a pair is worth reporting.
 ///
@@ -257,11 +257,7 @@ fn indexed_file_set(code: &Connection) -> Result<HashSet<String>> {
 /// A pair in a fixed order, so the same two files always hash to the same key
 /// regardless of which one git or the graph query happened to name first.
 fn normalize_pair(a: String, b: String) -> (String, String) {
-    if a <= b {
-        (a, b)
-    } else {
-        (b, a)
-    }
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 /// Order findings worst-first: most co-changes first, then alphabetically for

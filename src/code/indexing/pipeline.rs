@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::code::indexing::hasher;
 use crate::code::indexing::module_path::module_path_for;
@@ -33,7 +33,7 @@ use crate::code::parsing::java::JavaParser;
 use crate::code::parsing::kotlin::KotlinParser;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::lua::LuaParser;
-use crate::code::parsing::parser::{split_call_target, LanguageParser, ReceiverType};
+use crate::code::parsing::parser::{LanguageParser, ReceiverType, split_call_target};
 use crate::code::parsing::php::PhpParser;
 use crate::code::parsing::python::PythonParser;
 use crate::code::parsing::rust::RustParser;
