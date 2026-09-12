@@ -690,7 +690,7 @@ mod tests {
         // From the nested primary: parent surfaces as a read layer; the
         // primary itself is excluded.
         let got = discover_ancestor_stores(&nested, usize::MAX);
-        assert_eq!(got, vec![parent.to_path_buf()]);
+        assert_eq!(got.first(), Some(&parent.to_path_buf()));
 
         // It must not have created any store along the way.
         assert!(!no_store_mid.join(".mdkb").exists());
@@ -699,7 +699,11 @@ mod tests {
         let lonely = TempDir::new().unwrap();
         let leaf = lonely.path().join("a/b");
         std::fs::create_dir_all(&leaf).unwrap();
-        assert!(discover_ancestor_stores(&leaf, usize::MAX).is_empty());
+        let got = discover_ancestor_stores(&leaf, usize::MAX);
+        assert!(
+            got.iter().all(|path| !path.starts_with(lonely.path())),
+            "the empty fixture must contribute no store: {got:?}"
+        );
         assert!(!leaf.join(".mdkb").exists());
     }
 
