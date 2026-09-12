@@ -233,7 +233,7 @@ impl McpServer {
                     match handles.len() {
                         0 => {
                             return Err(mcp_error(
-                                "No repos registered. Waiting for MCP roots from client.",
+                                "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
                             ));
                         }
                         1 => handles.into_iter().next().unwrap(),
@@ -518,7 +518,13 @@ impl McpServer {
 
     /// Search documents using hybrid search (BM25 + semantic with RRF fusion).
     #[tool(
-        description = "Semantic search (fuzzy, not literal). Searches docs+memory (default), code symbols (scope=\"symbols\"), or semantic code (scope=\"code\"). For exact string/regex matching, use Grep instead."
+        description = "Semantic search (fuzzy, not literal). Searches docs+memory (default), docs, memory, code symbols (scope=\"symbols\"), semantic code (scope=\"code\"), or duplication clusters (scope=\"duplicates\"). For exact string/regex matching, use Grep instead.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn search(
         &self,
@@ -543,7 +549,13 @@ impl McpServer {
     /// Retrieve a document by ID or path, with optional line range.
     /// Also accepts memory slugs, glob patterns, and comma-separated lists.
     #[tool(
-        description = "Retrieve a document by ID, path, or memory slug, with optional line range. In multi-repo mode, pass the exact repository root; root=\"*\" is supported only by search."
+        description = "Retrieve a document by ID, path, or memory slug, with optional line range. In multi-repo mode, pass the exact repository root; root=\"*\" is supported only by search.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn get(
         &self,
@@ -565,7 +577,15 @@ impl McpServer {
     }
 
     /// Get index status including documents, collections, and code index.
-    #[tool(description = "Get index status: collections, documents, code index stats.")]
+    #[tool(
+        description = "Get index status: collections, documents, code index stats.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     pub async fn status(
         &self,
         Parameters(_): Parameters<EmptyObject>,
@@ -583,7 +603,15 @@ impl McpServer {
     }
 
     /// Reindex everything: documents (from collections) and source code (from project root).
-    #[tool(description = "Differential reindex of all collections.")]
+    #[tool(
+        description = "Differential reindex of all collections.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn update(
         &self,
         Parameters(_): Parameters<EmptyObject>,
@@ -604,7 +632,13 @@ impl McpServer {
 
     /// Write or update a memory entry.
     #[tool(
-        description = "Create or update a memory entry. Types: problem, decision, topic. Slug ID, title max 50 chars."
+        description = "Create or update a memory entry. Types: topic, problem, decision, reminder, prior, handoff. Slug ID, title max 50 chars.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     pub async fn memory_write(
         &self,
@@ -640,7 +674,13 @@ impl McpServer {
 
     /// Write multiple memory entries in one call.
     #[tool(
-        description = "Create or update multiple memory entries at once. Same semantics as memory_write, batched. Max 20 entries."
+        description = "Create or update multiple memory entries at once. Same semantics as memory_write, batched. Max 20 entries.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn memory_write_batch(
         &self,
@@ -665,7 +705,15 @@ impl McpServer {
     }
 
     /// Delete a memory entry by ID.
-    #[tool(description = "Delete a memory entry by ID.")]
+    #[tool(
+        description = "Delete a memory entry by ID.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn memory_delete(
         &self,
         Parameters(params): Parameters<MemoryDeleteParams>,
@@ -684,7 +732,13 @@ impl McpServer {
 
     /// Record a Bayesian confirmation signal for a memory entry.
     #[tool(
-        description = "Record outcome=\"confirmed\"|\"refuted\" against a memory entry. Atomic: increments or decrements confirmations (floor 0) and advances last_confirmed_at."
+        description = "Record outcome=\"confirmed\"|\"refuted\" against a memory entry. Atomic: increments or decrements confirmations (floor 0) and advances last_confirmed_at.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     pub async fn memory_confirm(
         &self,
@@ -703,7 +757,15 @@ impl McpServer {
     }
 
     /// List memory entries with configurable sort order.
-    #[tool(description = "List memory entries sorted by recency, popularity, or creation date.")]
+    #[tool(
+        description = "List memory entries sorted by recency, popularity, or creation date.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn memory_list(
         &self,
         Parameters(params): Parameters<MemoryListParams>,
@@ -726,7 +788,13 @@ impl McpServer {
 
     /// Query the code call graph: outgoing calls, incoming callers, or impact radius.
     #[tool(
-        description = "Query code call graph. Resolves fuzzy/partial names. Directions: calls (default), callers, impact. For calls, tier <= 2 is resolved; tier >= 3 is a candidate list to confirm with grep."
+        description = "Query code call graph. Resolves fuzzy/partial names. Directions: calls (default), callers, impact. For calls, tier <= 2 is resolved; tier >= 3 is a candidate list to confirm with grep.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn code_graph(
         &self,
@@ -747,7 +815,13 @@ impl McpServer {
 
     /// Query the knowledge graph: links, backlinks, neighbors, or shortest path.
     #[tool(
-        description = "Query the knowledge graph (frontmatter + wikilink edges). Directions: links (default, outgoing), backlinks (incoming), neighbors (adjacent), path (shortest path to `to`)."
+        description = "Query the knowledge graph (frontmatter + wikilink edges). Directions: links (default, outgoing), backlinks (incoming), neighbors (adjacent), path (shortest path to `to`).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn graph(
         &self,
@@ -763,7 +837,13 @@ impl McpServer {
 
     /// Audit token economy: session/lifetime token counts, per-tool usage, top-5 most-called.
     #[tool(
-        description = "Audit token economy: session tokens, per-tool counts, top-5 most-called, lifetime totals."
+        description = "Audit token economy: session tokens, per-tool counts, top-5 most-called, lifetime totals.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn usage(
         &self,
@@ -2193,6 +2273,93 @@ mod tests {
             "BASE_INSTRUCTIONS exceeds 600-token budget: {} tokens",
             tokens
         );
+    }
+
+    #[test]
+    fn every_advertised_tool_has_complete_annotations() {
+        let tools = McpServer::tool_router().list_all();
+        assert_eq!(
+            tools.len(),
+            12,
+            "the annotation audit must cover every tool"
+        );
+        let read_only = [
+            "search",
+            "get",
+            "status",
+            "memory_list",
+            "code_graph",
+            "graph",
+            "usage",
+        ];
+
+        for tool in &tools {
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+            assert!(
+                annotations.read_only_hint.is_some(),
+                "{}: readOnlyHint",
+                tool.name
+            );
+            assert!(
+                annotations.destructive_hint.is_some(),
+                "{}: destructiveHint",
+                tool.name
+            );
+            assert!(
+                annotations.idempotent_hint.is_some(),
+                "{}: idempotentHint",
+                tool.name
+            );
+            assert!(
+                annotations.open_world_hint.is_some(),
+                "{}: openWorldHint",
+                tool.name
+            );
+            assert_eq!(
+                annotations.read_only_hint,
+                Some(read_only.contains(&tool.name.as_ref())),
+                "{} has the wrong readOnlyHint",
+                tool.name
+            );
+        }
+
+        eprintln!(
+            "tools/list tool metadata size: {} bytes",
+            serde_json::to_vec(&tools).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn tool_descriptions_cover_their_closed_input_sets() {
+        let tools = McpServer::tool_router().list_all();
+        let memory_write = tools
+            .iter()
+            .find(|tool| tool.name == "memory_write")
+            .expect("memory_write is advertised");
+        let memory_description = memory_write.description.as_deref().unwrap_or_default();
+        for entry_type in crate::store::memory::EntryType::ALL {
+            assert!(
+                memory_description.contains(entry_type.as_str()),
+                "memory_write omits entry type {}",
+                entry_type.as_str()
+            );
+        }
+
+        let search = tools
+            .iter()
+            .find(|tool| tool.name == "search")
+            .expect("search is advertised");
+        let search_description = search.description.as_deref().unwrap_or_default();
+        for scope in crate::mcp::tools::SearchScope::ALL {
+            assert!(
+                search_description.contains(scope.as_str()),
+                "search omits scope {}",
+                scope.as_str()
+            );
+        }
     }
 
     #[test]
@@ -3908,10 +4075,14 @@ if (require.main === module) {
 
         let server = McpServer::global(registry);
         let err = server.resolve_handle(None).await.unwrap_err();
+        let message = format!("{err:?}");
         assert!(
-            format!("{:?}", err).contains("No repos registered"),
-            "Should error on empty registry: {:?}",
-            err
+            message.contains("No repos registered"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("root=\\\"/abs/path\\\""),
+            "message: {message}"
         );
     }
 

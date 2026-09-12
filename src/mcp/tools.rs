@@ -3,6 +3,47 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Closed set of scopes accepted by [`SearchParams`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    Docs,
+    Memory,
+    Code,
+    Symbols,
+    Duplicates,
+}
+
+impl SearchScope {
+    pub const ALL: [Self; 5] = [
+        Self::Docs,
+        Self::Memory,
+        Self::Code,
+        Self::Symbols,
+        Self::Duplicates,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Docs => "docs",
+            Self::Memory => "memory",
+            Self::Code => "code",
+            Self::Symbols => "symbols",
+            Self::Duplicates => "duplicates",
+        }
+    }
+}
+
+impl TryFrom<&str> for SearchScope {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::ALL
+            .into_iter()
+            .find(|scope| scope.as_str() == value)
+            .ok_or(())
+    }
+}
+
 /// Parameters for the search tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SearchParams {

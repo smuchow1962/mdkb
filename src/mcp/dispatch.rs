@@ -1263,11 +1263,22 @@ pub async fn search_impl(
 ) -> Result<(String, usize), McpError> {
     ensure_handle_context(handle).await?;
 
-    let scope = params.scope.as_deref();
+    let scope = params
+        .scope
+        .as_deref()
+        .map(crate::mcp::tools::SearchScope::try_from)
+        .transpose()
+        .map_err(|()| {
+            let invalid = params.scope.as_deref().unwrap_or_default();
+            let valid = crate::mcp::tools::SearchScope::ALL
+                .map(crate::mcp::tools::SearchScope::as_str)
+                .join(", ");
+            mcp_error(format!("Invalid scope: '{invalid}'. Valid: {valid}."))
+        })?;
     let limit = params.limit.min(100);
 
     match scope {
-        Some("docs") => {
+        Some(crate::mcp::tools::SearchScope::Docs) => {
             let mut ctx_guard = handle.ctx.lock().await;
             let results = crate::core::run_guarded_read(&mut ctx_guard, "document search", |ctx| {
                 handle_hybrid_search(
@@ -1293,7 +1304,7 @@ pub async fn search_impl(
             .map_err(|e| mcp_store_error("Failed to inspect index state", e))?;
             Ok((output, results.len()))
         }
-        Some("memory") => {
+        Some(crate::mcp::tools::SearchScope::Memory) => {
             let query_embedding = embed_query_off_lock(&params.query).await;
             let mut ctx_guard = handle.ctx.lock().await;
             let entries = crate::core::run_guarded_read(&mut ctx_guard, "memory search", |ctx| {
@@ -1379,13 +1390,13 @@ pub async fn search_impl(
             .map_err(|e| mcp_store_error("Failed to inspect index state", e))?;
             Ok((output, total))
         }
-        Some("code" | "symbols") => {
+        Some(crate::mcp::tools::SearchScope::Code | crate::mcp::tools::SearchScope::Symbols) => {
             let mut idx_guard = acquire_handle_code_index(handle).await?;
             let Some(facade) = idx_guard.as_mut() else {
                 return Ok(("Code index is being rebuilt, retry shortly.".to_string(), 0));
             };
 
-            if scope == Some("code") {
+            if scope == Some(crate::mcp::tools::SearchScope::Code) {
                 let code_limit = params.limit.min(5);
                 let results = crate::core::code::semantic_search_scoped(
                     facade,
@@ -1453,7 +1464,7 @@ pub async fn search_impl(
                 Ok((out, count))
             }
         }
-        Some("duplicates") => {
+        Some(crate::mcp::tools::SearchScope::Duplicates) => {
             // The audit reads the code index off its own read-only connection,
             // so it does not take the code-index guard the other code scopes
             // need. It does take the memory connection, for the ignore-list.
@@ -1484,9 +1495,6 @@ pub async fn search_impl(
 
             Ok((report.markdown.clone(), report.clusters()))
         }
-        Some(invalid) => Err(mcp_error(format!(
-            "Invalid scope: '{invalid}'. Valid: docs, memory, code, symbols, duplicates."
-        ))),
     }
 }
 
@@ -1502,14 +1510,26 @@ pub async fn cross_repo_search_impl(
 ) -> Result<(String, usize), McpError> {
     if handles.is_empty() {
         return Err(mcp_error(
-            "No repos registered. Waiting for MCP roots from client.",
+            "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
         ));
     }
 
-    let scope = params.scope.as_deref();
+    let scope = params
+        .scope
+        .as_deref()
+        .map(crate::mcp::tools::SearchScope::try_from)
+        .transpose()
+        .map_err(|()| mcp_error("Invalid search scope"))?;
     let limit = params.limit.min(100);
 
-    if matches!(scope, Some("code" | "symbols" | "duplicates")) {
+    if matches!(
+        scope,
+        Some(
+            crate::mcp::tools::SearchScope::Code
+                | crate::mcp::tools::SearchScope::Symbols
+                | crate::mcp::tools::SearchScope::Duplicates
+        )
+    ) {
         return Err(mcp_error(
             "Cross-repo search is not supported for code/symbols/duplicates scope. Specify a root.",
         ));
@@ -1537,7 +1557,7 @@ pub async fn cross_repo_search_impl(
                 return Vec::<SearchResult>::new();
             }
             // Embed off the runtime before locking — memory scope only needs it.
-            let query_embedding = if scope == Some("memory") {
+            let query_embedding = if scope == Some(crate::mcp::tools::SearchScope::Memory) {
                 embed_query_off_lock(&query).await
             } else {
                 None
@@ -1549,7 +1569,7 @@ pub async fn cross_repo_search_impl(
             let mut repo_results: Vec<SearchResult> = Vec::new();
 
             match scope {
-                Some("docs") | None => {
+                Some(crate::mcp::tools::SearchScope::Docs) | None => {
                     let result = crate::core::run_guarded_read(
                         &mut ctx_guard,
                         "cross-repo document search",
@@ -1579,7 +1599,7 @@ pub async fn cross_repo_search_impl(
                         None => {}
                     }
                 }
-                Some("memory") => {
+                Some(crate::mcp::tools::SearchScope::Memory) => {
                     let result = crate::core::run_guarded_read(
                         &mut ctx_guard,
                         "cross-repo memory search",
