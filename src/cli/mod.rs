@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand};
 
+use crate::eval::recall::Mode as EvalMode;
 use crate::store::memory::{EntryType, SourceType};
 use crate::store::memory_graph::MemoryRelation;
 
@@ -637,7 +638,7 @@ pub enum CollectionCommand {
 /// Evaluation subcommands.
 #[derive(Subcommand, Debug)]
 pub enum EvalCommand {
-    /// Recall@k / MRR over a fixture (deterministic, BM25-only, no API)
+    /// Recall@k / MRR over a fixture, through the production memory search
     Recall {
         /// Path to a JSON fixture (defaults to the bundled synthetic corpus)
         #[arg(short, long)]
@@ -645,6 +646,16 @@ pub enum EvalCommand {
         /// Cutoff rank k
         #[arg(short, long, default_value = "5")]
         k: usize,
+        /// Retrieval mode; `all` runs bm25, embedding and hybrid in turn
+        #[arg(long, default_value = "all", value_parser = eval_mode_values())]
+        mode: String,
+        /// Fetch the ONNX model when it is not cached (otherwise the embedding
+        /// and hybrid modes are skipped with a reason)
+        #[arg(long)]
+        download: bool,
+        /// Exit 1 when any mode that ran scores recall@k below this
+        #[arg(long)]
+        min_recall: Option<f64>,
     },
 
     /// Answer-support accuracy over a fixture (deterministic SubstringJudge)
@@ -655,7 +666,29 @@ pub enum EvalCommand {
         /// Cutoff rank k
         #[arg(short, long, default_value = "5")]
         k: usize,
+        /// Retrieval mode; `all` runs bm25, embedding and hybrid in turn
+        #[arg(long, default_value = "all", value_parser = eval_mode_values())]
+        mode: String,
+        /// Fetch the ONNX model when it is not cached (otherwise the embedding
+        /// and hybrid modes are skipped with a reason)
+        #[arg(long)]
+        download: bool,
     },
+}
+
+fn eval_mode_values() -> PossibleValuesParser {
+    let mut values = vec!["all"];
+    values.extend(EvalMode::ALL.map(|m| m.as_str()));
+    PossibleValuesParser::new(values)
+}
+
+/// Expand the `--mode` value: `all` is every mode in `EvalMode::ALL` order.
+pub fn parse_eval_modes(mode: &str) -> Vec<EvalMode> {
+    if mode == "all" {
+        return EvalMode::ALL.to_vec();
+    }
+    // `eval_mode_values` already rejected anything else.
+    mode.parse().into_iter().collect()
 }
 
 /// Metrics subcommands.

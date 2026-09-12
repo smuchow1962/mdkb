@@ -173,33 +173,60 @@ pub struct EmbedResult {
     /// Errors encountered.
     pub errors: Vec<String>,
 }
-/// Handle `mdkb eval recall` — seed a fixture DB and score recall@k / MRR.
-pub fn handle_eval_recall(
-    fixture: Option<&std::path::Path>,
-    k: usize,
-) -> Result<crate::eval::recall::RecallReport> {
-    let fx = match fixture {
-        Some(p) => crate::eval::fixture::Fixture::load(p)?,
-        None => crate::eval::fixture::Fixture::bundled()?,
-    };
-    let conn = fx.seed_db()?;
-    crate::eval::recall::run_recall(&conn, &fx.recall_cases(), k)
+/// Options shared by the `mdkb eval` subcommands.
+#[derive(Debug, Clone)]
+pub struct EvalOptions<'a> {
+    /// A JSON fixture path, or `None` for the bundled corpus.
+    pub fixture: Option<&'a std::path::Path>,
+    /// Cutoff rank.
+    pub k: usize,
+    /// The retrieval modes to run, in order.
+    pub modes: &'a [crate::eval::recall::Mode],
+    /// Fetch the ONNX model when it is not cached, instead of skipping the
+    /// modes that need it.
+    pub download: bool,
 }
-/// Handle `mdkb eval judge` — seed a fixture DB and score answer support.
+
+fn load_eval_fixture(fixture: Option<&std::path::Path>) -> Result<crate::eval::fixture::Fixture> {
+    match fixture {
+        Some(p) => crate::eval::fixture::Fixture::load(p),
+        None => crate::eval::fixture::Fixture::bundled(),
+    }
+}
+/// Handle `mdkb eval recall` — seed a real store from the fixture and score
+/// recall@k / MRR once per mode.
+pub fn handle_eval_recall(
+    opts: &EvalOptions<'_>,
+) -> Result<Vec<crate::eval::ModeRun<crate::eval::recall::RecallReport>>> {
+    let fx = load_eval_fixture(opts.fixture)?;
+    let cases = fx.recall_cases();
+    crate::eval::run_modes(
+        &fx,
+        opts.modes,
+        crate::eval::load_embedder(opts.download),
+        |conn, retrieval| crate::eval::recall::run_recall(conn, retrieval, &cases, opts.k),
+    )
+}
+/// Handle `mdkb eval judge` — seed a real store from the fixture and score
+/// answer support once per mode.
 pub fn handle_eval_judge(
-    fixture: Option<&std::path::Path>,
-    k: usize,
-) -> Result<crate::eval::judge::JudgeReport> {
-    let fx = match fixture {
-        Some(p) => crate::eval::fixture::Fixture::load(p)?,
-        None => crate::eval::fixture::Fixture::bundled()?,
-    };
-    let conn = fx.seed_db()?;
-    crate::eval::judge::run_judge(
-        &conn,
-        &fx.judge_cases(),
-        k,
-        &crate::eval::judge::SubstringJudge,
+    opts: &EvalOptions<'_>,
+) -> Result<Vec<crate::eval::ModeRun<crate::eval::judge::JudgeReport>>> {
+    let fx = load_eval_fixture(opts.fixture)?;
+    let cases = fx.judge_cases();
+    crate::eval::run_modes(
+        &fx,
+        opts.modes,
+        crate::eval::load_embedder(opts.download),
+        |conn, retrieval| {
+            crate::eval::judge::run_judge(
+                conn,
+                retrieval,
+                &cases,
+                opts.k,
+                &crate::eval::judge::SubstringJudge,
+            )
+        },
     )
 }
 /// Handle `mdkb history` command - show evolution chain.

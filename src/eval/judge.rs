@@ -1,12 +1,14 @@
 //! Answer-quality judging over retrieved memory context.
 //!
-//! Given a question and the top-k retrieved entries, a [`Judge`] returns a
-//! [`Verdict`] on whether the context supports the expected answer.
+//! Given a question and the top-k entries the production memory search
+//! returns for it (see [`Retrieval`]), a [`Judge`] returns a [`Verdict`] on
+//! whether the context supports the expected answer.
 //! [`SubstringJudge`] is the deterministic, API-free default. An LLM-backed
 //! judge is a future alternate `Judge` impl — the orchestration
 //! ([`run_judge`]) and aggregation ([`judge_accuracy`]) here do not change when
 //! it lands, because they depend only on the trait.
 
+use super::recall::{Mode, Retrieval};
 use crate::error::Result;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -28,6 +30,7 @@ pub struct JudgeCase {
 /// Aggregate judging result.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JudgeReport {
+    pub mode: Mode,
     pub accuracy: f64,
     pub n: usize,
     pub k: usize,
@@ -68,10 +71,11 @@ pub fn judge_accuracy(verdicts: &[Verdict]) -> f64 {
         / verdicts.len() as f64
 }
 
-/// For each case: retrieve top-k context (BM25-only, deterministic), ask the
-/// judge whether it supports the expected answer, aggregate accuracy.
+/// For each case: retrieve top-k context through `retrieval`, ask the judge
+/// whether it supports the expected answer, aggregate accuracy.
 pub fn run_judge<J: Judge>(
     conn: &Connection,
+    retrieval: &Retrieval<'_>,
     cases: &[JudgeCase],
     k: usize,
     judge: &J,
@@ -81,11 +85,7 @@ pub fn run_judge<J: Judge>(
         // QA questions are natural language → OR retrieval (any term may match),
         // not the default token-AND which a full sentence rarely satisfies.
         let fts = crate::store::search::escape_fts5_query_or(&case.question);
-        let results = if fts.is_empty() {
-            Vec::new()
-        } else {
-            crate::store::memory::search_entries_hybrid_fts(conn, &fts, None, k, 0.0, 0)?
-        };
+        let results = retrieval.search(conn, &fts, &case.question, k)?;
         let context: Vec<String> = results
             .iter()
             .map(|e| format!("{}\n{}", e.title, e.content))
@@ -93,6 +93,7 @@ pub fn run_judge<J: Judge>(
         verdicts.push(judge.judge(&case.question, &context, &case.expected_answer)?);
     }
     Ok(JudgeReport {
+        mode: retrieval.mode,
         accuracy: judge_accuracy(&verdicts),
         n: cases.len(),
         k,
@@ -102,6 +103,7 @@ pub fn run_judge<J: Judge>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SearchMemoryConfig;
     use crate::eval::testkit::{add, setup_db};
 
     #[test]
@@ -160,7 +162,9 @@ mod tests {
             },
         ];
 
-        let r = run_judge(&conn, &cases, 5, &SubstringJudge).unwrap();
+        let cfg = SearchMemoryConfig::default();
+        let r = run_judge(&conn, &Retrieval::bm25(&cfg), &cases, 5, &SubstringJudge).unwrap();
+        assert_eq!(r.mode, Mode::Bm25);
         assert_eq!(r.n, 2);
         assert_eq!(r.k, 5);
         assert!(

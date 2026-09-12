@@ -18,7 +18,7 @@ use mdkb::Result;
 use mdkb::cli::CodeCommand;
 use mdkb::cli::daemon as daemon_cli;
 use mdkb::cli::handlers::{
-    EmbedResult, EvolutionHistoryEntry, handle_collection_add, handle_collection_list,
+    EmbedResult, EvalOptions, EvolutionHistoryEntry, handle_collection_add, handle_collection_list,
     handle_collection_remove, handle_collection_rename, handle_collection_update, handle_current,
     handle_embed, handle_eval_judge, handle_eval_recall, handle_evolve_corrects,
     handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
@@ -39,7 +39,7 @@ use mdkb::cli::{
     Cli, CollectionCommand, Command, DaemonCommand, EvalCommand, EvolveCommand, ExperimentCommand,
     GraphCommand, HookCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat,
     RemoveHooksCommand, RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand,
-    SetupMcpCommand, SetupRemoveCommand,
+    SetupMcpCommand, SetupRemoveCommand, parse_eval_modes,
 };
 use mdkb::core::Context;
 use mdkb::core::indexing::{UpdateOutcome, UpdateRequest, report_code_stats, update_documents};
@@ -49,6 +49,39 @@ use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
 use rmcp::ServiceExt;
+
+/// One line per mode, then the queries each mode missed, so a drop in the
+/// number comes with the cases behind it.
+fn print_eval_recall(runs: &[mdkb::eval::ModeRun<mdkb::eval::recall::RecallReport>]) {
+    for run in runs {
+        match &run.report {
+            Some(r) => println!(
+                "{:<10} recall@{}: {:.3}  MRR: {:.3}  (n={}, misses={})",
+                run.mode.as_str(),
+                r.k,
+                r.recall_at_k,
+                r.mrr,
+                r.n,
+                r.misses.len()
+            ),
+            None => println!(
+                "{:<10} skipped: {}",
+                run.mode.as_str(),
+                run.skipped.as_deref().unwrap_or("no reason given")
+            ),
+        }
+    }
+    for run in runs {
+        if let Some(r) = &run.report {
+            if !r.misses.is_empty() {
+                println!("\nmissed ({}):", run.mode.as_str());
+                for q in &r.misses {
+                    println!("  {q}");
+                }
+            }
+        }
+    }
+}
 
 fn main() -> Result<()> {
     // `--detach` has to happen before any threads exist — tokio spawns
@@ -707,31 +740,76 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Eval(cmd) => {
-            let (report_json, summary) = match cmd {
-                EvalCommand::Recall { fixture, k } => {
-                    let r = handle_eval_recall(fixture.as_deref(), k)?;
-                    (
-                        serde_json::to_string_pretty(&r)?,
-                        format!(
-                            "recall@{}: {:.3}  MRR: {:.3}  (n={})",
-                            r.k, r.recall_at_k, r.mrr, r.n
-                        ),
-                    )
+        Command::Eval(cmd) => match cmd {
+            EvalCommand::Recall {
+                fixture,
+                k,
+                mode,
+                download,
+                min_recall,
+            } => {
+                let modes = parse_eval_modes(&mode);
+                let runs = handle_eval_recall(&EvalOptions {
+                    fixture: fixture.as_deref(),
+                    k,
+                    modes: &modes,
+                    download,
+                })?;
+                match cli.format {
+                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&runs)?),
+                    _ => print_eval_recall(&runs),
                 }
-                EvalCommand::Judge { fixture, k } => {
-                    let r = handle_eval_judge(fixture.as_deref(), k)?;
-                    (
-                        serde_json::to_string_pretty(&r)?,
-                        format!("judge accuracy: {:.3}  (n={}, k={})", r.accuracy, r.n, r.k),
-                    )
+                if let Some(floor) = min_recall {
+                    let below: Vec<String> = runs
+                        .iter()
+                        .filter_map(|run| run.report.as_ref())
+                        .filter(|r| r.recall_at_k < floor)
+                        .map(|r| format!("{} {:.3}", r.mode.as_str(), r.recall_at_k))
+                        .collect();
+                    if !below.is_empty() {
+                        return Err(mdkb::Error::other(format!(
+                            "recall@{k} below {floor}: {}",
+                            below.join(", ")
+                        )));
+                    }
                 }
-            };
-            match cli.format {
-                OutputFormat::Json => println!("{report_json}"),
-                _ => println!("{summary}"),
             }
-        }
+            EvalCommand::Judge {
+                fixture,
+                k,
+                mode,
+                download,
+            } => {
+                let modes = parse_eval_modes(&mode);
+                let runs = handle_eval_judge(&EvalOptions {
+                    fixture: fixture.as_deref(),
+                    k,
+                    modes: &modes,
+                    download,
+                })?;
+                match cli.format {
+                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&runs)?),
+                    _ => {
+                        for run in &runs {
+                            match &run.report {
+                                Some(r) => println!(
+                                    "{:<10} accuracy: {:.3}  (n={}, k={})",
+                                    run.mode.as_str(),
+                                    r.accuracy,
+                                    r.n,
+                                    r.k
+                                ),
+                                None => println!(
+                                    "{:<10} skipped: {}",
+                                    run.mode.as_str(),
+                                    run.skipped.as_deref().unwrap_or("no reason given")
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        },
         Command::Memory(cmd) => {
             let ctx = if matches!(
                 &cmd,

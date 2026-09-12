@@ -475,6 +475,18 @@ counters (`access_count`, `last_accessed`, `confirmations`) reset to zero on
 import; they track local usage, not authored knowledge, so they don't need
 to round-trip.
 
+### Retrieval eval
+
+```bash
+# recall@5 / MRR of memory search over a held-out fixture, one line per mode
+# (bm25, embedding, hybrid); model modes are skipped when the ONNX model is not cached
+mdkb eval recall
+mdkb eval judge
+mdkb eval recall --mode hybrid --min-recall 0.9   # exit 1 below the floor
+```
+
+Baseline numbers, the fixture authoring rule and what CI enforces: [docs/retrieval-eval.md](docs/retrieval-eval.md).
+
 ### Stats
 
 `mdkb stats` is the unified diagnostic dashboard introduced in 2.0.0 (replaces the former `mdkb status` — not aliased, it was removed).

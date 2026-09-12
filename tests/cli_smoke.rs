@@ -1821,3 +1821,64 @@ fn smoke_format_json_error_is_json() {
         "JSON error should have 'error' key: {parsed}"
     );
 }
+
+#[test]
+fn smoke_eval_recall_bm25_runs_without_a_repo_or_a_model() {
+    // The eval seeds its own scratch store, so it needs no `init` in cwd; bm25
+    // mode needs no model, so this is deterministic on every machine.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(&["eval", "recall", "--mode", "bm25"], tmp.path());
+    assert_ok(&out, "eval recall --mode bm25");
+    let text = stdout(&out);
+    assert!(
+        text.contains("bm25") && text.contains("recall@5:"),
+        "expected a bm25 recall line: {text}"
+    );
+    assert!(
+        text.contains("missed (bm25):"),
+        "held-out queries must produce misses in bm25 mode: {text}"
+    );
+
+    let out = run(
+        &["--format", "json", "eval", "recall", "--mode", "bm25"],
+        tmp.path(),
+    );
+    assert_ok(&out, "eval recall --format json");
+    let runs: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("json array");
+    assert_eq!(runs[0]["mode"], "bm25");
+    assert_eq!(runs[0]["report"]["n"], 36);
+    assert!(
+        runs[0]["report"]["misses"]
+            .as_array()
+            .is_some_and(|m| !m.is_empty())
+    );
+}
+
+#[test]
+fn smoke_eval_recall_min_recall_fails_the_run() {
+    // `--min-recall` is what lets CI fail: a floor no mode can reach exits 1
+    // and names the mode and its score.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(
+        &["eval", "recall", "--mode", "bm25", "--min-recall", "1.01"],
+        tmp.path(),
+    );
+    assert!(!out.status.success(), "a floor above 1.0 must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("below 1.01") && stderr.contains("bm25"),
+        "error must name the floor and the mode: {stderr}"
+    );
+}
+
+#[test]
+fn smoke_eval_judge_bm25_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(&["eval", "judge", "--mode", "bm25"], tmp.path());
+    assert_ok(&out, "eval judge --mode bm25");
+    let text = stdout(&out);
+    assert!(
+        text.contains("bm25") && text.contains("accuracy:"),
+        "expected a bm25 accuracy line: {text}"
+    );
+}

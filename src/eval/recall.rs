@@ -1,13 +1,125 @@
-//! Deterministic recall-quality evaluation for memory retrieval (LoCoMo-style).
+//! Recall-quality evaluation for memory retrieval (LoCoMo-style).
 //!
-//! API-free by default: uses BM25-only hybrid search (no query embedding) so a
-//! recall@k / MRR baseline is reproducible without a model or network. This is
-//! the yardstick every later retrieval change (dedup, router, compression) is
-//! measured against — a change that drops recall@k is a regression, not a win.
+//! Every query goes through the production memory search
+//! (`store::memory::search_entries_hybrid_fts`: BM25 leg, vector leg, RRF
+//! fusion, access-recency signal, confidence re-rank) with the production
+//! `[search.memory]` weights. The only knob is [`Mode`], which decides which
+//! legs get input. This is the yardstick every retrieval change is measured
+//! against — a change that drops recall@k is a regression, not a win.
 
-use crate::error::Result;
+use crate::config::SearchMemoryConfig;
+use crate::error::{Error, Result};
+use crate::llm::EmbeddingService;
+use crate::store::memory::{self, MemoryEntry};
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// Which retrieval legs receive the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// FTS5 leg only: no query embedding, the fallback production takes when
+    /// the model is cold.
+    Bm25,
+    /// Vector leg only: the BM25 leg is starved with a term no memory holds,
+    /// so fusion and re-rank still run, over the vector candidates alone.
+    Embedding,
+    /// Both legs, fused — production with a warm model.
+    Hybrid,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 3] = [Mode::Bm25, Mode::Embedding, Mode::Hybrid];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Bm25 => "bm25",
+            Mode::Embedding => "embedding",
+            Mode::Hybrid => "hybrid",
+        }
+    }
+
+    /// True when the mode cannot run without the ONNX model.
+    pub fn needs_model(self) -> bool {
+        !matches!(self, Mode::Bm25)
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Mode::ALL
+            .into_iter()
+            .find(|m| m.as_str() == s)
+            .ok_or_else(|| Error::other(format!("unknown eval mode '{s}'")))
+    }
+}
+
+/// An FTS5 term that no fixture memory contains. Feeding it to the BM25 leg
+/// yields zero BM25 candidates without tripping the empty-query short-circuit,
+/// which is how [`Mode::Embedding`] isolates the vector leg inside the
+/// production function instead of calling the vector store directly.
+const NO_BM25_MATCH: &str = "\"mdkbevalnobm25leg\"";
+
+/// One production retrieval configuration: which legs run, with what weights.
+#[derive(Debug)]
+pub struct Retrieval<'a> {
+    pub mode: Mode,
+    /// Required by every mode that [`Mode::needs_model`].
+    pub embedder: Option<&'a EmbeddingService>,
+    /// Production `[search.memory]` weights (access-recency signal).
+    pub memory_cfg: &'a SearchMemoryConfig,
+}
+
+impl Retrieval<'_> {
+    /// BM25 only, with the production defaults — needs no model.
+    pub fn bm25(memory_cfg: &SearchMemoryConfig) -> Retrieval<'_> {
+        Retrieval {
+            mode: Mode::Bm25,
+            embedder: None,
+            memory_cfg,
+        }
+    }
+
+    /// Run one query through the production memory search.
+    ///
+    /// `fts_query` is the caller's escaped FTS5 expression for `text` (token-AND
+    /// for a search-tool query, OR-expanded for a prompt); `text` is what gets
+    /// embedded, exactly as the MCP layer embeds the raw query.
+    pub fn search(
+        &self,
+        conn: &Connection,
+        fts_query: &str,
+        text: &str,
+        k: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let embedding = if self.mode.needs_model() {
+            let svc = self.embedder.ok_or_else(|| {
+                Error::other(format!(
+                    "eval mode {} needs an embedder",
+                    self.mode.as_str()
+                ))
+            })?;
+            Some(svc.embed_query(text)?)
+        } else {
+            None
+        };
+        let fts = if self.mode == Mode::Embedding {
+            NO_BM25_MATCH
+        } else {
+            fts_query
+        };
+        memory::search_entries_hybrid_fts(
+            conn,
+            fts,
+            embedding.as_deref(),
+            k,
+            self.memory_cfg.access_recency_weight,
+            self.memory_cfg.recency_half_life_secs,
+        )
+    }
+}
 
 /// One evaluation query: a natural-language prompt and the id(s) a correct
 /// retrieval must surface within the top-k results.
@@ -15,17 +127,19 @@ use serde::Serialize;
 pub struct EvalCase {
     pub query: String,
     pub expected_ids: Vec<String>,
-    /// Optional pre-computed query embedding. `None` = BM25-only (deterministic).
-    pub embedding: Option<Vec<f32>>,
 }
 
 /// Aggregate recall metrics over a case set.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RecallReport {
+    pub mode: Mode,
     pub recall_at_k: f64,
     pub mrr: f64,
     pub n: usize,
     pub k: usize,
+    /// The queries whose expected id did not appear in the top-k, so a drop in
+    /// `recall_at_k` names the cases that caused it.
+    pub misses: Vec<String>,
 }
 
 /// Compute recall@k and MRR over `cases`.
@@ -33,34 +147,42 @@ pub struct RecallReport {
 /// A case is a hit if any of its `expected_ids` appears in the top-k retrieved
 /// entries; MRR credits the reciprocal rank of the first such hit. An empty
 /// case set yields zeroed metrics (never a divide-by-zero).
-pub fn run_recall(conn: &Connection, cases: &[EvalCase], k: usize) -> Result<RecallReport> {
+///
+/// Each query is escaped token-AND, as the `search` tool escapes a memory
+/// query: this measures what an agent gets when it searches for a memory.
+pub fn run_recall(
+    conn: &Connection,
+    retrieval: &Retrieval<'_>,
+    cases: &[EvalCase],
+    k: usize,
+) -> Result<RecallReport> {
     let mut hits = 0usize;
     let mut reciprocal_rank = 0f64;
+    let mut misses = Vec::new();
     for case in cases {
-        let results = crate::store::memory::search_entries_hybrid(
-            conn,
-            &case.query,
-            case.embedding.as_deref(),
-            k,
-            0.0,
-            0,
-        )?;
-        if let Some(pos) = results
+        let fts = crate::store::search::escape_fts5_query(&case.query);
+        let results = retrieval.search(conn, &fts, &case.query, k)?;
+        match results
             .iter()
             .take(k)
             .position(|e| case.expected_ids.contains(&e.id))
         {
-            hits += 1;
-            reciprocal_rank += 1.0 / (pos as f64 + 1.0);
+            Some(pos) => {
+                hits += 1;
+                reciprocal_rank += 1.0 / (pos as f64 + 1.0);
+            }
+            None => misses.push(case.query.clone()),
         }
     }
     let n = cases.len();
     let denom = n.max(1) as f64;
     Ok(RecallReport {
+        mode: retrieval.mode,
         recall_at_k: hits as f64 / denom,
         mrr: reciprocal_rank / denom,
         n,
         k,
+        misses,
     })
 }
 
@@ -99,17 +221,17 @@ mod tests {
             EvalCase {
                 query: "pkce exchange".into(),
                 expected_ids: vec!["oauth".into()],
-                embedding: None,
             },
             // Clear miss: neither token is present in any entry.
             EvalCase {
                 query: "kubernetes helm".into(),
                 expected_ids: vec!["oauth".into()],
-                embedding: None,
             },
         ];
 
-        let r = run_recall(&conn, &cases, 5).unwrap();
+        let cfg = SearchMemoryConfig::default();
+        let r = run_recall(&conn, &Retrieval::bm25(&cfg), &cases, 5).unwrap();
+        assert_eq!(r.mode, Mode::Bm25);
         assert_eq!(r.n, 2);
         assert_eq!(r.k, 5);
         assert!(
@@ -123,20 +245,52 @@ mod tests {
             "rank-1 hit over two cases → 0.5, got {}",
             r.mrr
         );
+        // The report names the query that failed, not just the count.
+        assert_eq!(r.misses, vec!["kubernetes helm".to_string()]);
     }
 
     #[test]
     fn empty_cases_do_not_divide_by_zero() {
         let conn = setup_db();
-        let r = run_recall(&conn, &[], 5).unwrap();
+        let cfg = SearchMemoryConfig::default();
+        let r = run_recall(&conn, &Retrieval::bm25(&cfg), &[], 5).unwrap();
         assert_eq!(
             r,
             RecallReport {
+                mode: Mode::Bm25,
                 recall_at_k: 0.0,
                 mrr: 0.0,
                 n: 0,
-                k: 5
+                k: 5,
+                misses: vec![],
             }
         );
+    }
+
+    #[test]
+    fn a_model_mode_without_an_embedder_is_an_error_not_a_silent_bm25_run() {
+        let conn = setup_db();
+        let cfg = SearchMemoryConfig::default();
+        let retrieval = Retrieval {
+            mode: Mode::Hybrid,
+            embedder: None,
+            memory_cfg: &cfg,
+        };
+        let err = retrieval.search(&conn, "\"x\"", "x", 5).unwrap_err();
+        assert!(
+            err.to_string().contains("needs an embedder"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mode_round_trips_through_its_name() {
+        for m in Mode::ALL {
+            assert_eq!(m.as_str().parse::<Mode>().unwrap(), m);
+        }
+        assert!("vector".parse::<Mode>().is_err());
+        assert!(!Mode::Bm25.needs_model());
+        assert!(Mode::Embedding.needs_model());
+        assert!(Mode::Hybrid.needs_model());
     }
 }
