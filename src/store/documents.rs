@@ -493,6 +493,40 @@ pub fn rollback_transaction(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Run `body` inside a named SAVEPOINT and RELEASE it on success.
+///
+/// On error the savepoint is unwound with ROLLBACK TO followed by RELEASE.
+/// ROLLBACK TO alone leaves the savepoint, and the transaction it opened,
+/// active: one failed write would then hold the write lock for the life of
+/// the connection. Unlike BEGIN, a savepoint nests inside an enclosing
+/// transaction, so callers may already be inside one.
+pub fn with_savepoint<T>(
+    conn: &Connection,
+    name: &'static str,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    conn.execute(&format!("SAVEPOINT {name}"), [])?;
+    match body() {
+        Ok(val) => {
+            conn.execute(&format!("RELEASE {name}"), [])?;
+            Ok(val)
+        }
+        Err(e) => {
+            for stmt in [format!("ROLLBACK TO {name}"), format!("RELEASE {name}")] {
+                if let Err(unwind_err) = conn.execute(&stmt, []) {
+                    tracing::error!(
+                        unwind_error = %unwind_err,
+                        original_error = %e,
+                        "{} failed after savepoint error",
+                        stmt
+                    );
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

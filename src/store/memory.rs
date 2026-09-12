@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorKind, Result};
+use crate::store::documents;
 
 /// Maximum ID length (slug format).
 pub const MAX_ID_LEN: usize = 100;
@@ -1836,8 +1837,7 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
     let now = Utc::now().timestamp();
     let cutoff = now - (i64::from(days) * 24 * 60 * 60);
 
-    conn.execute("SAVEPOINT prune_entries", [])?;
-    let result = (|| -> Result<Vec<String>> {
+    documents::with_savepoint(conn, "prune_entries", || {
         let lifecycle = EntryType::sql_list(|t| !t.is_durable());
         let mut stmt = conn.prepare(&format!(
             r#"
@@ -1875,20 +1875,7 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
         }
 
         Ok(ids)
-    })();
-
-    match result {
-        Ok(ids) => {
-            conn.execute("RELEASE prune_entries", [])?;
-            Ok(ids)
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute("ROLLBACK TO prune_entries", []) {
-                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
-            }
-            Err(e)
-        }
-    }
+    })
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {

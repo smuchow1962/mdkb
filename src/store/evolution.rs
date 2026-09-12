@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::store::documents;
 
 /// Relationship type between documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,8 +113,7 @@ pub fn add_evolution(
 
     // Atomic: evolution record + status update must be consistent.
     // Use SAVEPOINT (not BEGIN) to support nesting inside existing transactions.
-    conn.execute("SAVEPOINT add_evolution", [])?;
-    let result = (|| -> Result<i64> {
+    documents::with_savepoint(conn, "add_evolution", || {
         conn.execute(
             "INSERT INTO evolution (source_doc_id, target_doc_id, relationship, scope, reason, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -141,20 +141,7 @@ pub fn add_evolution(
         }
 
         Ok(id)
-    })();
-
-    match result {
-        Ok(id) => {
-            conn.execute("RELEASE add_evolution", [])?;
-            Ok(id)
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute("ROLLBACK TO add_evolution", []) {
-                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
-            }
-            Err(e)
-        }
-    }
+    })
 }
 
 /// Update a document's status.

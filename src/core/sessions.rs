@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::core::Context;
+use crate::core::indexing::with_transaction;
 use crate::domain::{Collection, Document, UpdateResult};
 use crate::error::Result;
 use crate::store::{collections, documents};
@@ -68,84 +69,85 @@ pub fn handle_session_index(
         })
         .collect();
 
-    documents::begin_transaction(&ctx.conn)?;
+    // One transaction for the whole pass: an error on any document rolls back
+    // every row written so far and leaves no transaction open.
+    with_transaction(&ctx.conn, || {
+        // Relative paths still produced by live transcript files this pass. Any
+        // previously-indexed session doc NOT in this set has lost its source and is
+        // archived below.
+        let mut present_paths: HashSet<String> = HashSet::new();
 
-    // Relative paths still produced by live transcript files this pass. Any
-    // previously-indexed session doc NOT in this set has lost its source and is
-    // archived below.
-    let mut present_paths: HashSet<String> = HashSet::new();
-
-    for entry in &entries {
-        let path = entry.path();
-        let file_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(name) => name.to_string(),
-            None => continue,
-        };
-
-        let file_mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        let session_docs = match parse_session_file(&path, &config) {
-            Ok(docs) => docs,
-            Err(e) => {
-                result
-                    .errors
-                    .push(format!("Failed to parse {}: {}", file_name, e));
-                continue;
-            }
-        };
-
-        for sdoc in &session_docs {
-            present_paths.insert(sdoc.relative_path.clone());
-            let existing = existing_docs.get(&sdoc.relative_path);
-
-            // Content-hash dedup (NOT file mtime). A transcript is append-only, so
-            // its mtime bumps on every growth while all but the tail chunk keep
-            // byte-identical content under a stable `{sid}-chunk-NNN` key. Skipping
-            // on file mtime therefore re-embedded the ENTIRE multi-MB file on every
-            // append; skipping on the per-chunk content hash re-embeds only the
-            // new/changed tail. `documents.hash` is the same SHA-256 the document
-            // layer stores, so this is exact, not heuristic.
-            if let Some(existing_doc) = existing {
-                if existing_doc.hash == documents::compute_hash(&sdoc.content) {
-                    result.unchanged += 1;
-                    continue;
-                }
-            }
-
-            let now = chrono::Utc::now().timestamp();
-            let doc = Document {
-                id: 0,
-                collection: collection_name.to_string(),
-                relative_path: sdoc.relative_path.clone(),
-                hash: String::new(), // computed by index_document_in_tx
-                title: Some(sdoc.metadata.session_id.clone()),
-                metadata: None,
-                file_modified_at: file_mtime,
-                indexed_at: now,
-                status: None,
+        for entry in &entries {
+            let path = entry.path();
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
             };
 
-            documents::index_document_in_tx(&ctx.conn, &doc, &sdoc.content)?;
+            let file_mtime = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
 
-            if existing.is_some() {
-                result.updated += 1;
-            } else {
-                result.added += 1;
+            let session_docs = match parse_session_file(&path, &config) {
+                Ok(docs) => docs,
+                Err(e) => {
+                    result
+                        .errors
+                        .push(format!("Failed to parse {}: {}", file_name, e));
+                    continue;
+                }
+            };
+
+            for sdoc in &session_docs {
+                present_paths.insert(sdoc.relative_path.clone());
+                let existing = existing_docs.get(&sdoc.relative_path);
+
+                // Content-hash dedup (NOT file mtime). A transcript is append-only, so
+                // its mtime bumps on every growth while all but the tail chunk keep
+                // byte-identical content under a stable `{sid}-chunk-NNN` key. Skipping
+                // on file mtime therefore re-embedded the ENTIRE multi-MB file on every
+                // append; skipping on the per-chunk content hash re-embeds only the
+                // new/changed tail. `documents.hash` is the same SHA-256 the document
+                // layer stores, so this is exact, not heuristic.
+                if let Some(existing_doc) = existing {
+                    if existing_doc.hash == documents::compute_hash(&sdoc.content) {
+                        result.unchanged += 1;
+                        continue;
+                    }
+                }
+
+                let now = chrono::Utc::now().timestamp();
+                let doc = Document {
+                    id: 0,
+                    collection: collection_name.to_string(),
+                    relative_path: sdoc.relative_path.clone(),
+                    hash: String::new(), // computed by index_document_in_tx
+                    title: Some(sdoc.metadata.session_id.clone()),
+                    metadata: None,
+                    file_modified_at: file_mtime,
+                    indexed_at: now,
+                    status: None,
+                };
+
+                documents::index_document_in_tx(&ctx.conn, &doc, &sdoc.content)?;
+
+                if existing.is_some() {
+                    result.updated += 1;
+                } else {
+                    result.added += 1;
+                }
             }
         }
-    }
 
-    // Archive session docs whose source jsonl is gone (deleted/rotated). Kept
-    // searchable via explicit --collection claude_sessions; never hard-deleted
-    // here (see `mdkb compact --prune-sessions`).
-    result.sessions_archived = documents::archive_missing_sessions(&ctx.conn, &present_paths)?;
-
-    documents::commit_transaction(&ctx.conn)?;
+        // Archive session docs whose source jsonl is gone (deleted/rotated). Kept
+        // searchable via explicit --collection claude_sessions; never hard-deleted
+        // here (see `mdkb compact --prune-sessions`).
+        result.sessions_archived = documents::archive_missing_sessions(&ctx.conn, &present_paths)?;
+        Ok(())
+    })?;
 
     Ok(result)
 }
