@@ -46,7 +46,20 @@ fn write_unreadable(ctx: &Context, name: &str) {
 fn stats_reports_files_that_could_not_be_read() {
     let (_dir, ctx) = env();
     handle_memory_add(
-        &ctx, "healthy", "Healthy", "topic", None, "body", None, None, None, None,
+        &ctx,
+        "healthy",
+        "Healthy",
+        "topic",
+        None,
+        "body",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     sync_memory_files(&ctx).expect("sync");
@@ -70,7 +83,20 @@ fn stats_reports_files_that_could_not_be_read() {
 fn stats_reports_no_drift_for_a_healthy_store() {
     let (_dir, ctx) = env();
     handle_memory_add(
-        &ctx, "fine", "Fine", "topic", None, "body", None, None, None, None,
+        &ctx,
+        "fine",
+        "Fine",
+        "topic",
+        None,
+        "body",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     sync_memory_files(&ctx).expect("sync");
@@ -86,7 +112,20 @@ fn stats_reports_no_drift_for_a_healthy_store() {
 fn stats_reports_entries_with_no_file() {
     let (_dir, ctx) = env();
     handle_memory_add(
-        &ctx, "db-only", "DB only", "topic", None, "body", None, None, None, None,
+        &ctx,
+        "db-only",
+        "DB only",
+        "topic",
+        None,
+        "body",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     sync_memory_files(&ctx).expect("sync");
@@ -151,7 +190,20 @@ fn a_bulk_import_completes_and_reports_itself() {
 fn the_session_start_drift_check_is_a_count_not_a_parse() {
     let (_dir, ctx) = env();
     handle_memory_add(
-        &ctx, "kept", "Kept", "topic", None, "body", None, None, None, None,
+        &ctx,
+        "kept",
+        "Kept",
+        "topic",
+        None,
+        "body",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     sync_memory_files(&ctx).expect("sync");

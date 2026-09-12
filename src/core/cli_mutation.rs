@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::journal::JournalImportResult;
 use crate::core::Context;
 use crate::core::indexing::{UpdateOutcome, UpdateRequest};
-use crate::core::memory::{ConfirmResult, ImportResult};
+use crate::core::memory::{ConfirmResult, ImportResult, WriteRelation};
 use crate::core::memory_sync::MemorySyncSummary;
 use crate::domain::UpdateResult;
 use crate::error::{Error, Result};
@@ -57,6 +57,14 @@ pub enum CliMutation {
         ttl: Option<u64>,
         due_in: Option<u64>,
         source_type: Option<String>,
+        #[serde(default)]
+        relates: Vec<WriteRelation>,
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        on_conflict: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
     },
     MemoryConfirm {
         id: String,
@@ -296,6 +304,10 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
             ttl,
             due_in,
             source_type,
+            relates,
+            agent,
+            on_conflict,
+            dry_run,
         } => {
             crate::core::memory::handle_memory_add(
                 ctx,
@@ -308,6 +320,10 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
                 ttl,
                 due_in,
                 source_type.as_deref(),
+                &relates,
+                agent.as_deref(),
+                on_conflict.as_deref(),
+                dry_run,
             )?;
             R::MemoryAdded
         }

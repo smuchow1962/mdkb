@@ -128,7 +128,20 @@ mod tests {
         handle_init(temp.path()).expect("init");
         let ctx = Context::open(temp.path()).expect("open");
         handle_memory_add(
-            &ctx, "c1", "Title", "topic", None, "content", None, None, None, None,
+            &ctx,
+            "c1",
+            "Title",
+            "topic",
+            None,
+            "content",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add");
         (temp, ctx)
@@ -160,7 +173,20 @@ mod tests {
         );
 
         handle_memory_add(
-            &ctx, "slug1", "T", "topic", None, "c", None, None, None, None,
+            &ctx,
+            "slug1",
+            "T",
+            "topic",
+            None,
+            "c",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .unwrap();
         match handle_get(&ctx, "slug1", None).expect("memory slug resolves") {
@@ -295,6 +321,10 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add memory should succeed");
 
@@ -331,6 +361,10 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect_err("mechanical tool-chain prior must be rejected");
         assert!(
@@ -350,6 +384,10 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("non-prior entry must not be rejected");
     }
@@ -358,11 +396,29 @@ mod tests {
     fn test_memory_link_roundtrip() {
         let temp = setup_temp_dir();
         handle_init(temp.path()).expect("init should succeed");
+        std::fs::write(
+            temp.path().join(".mdkb/config.toml"),
+            "[search]\nauto_embed_memory = false\n",
+        )
+        .expect("disable embeddings for graph-only fixture");
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         for id in ["a", "b"] {
             handle_memory_add(
-                &ctx, id, "Title", "topic", None, "content", None, None, None, None,
+                &ctx,
+                id,
+                "Title",
+                "topic",
+                None,
+                "content",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                false,
             )
             .expect("add should succeed");
         }
@@ -384,7 +440,20 @@ mod tests {
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         handle_memory_add(
-            &ctx, "a", "Title", "topic", None, "content", None, None, None, None,
+            &ctx,
+            "a",
+            "Title",
+            "topic",
+            None,
+            "content",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add should succeed");
 
@@ -419,7 +488,20 @@ mod tests {
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         handle_memory_add(
-            &ctx, "a", "Title", "topic", None, "content", None, None, None, None,
+            &ctx,
+            "a",
+            "Title",
+            "topic",
+            None,
+            "content",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add should succeed");
 
@@ -437,7 +519,20 @@ mod tests {
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         handle_memory_add(
-            &ctx, "a", "Title", "topic", None, "content", None, None, None, None,
+            &ctx,
+            "a",
+            "Title",
+            "topic",
+            None,
+            "content",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add should succeed");
 
@@ -469,6 +564,10 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("first write should succeed");
 
@@ -484,6 +583,10 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("re-writing an existing id must upsert, not fail");
 
@@ -518,6 +621,10 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .unwrap();
 
@@ -2363,7 +2470,20 @@ mod tests {
 
         // Add an entry first
         handle_memory_add(
-            &ctx, "existing", "Existing", "topic", None, "Content", None, None, None, None,
+            &ctx,
+            "existing",
+            "Existing",
+            "topic",
+            None,
+            "Content",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .unwrap();
 
@@ -2386,7 +2506,20 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
 
         handle_memory_add(
-            &ctx, "existing", "Existing", "topic", None, "Content", None, None, None, None,
+            &ctx,
+            "existing",
+            "Existing",
+            "topic",
+            None,
+            "Content",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .unwrap();
 

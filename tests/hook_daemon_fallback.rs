@@ -103,6 +103,10 @@ fn a_hook_still_works_with_no_daemon_reachable() {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add");
     }
@@ -161,6 +165,10 @@ fn daemon_required_skips_the_in_process_fallback() {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add");
     }
@@ -223,6 +231,10 @@ fn a_delivered_hook_is_not_retried_in_process() {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add");
     }

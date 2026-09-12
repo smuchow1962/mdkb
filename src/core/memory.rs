@@ -16,7 +16,264 @@ use crate::core::memory_sync::{
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::store::memory::{self, EntryStatus, EntryType, MemoryEntry};
+use crate::store::memory_graph::{self, MemoryRelation, TargetKind};
 use serde::Deserialize;
+
+/// One typed edge written atomically with a memory entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WriteRelation {
+    pub relation: String,
+    pub target: String,
+    pub target_kind: String,
+}
+
+impl std::str::FromStr for WriteRelation {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let mut parts = value.splitn(3, ':');
+        let relation = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or_default();
+        let target_kind = parts.next().unwrap_or("memory");
+        if relation.is_empty() || target.is_empty() {
+            return Err(format!(
+                "invalid relation '{value}': expected RELATION:TARGET[:memory|doc]"
+            ));
+        }
+        Ok(Self {
+            relation: relation.to_string(),
+            target: target.to_string(),
+            target_kind: target_kind.to_string(),
+        })
+    }
+}
+
+/// Everything the shared memory-write operation can persist.
+#[derive(Debug)]
+pub struct WriteMemoryInput<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub content: &'a str,
+    pub entry_type: &'a str,
+    pub source_type: Option<&'a str>,
+    pub tags: &'a [String],
+    pub ttl: Option<u64>,
+    pub due_in: Option<u64>,
+    pub embedding: Option<&'a [f32]>,
+    pub source_path: Option<&'a str>,
+    pub relates: &'a [WriteRelation],
+    pub session: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub on_conflict: Option<&'a str>,
+    pub dry_run: bool,
+}
+
+/// Create or update one memory row, including revisions, edges, provenance and
+/// its precomputed embedding. Projection is deliberately the caller's next
+/// step because it needs the complete [`Context`], not only the transaction.
+pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) -> Result<String> {
+    memory::validate_entry_input(input.id, input.title, input.tags, input.content)?;
+
+    let entry_type: EntryType = input
+        .entry_type
+        .parse()
+        .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
+    let source_type = input
+        .source_type
+        .map(str::parse::<memory::SourceType>)
+        .transpose()
+        .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
+    if input
+        .on_conflict
+        .is_some_and(|value| value != "contradicts")
+    {
+        return Err(ErrorKind::InvalidQuery(
+            "on_conflict must be 'contradicts' when provided".to_string(),
+        )
+        .into());
+    }
+
+    if input.relates.len() > 10 {
+        return Err(ErrorKind::InvalidQuery("max 10 relations per entry".to_string()).into());
+    }
+    let parsed_relates = input
+        .relates
+        .iter()
+        .map(|edge| {
+            let relation = edge
+                .relation
+                .parse::<MemoryRelation>()
+                .map_err(|e| Error::from(ErrorKind::InvalidQuery(e)))?;
+            let target_kind = edge
+                .target_kind
+                .parse::<TargetKind>()
+                .map_err(|e| Error::from(ErrorKind::InvalidQuery(e)))?;
+            Ok((edge.target.as_str(), target_kind, relation))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if entry_type == EntryType::Prior && memory::is_mechanical_prior_noise(input.content) {
+        return Err(ErrorKind::InvalidQuery(
+            "Rejected mechanical tool-chain prior (no reusable lesson). Priors must carry a distilled, trigger-scoped lesson.".to_string(),
+        )
+        .into());
+    }
+
+    let existing = memory::get_entry_without_tracking(conn, input.id)?;
+    if input.dry_run {
+        let action = if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        };
+        return Ok(format!(
+            "dry-run: would {action} memory entry '{}'",
+            input.id
+        ));
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = match (input.ttl, entry_type) {
+        (Some(seconds), _) => Some(now + seconds as i64),
+        (None, EntryType::Prior) => Some(now + memory::PRIOR_TTL_SECS),
+        (None, _) => None,
+    };
+    let due_at = input.due_in.map(|seconds| now + seconds as i64);
+    let is_new = existing.is_none();
+
+    let mut contradicts_target = None;
+    if is_new {
+        if let Some(embedding) = input.embedding {
+            for (rowid, distance) in
+                crate::store::vectors::memory_vector_search(conn, embedding, 3)?
+            {
+                if distance >= 0.32 {
+                    continue;
+                }
+                let Some(duplicate) = memory::get_entry_by_rowid(conn, rowid)? else {
+                    continue;
+                };
+                if input.on_conflict == Some("contradicts") {
+                    contradicts_target = Some(duplicate.id);
+                    break;
+                }
+                let similarity = 1.0 - (f64::from(distance) * f64::from(distance) / 2.0);
+                return Err(ErrorKind::InvalidQuery(format!(
+                    "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). Update that entry instead, or use a more distinct title/content.",
+                    duplicate.title,
+                    duplicate.id,
+                    similarity * 100.0
+                ))
+                .into());
+            }
+        }
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let mut output = if let Some(mut entry) = existing {
+        if let Err(error) = memory::save_revision(
+            &tx,
+            input.id,
+            &entry.content,
+            input.content,
+            entry.source_type,
+        ) {
+            if error.is_index_corrupt() {
+                return Err(error);
+            }
+            tracing::warn!("Failed to save revision for {}: {error}", input.id);
+        }
+        let previous = entry.clone();
+        entry.title = input.title.to_string();
+        entry.content = input.content.to_string();
+        entry.entry_type = entry_type;
+        entry.tags = input.tags.to_vec();
+        entry.expires_at = expires_at;
+        if input.due_in.is_some() {
+            entry.due_at = due_at;
+        }
+        if let Some(source_type) = source_type {
+            entry.source_type = source_type;
+        }
+        if crate::store::memory_file::projection_differs(&previous, &entry) {
+            entry.updated_at = now;
+        }
+        memory::update_entry(&tx, &entry)?;
+        let revisions = memory::get_revision_summary(&tx, input.id)?;
+        let suffix = if revisions.count > 0 {
+            format!(" ({} revisions)", revisions.count)
+        } else {
+            String::new()
+        };
+        format!("Updated memory entry: {}{suffix}", input.id)
+    } else {
+        let entry = MemoryEntry {
+            id: input.id.to_string(),
+            title: input.title.to_string(),
+            content: input.content.to_string(),
+            entry_type,
+            tags: input.tags.to_vec(),
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: input.source_path.map(str::to_string),
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: source_type.unwrap_or_default(),
+            expires_at,
+            due_at,
+        };
+        memory::add_entry(&tx, &entry)?;
+        format!("Created memory entry: {}", input.id)
+    };
+
+    for (target, kind, relation) in parsed_relates {
+        memory_graph::add_edge_in(&tx, input.id, target, kind, relation)?;
+    }
+    if let Some(target) = &contradicts_target {
+        memory_graph::add_edge_in(
+            &tx,
+            input.id,
+            target,
+            TargetKind::Memory,
+            MemoryRelation::Contradicts,
+        )?;
+        output.push_str(&format!(
+            " — conflict with '{target}' recorded as a contradicts edge (resolve via memory_confirm)"
+        ));
+    }
+    memory::set_provenance(&tx, input.id, input.session, input.agent)?;
+    tx.commit()?;
+
+    if let Some(embedding) = input.embedding {
+        if let Some(rowid) = memory::get_rowid(conn, input.id)? {
+            if let Err(error) = crate::store::vectors::store_memory_embedding(
+                conn,
+                rowid,
+                embedding,
+                crate::llm::embeddings::MODEL_NAME,
+            ) {
+                if error.is_index_corrupt() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    "Failed to store memory embedding for '{}': {error}",
+                    input.id
+                );
+            }
+            if is_new {
+                output.push_str(&memory::find_similar_entries(
+                    conn, embedding, rowid, input.id,
+                )?);
+            }
+        }
+    }
+
+    Ok(output)
+}
 
 /// Handle `mdkb memory add` command.
 #[allow(clippy::too_many_arguments)]
@@ -31,118 +288,62 @@ pub fn handle_memory_add(
     ttl: Option<u64>,
     due_in: Option<u64>,
     source_type: Option<&str>,
+    relates: &[WriteRelation],
+    agent: Option<&str>,
+    on_conflict: Option<&str>,
+    dry_run: bool,
 ) -> Result<()> {
-    let entry_type: EntryType = entry_type
-        .parse()
-        .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
-
-    // Parse the explicit source_type (if any); default applied at insert only so
-    // a defaulted re-write never silently downgrades an official_docs entry.
-    let parsed_source_type: Option<memory::SourceType> = source_type
-        .map(|s| s.parse())
-        .transpose()
-        .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
-
     let tags: Vec<String> = tags
         .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
         .unwrap_or_default();
+    let embedding = if dry_run
+        || !crate::config::Config::load_or_default(&ctx.config_path)
+            .search
+            .auto_embed_memory
+    {
+        None
+    } else {
+        crate::llm::get_cached_service()
+            .ok()
+            .and_then(|service| service.embed_query(&format!("{title} {content}")).ok())
+    };
 
-    memory::validate_entry_input(id, title, &tags, content)?;
+    write_memory(
+        &ctx.conn,
+        WriteMemoryInput {
+            id,
+            title,
+            content,
+            entry_type,
+            source_type,
+            tags: &tags,
+            ttl,
+            due_in,
+            embedding: embedding.as_deref(),
+            source_path,
+            relates,
+            session: None,
+            agent,
+            on_conflict,
+            dry_run,
+        },
+    )?;
 
-    if entry_type == EntryType::Prior && memory::is_mechanical_prior_noise(content) {
-        return Err(ErrorKind::InvalidQuery(
-            "Rejected mechanical tool-chain prior (no reusable lesson). Priors must carry a distilled, trigger-scoped lesson.".to_string(),
-        )
-        .into());
+    if dry_run {
+        return Ok(());
     }
 
     let now = chrono::Utc::now().timestamp();
-    let expires_at = ttl.map(|s| now + s as i64);
-    let due_at = due_in.map(|s| now + s as i64);
-
-    let entry = MemoryEntry {
-        id: id.to_string(),
-        title: title.to_string(),
-        content: content.to_string(),
-        entry_type,
-        tags,
-        status: EntryStatus::Active,
-        created_at: now,
-        updated_at: now,
-        superseded_by: None,
-        access_count: 0,
-        last_accessed: None,
-        source_path: source_path.map(String::from),
-        confirmations: 0,
-        last_confirmed_at: None,
-        source_type: parsed_source_type.unwrap_or_default(),
-        expires_at,
-        due_at,
-    };
-
-    // Upsert: update in place when the id already exists, else insert. Mirrors
-    // the MCP `memory_write` path so the CLI/bridge does not fail with a UNIQUE
-    // constraint violation when re-writing an existing entry.
-    let persisted = if let Some(mut existing) = memory::get_entry_without_tracking(&ctx.conn, id)? {
-        if let Err(e) = memory::save_revision(
-            &ctx.conn,
-            id,
-            &existing.content,
-            content,
-            existing.source_type,
-        ) {
-            tracing::warn!("Failed to save revision for {id}: {e}");
-        }
-        let previous = existing.clone();
-        existing.title = entry.title;
-        existing.content = entry.content;
-        existing.entry_type = entry.entry_type;
-        existing.tags = entry.tags;
-        existing.expires_at = entry.expires_at;
-        if due_in.is_some() {
-            existing.due_at = entry.due_at;
-        }
-        // Only override provenance when the caller explicitly passed --source-type;
-        // a defaulted re-write preserves the existing trust level.
-        if let Some(st) = parsed_source_type {
-            existing.source_type = st;
-        }
-        // A re-write that restates what is already recorded is not an edit. The
-        // TTL still slides in the DB, but `updated_at` stays put, so the
-        // projection is byte-identical and produces no diff — a session that
-        // learned nothing new must not show up in the shared history.
-        if crate::store::memory_file::projection_differs(&previous, &existing) {
-            existing.updated_at = now;
-        }
-        memory::update_entry(&ctx.conn, &existing)?;
-        existing
-    } else {
-        memory::add_entry(&ctx.conn, &entry)?;
-        entry
-    };
 
     // Save to disk and regenerate index. Recording the projection here — not
     // leaving it to the next sync — is what keeps the write and the hash that
     // describes it in step; a file written without its hash reads back as an
     // unexplained local edit.
-    project_after_write(ctx, &persisted.id, now);
-
-    // Embed (or re-embed) so CLI/bridge writes are searchable by vector like the
-    // MCP path. A cold model or embed failure leaves the entry pending — never
-    // fails the write — and `mdkb update` backfills it (count in `mdkb stats`).
-    // Gated by `[search] auto_embed_memory` (default on): off skips the ONNX call
-    // entirely, leaving the entry pending for backfill (TEST-1 hermetic switch).
-    if crate::config::Config::load_or_default(&ctx.config_path)
-        .search
-        .auto_embed_memory
-    {
-        if let Err(e) = memory::embed_entry(&ctx.conn, id, &persisted.title, &persisted.content) {
-            tracing::warn!("Failed to store embedding for '{id}': {e}");
-        }
-    }
+    project_after_write(ctx, id, now);
 
     Ok(())
 }
+
 /// Handle `mdkb memory show` command.
 pub fn handle_memory_show(ctx: &Context, id: &str) -> Result<Option<MemoryEntry>> {
     memory::get_entry_without_tracking(&ctx.conn, id)
@@ -177,7 +378,6 @@ pub fn handle_memory_link(
     doc: bool,
     agent: Option<&str>,
 ) -> Result<()> {
-    use crate::store::memory_graph::{self, MemoryRelation, TargetKind};
     use std::str::FromStr;
 
     let rel = MemoryRelation::from_str(relation)

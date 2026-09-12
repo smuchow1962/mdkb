@@ -39,12 +39,6 @@ use crate::store::memory_graph::{self, MemoryRelation, TargetKind};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::mcp_error;
-use super::server::{
-    apply_min_confidence, format_memory_search_results, format_search_results, format_symbol,
-    format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago, resolve_document,
-    truncate_text,
-};
-
 /// Pick the JSON-RPC code a store error must travel under.
 ///
 /// `INTERNAL_ERROR` is the daemon's post-dispatch code: it tells the CLI that a
@@ -105,12 +99,250 @@ fn close_context_on_reported_corruption<T>(
     }
     result
 }
+#[cfg(test)]
+use super::tools::RelatesInput;
 use super::tools::{
-    CodeFindParams, CodeGraphParams, GetParams, GraphParams, MemoryWriteBatchEntry, RelatesInput,
-    SearchParams, SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
+    CodeFindParams, CodeGraphParams, GetParams, GraphParams, MemoryConfirmParams,
+    MemoryDeleteParams, MemoryListParams, MemoryWriteBatchEntry, SearchParams,
+    SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
 };
 
 const MAX_HOOK_PROMPT_FINGERPRINTS: usize = 32;
+
+fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
+    format_symbol_with_file_tokens(sym, None)
+}
+
+fn format_symbol_with_file_tokens(
+    sym: &crate::code::symbol::Symbol,
+    file_tokens: Option<u32>,
+) -> String {
+    let suffix = file_tokens
+        .map(|count| format!(" (file: ~{count}tok)"))
+        .unwrap_or_default();
+    let mut output = format!(
+        "  sym#{} {:?} {} in {}:{}{}\n",
+        sym.id.value(),
+        sym.kind,
+        sym.name,
+        sym.file_path,
+        sym.range.start_line,
+        suffix,
+    );
+    if let Some(signature) = &sym.signature {
+        output.push_str(&format!("    Signature: {signature}\n"));
+    }
+    if let Some(doc) = &sym.doc_comment {
+        output.push_str(&format!("    Doc: {}\n", truncate_text(doc, 120)));
+    }
+    output
+}
+
+fn resolve_document(
+    conn: &rusqlite::Connection,
+    path_or_id: &str,
+) -> crate::error::Result<crate::domain::Document> {
+    if let Ok(id) = path_or_id.parse::<i64>() {
+        if let Some(document) = documents::get_document(conn, id)? {
+            return Ok(document);
+        }
+    }
+    for collection in collections::list_collections(conn)? {
+        if let Some(document) = documents::get_document_by_path(conn, &collection.name, path_or_id)?
+        {
+            return Ok(document);
+        }
+    }
+    Err(ErrorKind::DocumentNotFound {
+        id: path_or_id.to_string(),
+    }
+    .into())
+}
+
+pub(super) fn relative_time_ago(unix_ts: i64) -> String {
+    let secs = (chrono::Utc::now().timestamp() - unix_ts).max(0);
+    if secs < 60 {
+        "just now".into()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else if secs < 7 * 86400 {
+        format!("{}d ago", secs / 86400)
+    } else if secs < 30 * 86400 {
+        format!("{}w ago", secs / (7 * 86400))
+    } else if secs < 365 * 86400 {
+        format!("{}mo ago", secs / (30 * 86400))
+    } else {
+        format!("{}y ago", secs / (365 * 86400))
+    }
+}
+
+pub(super) fn truncate_text(text: &str, max_len: usize) -> String {
+    let text = text.replace('\n', " ");
+    if text.len() <= max_len {
+        return text;
+    }
+    let mut cut = max_len.saturating_sub(3);
+    while !text.is_char_boundary(cut) && cut > 0 {
+        cut -= 1;
+    }
+    format!("{}...", &text[..cut])
+}
+
+const OOD_SCORE_THRESHOLD: f64 = 0.3;
+
+pub(super) fn ood_hint(
+    query: &str,
+    result_count: usize,
+    top_score: Option<f64>,
+) -> Option<&'static str> {
+    if query.trim().is_empty() {
+        return Some("\n> The query is empty. Pass search terms — an empty query matches nothing.");
+    }
+    if result_count == 0 {
+        return Some(
+            "\n> No results. mdkb is semantic search — it won't match literal strings. \
+             Use Grep for exact string/regex matching in source files.",
+        );
+    }
+    if top_score.is_some_and(|score| score < OOD_SCORE_THRESHOLD) {
+        return Some(
+            "\n> Low-confidence results. If searching for a literal string or pattern, \
+             use Grep instead — mdkb only does semantic/fuzzy matching.",
+        );
+    }
+    None
+}
+
+pub(super) fn format_search_results(results: &[SearchResult], limit: usize) -> String {
+    use crate::store::hybrid::lost_in_middle_reorder;
+
+    let mut ordered: Vec<_> = results
+        .iter()
+        .filter(|result| result.score != 0.0)
+        .collect();
+    if ordered.is_empty() {
+        return "No matching documents found.".to_string();
+    }
+    lost_in_middle_reorder(&mut ordered);
+
+    let mut output = if ordered.len() >= limit {
+        format!(
+            "Showing {} results (limit reached, refine query for more precise results):\n",
+            ordered.len()
+        )
+    } else {
+        String::new()
+    };
+    for result in &ordered {
+        let title = result.title.as_deref().unwrap_or("(untitled)");
+        if let Some(root) = &result.repo_root {
+            output.push_str(&format!(
+                "[{}] {} - {} (score: {:.2}, repo: {})\n",
+                result.id, result.path, title, result.score, root
+            ));
+        } else {
+            output.push_str(&format!(
+                "[{}] {} - {} (score: {:.2})\n",
+                result.id, result.path, title, result.score
+            ));
+        }
+        for snippet in &result.snippets {
+            output.push_str(&format!("  {snippet}\n"));
+        }
+    }
+
+    let retrieval_ids: Vec<_> = ordered
+        .iter()
+        .map(|result| {
+            if result.collection == "memory" && !result.path.is_empty() {
+                result.path.clone()
+            } else {
+                result.id.to_string()
+            }
+        })
+        .collect();
+    let repo_roots: Vec<_> = ordered
+        .iter()
+        .filter_map(|result| result.repo_root.as_deref())
+        .collect();
+    if let Some(root) = repo_roots.first() {
+        let id = serde_json::to_string(&retrieval_ids[0]).expect("string serialization");
+        let root = serde_json::to_string(root).expect("string serialization");
+        output.push_str(&format!("\nUse get({id}, root={root}) to read one."));
+        if retrieval_ids.len() > 1 {
+            output.push_str(" For another result, pass its listed repo as root.");
+        }
+        output.push_str(" root=\"*\" is search-only.");
+    } else if retrieval_ids.len() == 1 {
+        output.push_str(&format!("\nUse get(\"{}\") to read.", retrieval_ids[0]));
+    } else {
+        output.push_str(&format!(
+            "\nUse get(\"{}\") to read one, or get(\"{}\") for all.",
+            retrieval_ids[0],
+            retrieval_ids.join(",")
+        ));
+    }
+    output
+}
+
+fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
+    use crate::store::hybrid::lost_in_middle_reorder;
+
+    if entries.is_empty() {
+        return "No matching memory entries found.".to_string();
+    }
+    let mut ordered: Vec<_> = entries.iter().collect();
+    lost_in_middle_reorder(&mut ordered);
+    let mut output = format!("Found {} memory entries:\n\n", entries.len());
+    for entry in ordered {
+        let confirmed = entry
+            .last_confirmed_at
+            .map(|timestamp| format!(", confirmed:{}", relative_time_ago(timestamp)))
+            .unwrap_or_default();
+        output.push_str(&format!(
+            "- [{}] {} ({}, conf:{:.2}, confirms:{}, access:{}{}, {}{}): {}\n",
+            entry.id,
+            entry.title,
+            entry.entry_type,
+            entry.confidence(),
+            entry.confirmations,
+            entry.access_count,
+            confirmed,
+            relative_time_ago(entry.updated_at),
+            format_ttl_info(entry.expires_at),
+            truncate_text(&entry.content, 100)
+        ));
+    }
+    output
+}
+
+fn apply_min_confidence(
+    entries: Vec<memory::MemoryEntry>,
+    min: Option<f64>,
+) -> Vec<memory::MemoryEntry> {
+    match min {
+        Some(threshold) if threshold > 0.0 => entries
+            .into_iter()
+            .filter(|entry| entry.confidence() >= threshold)
+            .collect(),
+        _ => entries,
+    }
+}
+
+fn format_ttl_info(expires_at: Option<i64>) -> String {
+    match expires_at {
+        Some(timestamp) if timestamp <= chrono::Utc::now().timestamp() => ", EXPIRED".to_string(),
+        Some(timestamp) => {
+            let date = chrono::DateTime::from_timestamp(timestamp, 0)
+                .map(|value| value.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| timestamp.to_string());
+            format!(", expires:{date}")
+        }
+        None => String::new(),
+    }
+}
 
 /// Drop a session's dedup state after this long untouched. Sessions are only
 /// explicitly reset on a same-session Stop/wrapup; one that ends abnormally
@@ -736,259 +968,8 @@ async fn embed_query_off_lock(query: &str) -> Option<Vec<f32>> {
     }
 }
 
-/// `memory_write_impl` and `memory_write_batch_impl`. Synchronous because it
-/// runs against an already-locked `Connection`; embedding I/O is best-effort
-/// and falls back silently when the LLM service is unconfigured (tests).
-///
-/// `embedding` must be pre-computed by the async caller **before** the ctx
-/// lock is acquired so that CPU-bound ONNX inference never blocks the tokio
-/// executor while holding the Mutex guard.
-struct WriteSingleMemory<'a> {
-    id: &'a str,
-    title: &'a str,
-    content: &'a str,
-    entry_type: &'a str,
-    source_type: &'a str,
-    tags: &'a [String],
-    ttl: Option<u64>,
-    due_in: Option<u64>,
-    embedding: Option<Vec<f32>>,
-    source_path: Option<&'a str>,
-    relates: &'a [RelatesInput],
-    session: Option<&'a str>,
-    agent: Option<&'a str>,
-    on_conflict: Option<&'a str>,
-    dry_run: bool,
-}
-
-fn write_single_memory(
-    conn: &rusqlite::Connection,
-    input: WriteSingleMemory<'_>,
-) -> Result<String, McpError> {
-    let WriteSingleMemory {
-        id,
-        title,
-        content,
-        entry_type: entry_type_str,
-        source_type: source_type_str,
-        tags,
-        ttl,
-        due_in,
-        embedding,
-        source_path,
-        relates,
-        session,
-        agent,
-        on_conflict,
-        dry_run,
-    } = input;
-    memory::validate_entry_input(id, title, tags, content).map_err(mcp_refusal)?;
-
-    let existing = memory::get_entry_without_tracking(conn, id)
-        .map_err(|e| mcp_store_error("Failed to check existing entry", e))?;
-
-    let entry_type: memory::EntryType = entry_type_str.parse().map_err(|e: String| {
-        mcp_error(format!(
-            "{e}. Valid types: topic, problem, decision, reminder, prior, handoff"
-        ))
-    })?;
-
-    let source_type: memory::SourceType =
-        source_type_str.parse().map_err(|e: String| mcp_error(e))?;
-
-    // Validate all relations up front so an invalid relation rejects the whole
-    // write (no partial edges) — even in dry-run. Parsed triples are applied
-    // inside the transaction below.
-    if relates.len() > 10 {
-        return Err(mcp_error("max 10 relations per entry"));
-    }
-    let parsed_relates: Vec<(String, TargetKind, MemoryRelation)> = relates
-        .iter()
-        .map(|r| {
-            let rel = r.relation.parse::<MemoryRelation>().map_err(mcp_error)?;
-            let kind = r.target_kind.parse::<TargetKind>().map_err(mcp_error)?;
-            Ok((r.target.clone(), kind, rel))
-        })
-        .collect::<Result<_, McpError>>()?;
-
-    if entry_type == memory::EntryType::Prior && memory::is_mechanical_prior_noise(content) {
-        return Err(mcp_error(
-            "Rejected mechanical tool-chain prior (no reusable lesson). Priors must carry a distilled, trigger-scoped lesson.".to_string(),
-        ));
-    }
-
-    if dry_run {
-        let action = if existing.is_some() {
-            "update"
-        } else {
-            "create"
-        };
-        return Ok(format!("dry-run: would {action} memory entry '{id}'"));
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let expires_at = match (ttl, entry_type) {
-        (Some(s), _) => Some(now + s as i64),
-        (None, memory::EntryType::Prior) => Some(now + memory::PRIOR_TTL_SECS),
-        (None, _) => None,
-    };
-    let due_at = due_in.map(|s| now + s as i64);
-    let is_new = existing.is_none();
-
-    // Pre-write duplicate check: reject if a near-identical entry exists (new entries only).
-    // L2 distance < 0.32 ≈ cosine similarity > 0.95 — very high bar, minimizes false positives.
-    // Uses the pre-computed embedding passed in by the async caller (computed outside the lock).
-    //
-    // With `on_conflict="contradicts"`, a conflict is NOT rejected: the new entry is
-    // written and linked to the similar one with a `contradicts` edge (recorded below,
-    // inside the transaction). The default (param absent) keeps today's rejection verbatim.
-    let mut contradicts_target: Option<String> = None;
-    if is_new {
-        if let Some(ref emb) = embedding {
-            let similar = crate::store::vectors::memory_vector_search(conn, emb, 3)
-                .map_err(|e| mcp_store_error("Failed to search for duplicate entries", e))?;
-            for (rowid, distance) in &similar {
-                if *distance < 0.32 {
-                    if let Some(dup) = memory::get_entry_by_rowid(conn, *rowid)
-                        .map_err(|e| mcp_store_error("Failed to load duplicate entry", e))?
-                    {
-                        if on_conflict == Some("contradicts") {
-                            contradicts_target = Some(dup.id);
-                            break;
-                        }
-                        let similarity = 1.0 - (f64::from(*distance) * f64::from(*distance) / 2.0);
-                        return Err(mcp_error(format!(
-                            "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
-                             Update that entry instead, or use a more distinct title/content.",
-                            dup.title,
-                            dup.id,
-                            similarity * 100.0
-                        )));
-                    }
-                }
-            }
-        }
-    }
-
-    // Entry write + typed edges + provenance are one atomic unit per item: a bad
-    // edge or provenance write rolls back the entry too.
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| mcp_store_error("Failed to begin transaction", e))?;
-
-    let mut output = if let Some(mut existing_entry) = existing {
-        if let Err(error) = memory::save_revision(
-            &tx,
-            id,
-            &existing_entry.content,
-            content,
-            existing_entry.source_type,
-        ) {
-            if error.is_index_corrupt() {
-                return Err(mcp_store_error("Failed to save memory revision", error));
-            }
-            tracing::warn!("Failed to save revision for {id}: {error}");
-        }
-
-        existing_entry.title = title.to_string();
-        existing_entry.content = content.to_string();
-        existing_entry.entry_type = entry_type;
-        existing_entry.tags = tags.to_vec();
-        existing_entry.expires_at = expires_at;
-        if due_in.is_some() {
-            existing_entry.due_at = due_at;
-        }
-        memory::update_entry(&tx, &existing_entry)
-            .map_err(|e| mcp_store_error("Failed to update memory entry", e))?;
-
-        let revision_summary = memory::get_revision_summary(&tx, id)
-            .map_err(|e| mcp_store_error("Failed to read memory revisions", e))?;
-        let rev_info = if revision_summary.count > 0 {
-            format!(" ({} revisions)", revision_summary.count)
-        } else {
-            String::new()
-        };
-        format!("Updated memory entry: {id}{rev_info}")
-    } else {
-        let entry = memory::MemoryEntry {
-            id: id.to_string(),
-            title: title.to_string(),
-            content: content.to_string(),
-            entry_type,
-            tags: tags.to_vec(),
-            status: memory::EntryStatus::Active,
-            created_at: now,
-            updated_at: now,
-            superseded_by: None,
-            access_count: 0,
-            last_accessed: None,
-            source_path: source_path.map(String::from),
-            confirmations: 0,
-            last_confirmed_at: None,
-            source_type,
-            expires_at,
-            due_at,
-        };
-        memory::add_entry(&tx, &entry)
-            .map_err(|e| mcp_store_error("Failed to create memory entry", e))?;
-        format!("Created memory entry: {id}")
-    };
-
-    for (target, kind, rel) in &parsed_relates {
-        memory_graph::add_edge_in(&tx, id, target, *kind, *rel)
-            .map_err(|e| mcp_store_error("Failed to add relation", e))?;
-    }
-    if let Some(target) = &contradicts_target {
-        memory_graph::add_edge_in(
-            &tx,
-            id,
-            target,
-            TargetKind::Memory,
-            MemoryRelation::Contradicts,
-        )
-        .map_err(|e| mcp_store_error("Failed to record contradicts edge", e))?;
-        output.push_str(&format!(
-            " — conflict with '{target}' recorded as a contradicts edge (resolve via memory_confirm)"
-        ));
-    }
-    memory::set_provenance(&tx, id, session, agent)
-        .map_err(|e| mcp_store_error("Failed to record provenance", e))?;
-
-    tx.commit()
-        .map_err(|e| mcp_store_error("Failed to commit memory write", e))?;
-
-    // Store the pre-computed embedding and append similarity warnings.
-    // The embedding was computed outside the lock by the async caller to avoid
-    // blocking the tokio executor during CPU-bound ONNX inference.
-    if let Some(ref emb) = embedding {
-        if let Some(rowid) = memory::get_rowid(conn, id)
-            .map_err(|e| mcp_store_error("Failed to resolve memory row", e))?
-        {
-            if let Err(e) = crate::store::vectors::store_memory_embedding(
-                conn,
-                rowid,
-                emb,
-                crate::llm::embeddings::MODEL_NAME,
-            ) {
-                if e.is_index_corrupt() {
-                    return Err(mcp_store_error("Failed to store memory embedding", e));
-                }
-                tracing::warn!("Failed to store memory embedding for '{id}': {e}");
-            }
-
-            if is_new {
-                let warnings = memory::find_similar_entries(conn, emb, rowid, id)
-                    .map_err(|e| mcp_store_error("Failed to find similar memory entries", e))?;
-                output.push_str(&warnings);
-            }
-        }
-    }
-
-    Ok(output)
-}
-
 /// `memory_write` — create or update a single memory entry. Wraps
-/// `write_single_memory` with `RepoHandle` ctx acquisition.
+/// [`crate::core::memory::write_memory`] with `RepoHandle` ctx acquisition.
 ///
 /// Embedding is generated **before** the ctx lock is acquired so that
 /// CPU-bound ONNX inference (10–100 ms) never blocks the tokio executor
@@ -1029,18 +1010,27 @@ pub async fn memory_write_impl(
         .unwrap_or(None)
     };
 
-    let input = WriteSingleMemory {
+    let relations = entry
+        .relates
+        .iter()
+        .map(|edge| crate::core::memory::WriteRelation {
+            relation: edge.relation.clone(),
+            target: edge.target.clone(),
+            target_kind: edge.target_kind.clone(),
+        })
+        .collect::<Vec<_>>();
+    let input = crate::core::memory::WriteMemoryInput {
         id: &entry.id,
         title: &entry.title,
         content: &content,
         entry_type: &entry.entry_type,
-        source_type: &entry.source_type,
+        source_type: entry.source_type.as_deref(),
         tags: &entry.tags,
         ttl: entry.ttl,
         due_in: entry.due_in,
-        embedding,
+        embedding: embedding.as_deref(),
         source_path: source_path.as_deref(),
-        relates: &entry.relates,
+        relates: &relations,
         session,
         agent: entry.agent.as_deref(),
         on_conflict: entry.on_conflict.as_deref(),
@@ -1052,12 +1042,14 @@ pub async fn memory_write_impl(
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
-        let result = write_single_memory(&ctx.conn, input);
+        let result = crate::core::memory::write_memory(&ctx.conn, input)
+            .map_err(|error| mcp_store_error("Memory write failed", error));
         close_context_on_reported_corruption(&mut ctx_guard, "memory write dry run", result)
     } else {
         let id = input.id;
         run_handle_memory_mutation(&mut ctx_guard, "memory write", |ctx| {
-            let output = write_single_memory(&ctx.conn, input)?;
+            let output = crate::core::memory::write_memory(&ctx.conn, input)
+                .map_err(|error| mcp_store_error("Memory write failed", error))?;
             // Same door as `mdkb memory add`: the file exists the moment the
             // row does, instead of at the next sync.
             crate::core::memory_sync::project_after_write(ctx, id, chrono::Utc::now().timestamp());
@@ -1132,26 +1124,36 @@ pub async fn memory_write_batch_impl(
         for ((entry, (content, source_path)), embedding) in
             entries.iter().zip(resolved.iter()).zip(embeddings)
         {
-            let result = write_single_memory(
+            let relations = entry
+                .relates
+                .iter()
+                .map(|edge| crate::core::memory::WriteRelation {
+                    relation: edge.relation.clone(),
+                    target: edge.target.clone(),
+                    target_kind: edge.target_kind.clone(),
+                })
+                .collect::<Vec<_>>();
+            let result = crate::core::memory::write_memory(
                 &ctx.conn,
-                WriteSingleMemory {
+                crate::core::memory::WriteMemoryInput {
                     id: &entry.id,
                     title: &entry.title,
                     content,
                     entry_type: &entry.entry_type,
-                    source_type: &entry.source_type,
+                    source_type: entry.source_type.as_deref(),
                     tags: &entry.tags,
                     ttl: entry.ttl,
                     due_in: entry.due_in,
-                    embedding,
+                    embedding: embedding.as_deref(),
                     source_path: source_path.as_deref(),
-                    relates: &entry.relates,
+                    relates: &relations,
                     session,
                     agent: entry.agent.as_deref(),
                     on_conflict: entry.on_conflict.as_deref(),
                     dry_run,
                 },
-            )?;
+            )
+            .map_err(|error| mcp_store_error("Memory write failed", error))?;
             if !dry_run {
                 crate::core::memory_sync::project_after_write(
                     ctx,
@@ -1178,6 +1180,9 @@ pub async fn memory_write_batch_impl(
     }
 }
 
+/// The most entries one `memory_list` call returns, whatever `limit` asks.
+pub const MEMORY_LIST_MAX_LIMIT: usize = 200;
+
 /// `memory_list` — list active memory entries sorted by `sort` ("recent" |
 /// "popular" | "newest"). Returns `(rendered_text, entry_count)` so callers
 /// can record search metrics.
@@ -1187,6 +1192,7 @@ pub async fn memory_list_impl(
     sort: &str,
 ) -> Result<(String, usize), McpError> {
     let sort_order: memory::MemorySortOrder = sort.parse().map_err(mcp_error)?;
+    let limit = limit.min(MEMORY_LIST_MAX_LIMIT);
 
     ensure_handle_context(handle).await?;
 
@@ -2566,6 +2572,70 @@ pub struct CodeGraphOutput {
     pub symbols: Vec<crate::code::symbol::Symbol>,
 }
 
+fn resolve_symbol(
+    facade: &IndexFacade,
+    name: &str,
+    symbol_id: Option<u32>,
+) -> Result<crate::code::symbol::Symbol, McpError> {
+    if let Some(id) = symbol_id {
+        let symbol_id = crate::code::types::SymbolId::new(id)
+            .ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved."))?;
+        return facade
+            .get_symbol(symbol_id)
+            .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}.")));
+    }
+
+    let matches = facade.find_symbols_by_name(name);
+    match matches.len() {
+        0 if name.len() >= 3 => {
+            let fuzzy = facade.search_symbols(name, 10);
+            match fuzzy.len() {
+                0 => Err(mcp_error(format!("No symbol found: '{name}'."))),
+                1 => Ok(fuzzy.into_iter().next().expect("one fuzzy symbol")),
+                _ => Err(disambiguation_error(name, &fuzzy)),
+            }
+        }
+        0 => Err(mcp_error(format!("No symbol found: '{name}'."))),
+        1 => Ok(matches.into_iter().next().expect("one exact symbol")),
+        _ => Err(disambiguation_error(name, &matches)),
+    }
+}
+
+pub(super) fn disambiguation_error(
+    name: &str,
+    candidates: &[crate::code::symbol::Symbol],
+) -> McpError {
+    let mut message = format!("Multiple symbols match '{name}'. Pass symbol_id:\n");
+    for symbol in candidates {
+        let scope = match &symbol.scope_context {
+            Some(crate::code::symbol::ScopeContext::ClassMember {
+                class_name: Some(class_name),
+            }) => format!(" [in {class_name}]"),
+            Some(crate::code::symbol::ScopeContext::Local {
+                parent_name: Some(parent_name),
+                ..
+            }) => format!(" [in {parent_name}]"),
+            _ => String::new(),
+        };
+        let signature = symbol
+            .signature
+            .as_ref()
+            .map(|value| format!(" `{}`", truncate_text(value.trim(), 60)))
+            .unwrap_or_default();
+        message.push_str(&format!(
+            "  sym#{} - {:?} {} in {} ({}){}{}\n",
+            symbol.id.value(),
+            symbol.kind,
+            symbol.name,
+            symbol.file_path,
+            symbol.range,
+            scope,
+            signature,
+        ));
+    }
+    mcp_error(message)
+}
+
 /// `code_graph` — call graph queries. Resolves the symbol then dispatches by
 /// direction (calls/callers/impact).
 pub async fn code_graph_impl(
@@ -2580,7 +2650,7 @@ pub async fn code_graph_impl(
         });
     };
 
-    let symbol = super::server::McpServer::resolve_symbol(facade, &params.name, params.symbol_id)?;
+    let symbol = resolve_symbol(facade, &params.name, params.symbol_id)?;
 
     // One entry per hit, `None` when `impact` returns an id the index no longer
     // holds. Keeping the id alongside preserves that row in the prose instead of
@@ -4508,30 +4578,18 @@ pub async fn dispatch_call(
             Ok(json!({ "text": text, "tokens": tokens }))
         }
         "memory_delete" => {
-            let id = params
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| mcp_error("memory_delete: missing 'id'"))?;
-            let dry_run = params
-                .get("dry_run")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let text = memory_delete_impl(&handle, id, dry_run).await?;
+            let request: MemoryDeleteParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("memory_delete: invalid params: {e}")))?;
+            let text = memory_delete_impl(&handle, &request.id, request.dry_run).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "memory_delete", tokens, 1, false)
                 .await;
             Ok(json!({ "text": text, "tokens": tokens }))
         }
         "memory_confirm" => {
-            let id = params
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| mcp_error("memory_confirm: missing 'id'"))?;
-            let outcome = params
-                .get("outcome")
-                .and_then(Value::as_str)
-                .ok_or_else(|| mcp_error("memory_confirm: missing 'outcome'"))?;
-            let text = memory_confirm_impl(&handle, id, outcome).await?;
+            let request: MemoryConfirmParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("memory_confirm: invalid params: {e}")))?;
+            let text = memory_confirm_impl(&handle, &request.id, &request.outcome).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "memory_confirm", tokens, 1, false)
                 .await;
@@ -4596,16 +4654,9 @@ pub async fn dispatch_call(
             Ok(json!({ "text": text, "tokens": tokens, "count": count, "truncated": truncated }))
         }
         "memory_list" => {
-            let limit = params
-                .get("limit")
-                .and_then(Value::as_u64)
-                .map(|n| (n as usize).min(200))
-                .unwrap_or(20);
-            let sort = params
-                .get("sort")
-                .and_then(Value::as_str)
-                .unwrap_or("recent");
-            let (text, count) = memory_list_impl(&handle, limit, sort).await?;
+            let request: MemoryListParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("memory_list: invalid params: {e}")))?;
+            let (text, count) = memory_list_impl(&handle, request.limit, &request.sort).await?;
             let tokens = count_tokens(&text);
             dctx.metrics.record_search(tokens, count);
             dctx.record_persistent_call(&handle, "memory_list", tokens, count, false)
@@ -6950,7 +7001,43 @@ mod tests {
         let err = dispatch_call("memory_delete", Value::Null, handle, &dctx)
             .await
             .expect_err("must error");
-        assert!(err.message.contains("missing 'id'"), "msg: {}", err.message);
+        assert!(err.message.contains("id"), "msg: {}", err.message);
+    }
+
+    /// `memory_delete` parses its params through `MemoryDeleteParams`: a
+    /// `dry_run` that is not a boolean is rejected instead of being read as
+    /// `false` and deleting the entry for real.
+    #[tokio::test]
+    async fn dispatch_call_memory_delete_rejects_untyped_dry_run() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        seed_memory_entry(&handle, "keep-me").await;
+
+        let err = dispatch_call(
+            "memory_delete",
+            json!({ "id": "keep-me", "dry_run": "yes" }),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .expect_err("a non-boolean dry_run must be rejected");
+        assert!(
+            err.message.contains("invalid params"),
+            "msg: {}",
+            err.message
+        );
+
+        let context = handle.ctx.lock().await;
+        let entry = crate::store::memory::get_entry_without_tracking(
+            &context.as_ref().unwrap().conn,
+            "keep-me",
+        )
+        .unwrap();
+        assert!(
+            entry.is_some(),
+            "the rejected call must not have deleted anything"
+        );
     }
 
     #[tokio::test]
@@ -6980,7 +7067,7 @@ mod tests {
             source_file: None,
             entry_type: "topic".to_string(),
             tags: vec!["t".to_string()],
-            source_type: "user_statement".to_string(),
+            source_type: Some("user_statement".to_string()),
             ttl: None,
             due_in: None,
             relates: vec![],
@@ -7223,18 +7310,18 @@ mod tests {
         let emb = vec![0.1f32; crate::store::vectors::EMBEDDING_DIM];
 
         // Original entry with a stored embedding.
-        write_single_memory(
+        crate::core::memory::write_memory(
             conn,
-            WriteSingleMemory {
+            crate::core::memory::WriteMemoryInput {
                 id: "orig-dup",
                 title: "Orig",
                 content: "Auth notes",
                 entry_type: "topic",
-                source_type: "user_statement",
+                source_type: Some("user_statement"),
                 tags: &[],
                 ttl: None,
                 due_in: None,
-                embedding: Some(emb.clone()),
+                embedding: Some(&emb),
                 source_path: None,
                 relates: &[],
                 session: None,
@@ -7247,18 +7334,18 @@ mod tests {
 
         // Near-identical embedding + on_conflict=contradicts: writes the entry AND
         // records a contradicts edge to the similar one, returning both ids.
-        let out = write_single_memory(
+        let out = crate::core::memory::write_memory(
             conn,
-            WriteSingleMemory {
+            crate::core::memory::WriteMemoryInput {
                 id: "new-dup",
                 title: "New",
                 content: "Auth notes v2",
                 entry_type: "topic",
-                source_type: "user_statement",
+                source_type: Some("user_statement"),
                 tags: &[],
                 ttl: None,
                 due_in: None,
-                embedding: Some(emb.clone()),
+                embedding: Some(&emb),
                 source_path: None,
                 relates: &[],
                 session: None,
@@ -7277,18 +7364,18 @@ mod tests {
         assert_eq!(edges[0].target_ref, "orig-dup");
 
         // Default (on_conflict absent): a near-duplicate is rejected verbatim.
-        let err = write_single_memory(
+        let err = crate::core::memory::write_memory(
             conn,
-            WriteSingleMemory {
+            crate::core::memory::WriteMemoryInput {
                 id: "third-dup",
                 title: "Third",
                 content: "Auth notes v3",
                 entry_type: "topic",
-                source_type: "user_statement",
+                source_type: Some("user_statement"),
                 tags: &[],
                 ttl: None,
                 due_in: None,
-                embedding: Some(emb.clone()),
+                embedding: Some(&emb),
                 source_path: None,
                 relates: &[],
                 session: None,
@@ -7913,24 +8000,39 @@ mod tests {
 
     #[tokio::test]
     async fn memory_list_limit_clamped_to_200() {
-        // Requesting limit=500 must be silently clamped to 200.
-        // Seed 5 entries and verify the call succeeds and count <= 200.
+        // The clamp lives in `memory_list_impl`, the one function both routers
+        // reach. 201 rows and a limit of 100000 must come back as 200.
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
-        for i in 0..5u8 {
+        for i in 0..201u16 {
             seed_memory_entry(&handle, &format!("entry-{i}")).await;
         }
-        // dispatch with limit=500 — must not error
-        let result = dispatch_call(
+        let (text, count) = memory_list_impl(&handle, 100_000, "newest")
+            .await
+            .expect("memory_list must succeed");
+        assert_eq!(count, MEMORY_LIST_MAX_LIMIT, "returned {count} entries");
+        assert!(text.starts_with("Found 200 memory entries"), "text: {text}");
+    }
+
+    /// `memory_list` parses its params through `MemoryListParams`, so a limit
+    /// that is not a number is a rejected call, not a silent default of 20.
+    #[tokio::test]
+    async fn dispatch_call_memory_list_rejects_untyped_limit() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let err = dispatch_call(
             "memory_list",
-            json!({ "limit": 500, "sort": "recent" }),
+            json!({ "limit": "many" }),
             handle,
             &make_dctx(),
         )
         .await
-        .expect("memory_list must succeed");
-        let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-        assert!(count <= 5, "returned {count} entries");
+        .expect_err("a non-numeric limit must be rejected");
+        assert!(
+            err.message.contains("invalid params"),
+            "msg: {}",
+            err.message
+        );
     }
 
     #[tokio::test]

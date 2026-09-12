@@ -50,7 +50,20 @@ impl Env {
 
     fn add(&self, id: &str, title: &str, content: &str) {
         handle_memory_add(
-            &self.ctx, id, title, "topic", None, content, None, None, None, None,
+            &self.ctx,
+            id,
+            title,
+            "topic",
+            None,
+            content,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("memory add");
     }
@@ -654,7 +667,20 @@ fn two_clones_converge_without_a_manual_import() {
     {
         let ctx = Context::open(&origin).expect("open A");
         handle_memory_add(
-            &ctx, "shared", "Shared", "topic", None, "v1", None, None, None, None,
+            &ctx,
+            "shared",
+            "Shared",
+            "topic",
+            None,
+            "v1",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add shared");
         sync_memory_files(&ctx).expect("sync A");
@@ -684,7 +710,20 @@ fn two_clones_converge_without_a_manual_import() {
         );
 
         handle_memory_add(
-            &ctx, "only-b", "Only B", "topic", None, "b body", None, None, None, None,
+            &ctx,
+            "only-b",
+            "Only B",
+            "topic",
+            None,
+            "b body",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add only-b");
         sync_memory_files(&ctx).expect("sync B 2");
@@ -695,7 +734,20 @@ fn two_clones_converge_without_a_manual_import() {
     {
         let ctx = Context::open(&origin).expect("open A2");
         handle_memory_add(
-            &ctx, "only-a", "Only A", "topic", None, "a body", None, None, None, None,
+            &ctx,
+            "only-a",
+            "Only A",
+            "topic",
+            None,
+            "a body",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add only-a");
         sync_memory_files(&ctx).expect("sync A2");

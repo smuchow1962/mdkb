@@ -844,6 +844,10 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     ttl,
                     due_in,
                     source_type,
+                    relates,
+                    agent,
+                    on_conflict,
+                    dry_run,
                 } => {
                     let (content, source_path) = if let Some(ref path) = file {
                         let text = std::fs::read_to_string(path).map_err(|e| {
@@ -878,8 +882,16 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         ttl,
                         due_in,
                         source_type.as_deref(),
+                        &relates,
+                        agent.as_deref(),
+                        on_conflict.as_deref(),
+                        dry_run,
                     )?;
-                    println!("Added memory entry '{id}'");
+                    if dry_run {
+                        println!("dry-run: validated memory entry '{id}'");
+                    } else {
+                        println!("Added memory entry '{id}'");
+                    }
                 }
                 MemoryCommand::Show { id } => {
                     // A miss exits non-zero, as `get` already does for the same
@@ -1954,8 +1966,12 @@ fn print_routed_result(
             Command::Collection(CollectionCommand::Update { name, .. }),
             R::CollectionUpdated { path, pattern },
         ) => println!("{}", collection_updated_line(name, path, pattern)),
-        (Command::Memory(MemoryCommand::Add { id, .. }), R::MemoryAdded) => {
-            println!("Added memory entry '{id}'");
+        (Command::Memory(MemoryCommand::Add { id, dry_run, .. }), R::MemoryAdded) => {
+            if *dry_run {
+                println!("dry-run: validated memory entry '{id}'");
+            } else {
+                println!("Added memory entry '{id}'");
+            }
         }
         (Command::Memory(MemoryCommand::Confirm { .. }), R::MemoryConfirmed { outcome }) => {
             match format {

@@ -765,6 +765,22 @@ pub enum MemoryCommand {
         /// multiplier, most to least authoritative: 1.0, 0.85, 0.70, 0.65.
         #[arg(long, value_parser = source_type_values())]
         source_type: Option<String>,
+
+        /// Typed edge RELATION:TARGET[:memory|doc]. Repeat for multiple edges.
+        #[arg(long)]
+        relates: Vec<crate::core::memory::WriteRelation>,
+
+        /// Record this agent as entry provenance.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// On near-duplicate conflict, write and attach a contradicts edge.
+        #[arg(long, value_parser = ["contradicts"])]
+        on_conflict: Option<String>,
+
+        /// Validate and describe the write without persisting it.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Show a memory entry

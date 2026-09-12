@@ -17,7 +17,7 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use mdkb::cli::handlers::{handle_init, handle_update};
+use mdkb::cli::handlers::{handle_init, handle_memory_add, handle_update};
 use mdkb::code::indexing::{IndexFacade, run_code_mutation};
 use mdkb::core::{Context, run_guarded_read, run_guarded_write, run_mutation};
 use mdkb::error::ErrorKind;
@@ -296,6 +296,78 @@ fn releasing_the_handle_lets_the_next_open_quarantine_salvage_and_rebuild() {
         salvaged.is_some(),
         "memory lives only in this database — the heal must salvage it, \
          which is exactly what 13 days of retrying did not do"
+    );
+}
+
+#[test]
+fn rebuilt_index_accepts_memory_writes_reads_and_repeat_startup() {
+    let repo = Repo::seed();
+    let mut slot = Some(Context::open(&repo.root).expect("open"));
+    repo.corrupt();
+
+    let error = mutate(&mut slot, &repo.root)
+        .expect("slot was populated")
+        .expect_err("the torn index must be detected before recovery");
+    assert!(
+        error.is_index_corrupt(),
+        "corruption must stay typed: {error}"
+    );
+    assert!(slot.is_none(), "the corrupt generation must be released");
+
+    let healed = Context::open(&repo.root).expect("quarantine and rebuild");
+    assert!(healed.rebuilt_from_corruption, "the first reopen must heal");
+    assert!(
+        memory::get_entry_without_tracking(&healed.conn, "keeper")
+            .expect("read salvaged memory")
+            .is_some(),
+        "recovery must not silently discard readable memory"
+    );
+
+    handle_memory_add(
+        &healed,
+        "after-heal",
+        "After heal",
+        "topic",
+        None,
+        "written into the rebuilt database",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        false,
+    )
+    .expect("write after recovery");
+    assert!(
+        memory::get_entry_without_tracking(&healed.conn, "after-heal")
+            .expect("read after recovery")
+            .is_some(),
+        "the rebuilt connection must support immediate reads"
+    );
+    drop(healed);
+
+    let reopened = Context::open(&repo.root).expect("repeat startup");
+    assert!(
+        !reopened.rebuilt_from_corruption,
+        "a healthy rebuilt database must not be quarantined again"
+    );
+    for id in ["keeper", "after-heal"] {
+        assert!(
+            memory::get_entry_without_tracking(&reopened.conn, id)
+                .expect("read after repeat startup")
+                .is_some(),
+            "{id} must survive repeat startup"
+        );
+    }
+    assert_eq!(
+        repo.quarantine_files()
+            .iter()
+            .filter(|path| path.extension().is_none_or(|ext| ext != "json"))
+            .count(),
+        1,
+        "the original corrupt artifact must remain quarantined"
     );
 }
 
