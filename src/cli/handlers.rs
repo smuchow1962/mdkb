@@ -2255,6 +2255,57 @@ mod tests {
         assert_eq!(result.unchanged, 0);
     }
 
+    #[test]
+    fn test_handle_session_index_failure_mid_index_rolls_back() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let sessions_base = temp.path().join("sessions");
+        let encoded = crate::domain::sessions::encode_project_path(&temp.path().to_string_lossy());
+        let session_dir = sessions_base.join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("first.jsonl"),
+            make_session_jsonl("first", 4),
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("second.jsonl"),
+            make_session_jsonl("second", 4),
+        )
+        .unwrap();
+
+        // The first session document is written; the second insert fails.
+        // RAISE(ABORT) undoes only the failing statement and keeps the
+        // transaction open, exactly like a real mid-index constraint error.
+        ctx.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_second_session BEFORE INSERT ON documents
+                 WHEN NEW.collection = 'claude_sessions'
+                  AND (SELECT COUNT(*) FROM documents WHERE collection = 'claude_sessions') >= 1
+                 BEGIN SELECT RAISE(ABORT, 'forced failure mid-index'); END;",
+            )
+            .unwrap();
+
+        let result = handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy());
+        assert!(result.is_err(), "the forced failure must surface");
+
+        assert!(
+            ctx.conn.is_autocommit(),
+            "a failed session index must not leave a transaction open"
+        );
+        let rows: i64 = ctx
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE collection = ?1",
+                [crate::domain::COLLECTION_CLAUDE_SESSIONS],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "a failed session index must leave no partial rows");
+    }
+
     // ==================== Memory Import Tests ====================
 
     fn write_import_json(dir: &std::path::Path, content: &str) -> String {

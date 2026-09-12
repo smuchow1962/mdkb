@@ -9,7 +9,7 @@ use sqlite_vec::sqlite3_vec_init;
 use zerocopy::AsBytes;
 
 use crate::error::Result;
-use crate::store::chunks;
+use crate::store::{chunks, documents};
 
 /// Ensures sqlite-vec extension is initialized exactly once.
 static INIT_SQLITE_VEC: Once = Once::new();
@@ -208,8 +208,7 @@ pub fn store_embedding(
     let now = chrono::Utc::now().timestamp();
     let embedding_bytes = embedding.as_bytes();
 
-    conn.execute("SAVEPOINT store_embedding", [])?;
-    let result = (|| -> Result<()> {
+    documents::with_savepoint(conn, "store_embedding", || {
         conn.execute(
             "INSERT OR REPLACE INTO embeddings (document_id, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![document_id, embedding_bytes, model, now],
@@ -225,20 +224,7 @@ pub fn store_embedding(
             params![document_id, embedding_bytes],
         )?;
         Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            conn.execute("RELEASE store_embedding", [])?;
-            Ok(())
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute("ROLLBACK TO store_embedding", []) {
-                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
-            }
-            Err(e)
-        }
-    }
+    })
 }
 
 /// Get embedding for a document.
@@ -556,8 +542,7 @@ pub fn store_memory_embedding(
     let now = chrono::Utc::now().timestamp();
     let embedding_bytes = embedding.as_bytes();
 
-    conn.execute("SAVEPOINT store_memory_embedding", [])?;
-    let result = (|| -> Result<()> {
+    documents::with_savepoint(conn, "store_memory_embedding", || {
         conn.execute(
             "INSERT OR REPLACE INTO memory_embeddings (memory_rowid, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![memory_rowid, embedding_bytes, model, now],
@@ -573,20 +558,7 @@ pub fn store_memory_embedding(
             params![memory_rowid, embedding_bytes],
         )?;
         Ok(())
-    })();
-
-    match result {
-        Ok(()) => {
-            conn.execute("RELEASE store_memory_embedding", [])?;
-            Ok(())
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute("ROLLBACK TO store_memory_embedding", []) {
-                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
-            }
-            Err(e)
-        }
-    }
+    })
 }
 
 /// Search for similar memory entries by vector.
@@ -993,6 +965,81 @@ mod tests {
         let results = memory_vector_search(&conn, &query, 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, rowid);
+    }
+
+    /// A file-backed connection with the pragmas of the daemon's long-lived
+    /// connection (`Context::configure_connection`). WAL mode is what makes a
+    /// leaked write transaction block checkpoints and other writers.
+    fn setup_wal_db(dir: &tempfile::TempDir) -> Connection {
+        INIT.call_once(|| {
+            init_sqlite_vec();
+        });
+
+        let conn = Connection::open(dir.path().join("index.sqlite")).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA busy_timeout = 5000;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA foreign_keys = ON;
+            ",
+        )
+        .unwrap();
+        init_schema(&conn).unwrap();
+        init_vector_schema(&conn).unwrap();
+        conn
+    }
+
+    /// Run the real `store_memory_embedding` into a failure: a vector of the
+    /// wrong dimension passes the plain `memory_embeddings` insert and fails
+    /// on the `vec_memory` insert, so the savepoint has work to undo.
+    fn fail_memory_embedding(conn: &Connection) -> i64 {
+        let rowid = insert_memory_entry(conn, "bad-dim", "Bad dimension", "wrong vector size");
+        let result = store_memory_embedding(conn, rowid, &[0.1, 0.2, 0.3], "test");
+        assert!(result.is_err(), "a 3-float vector must fail on FLOAT[384]");
+        rowid
+    }
+
+    #[test]
+    fn failed_vec_memory_insert_leaves_connection_in_autocommit() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_wal_db(&dir);
+
+        let rowid = fail_memory_embedding(&conn);
+
+        assert!(
+            conn.is_autocommit(),
+            "a failed savepoint must not leave a write transaction open"
+        );
+        let leaked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE memory_rowid = ?1",
+                params![rowid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0, "the memory_embeddings row must be rolled back");
+
+        // A second connection must be able to write immediately. A short
+        // busy_timeout turns a leaked write lock into a failure, not a stall.
+        let other = Connection::open(dir.path().join("index.sqlite")).unwrap();
+        other.execute_batch("PRAGMA busy_timeout = 100;").unwrap();
+        insert_memory_entry(&other, "second-writer", "Second", "writes without waiting");
+    }
+
+    #[test]
+    fn failed_store_memory_embedding_does_not_block_wal_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_wal_db(&dir);
+
+        fail_memory_embedding(&conn);
+
+        // With a transaction open on this connection the pragma fails with
+        // "database table is locked"; with a blocked checkpoint it reports busy.
+        let busy: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+            .expect("checkpoint must run after a failed embedding store");
+        assert_eq!(busy, 0, "checkpoint must not be blocked");
     }
 
     // ==================== Chunk Embedding Tests ====================
