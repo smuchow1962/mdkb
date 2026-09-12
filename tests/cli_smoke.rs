@@ -1450,6 +1450,11 @@ fn smoke_code_lifecycle() {
 
     let out = run(&["code", "calls", "farewell"], &repo.root);
     assert_ok(&out, "code calls");
+    assert!(
+        stdout(&out).contains("[tier "),
+        "code calls must expose the resolution tier: {}",
+        stdout(&out)
+    );
 
     let out = run(&["code", "callers", "greet"], &repo.root);
     assert_ok(&out, "code callers");

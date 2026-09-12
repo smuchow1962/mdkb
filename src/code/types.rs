@@ -400,7 +400,10 @@ mod tests {
             SymbolKind::Constant,
             SymbolKind::Macro,
         ] {
-            assert!(!kind.is_callable(), "{kind} was 1 of the 4 false-target kinds");
+            assert!(
+                !kind.is_callable(),
+                "{kind} was 1 of the 4 false-target kinds"
+            );
         }
         assert!(SymbolKind::Function.is_callable());
         assert!(SymbolKind::Method.is_callable());

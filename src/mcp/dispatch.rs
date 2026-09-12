@@ -2590,15 +2590,21 @@ pub async fn code_graph_impl(
     // the useful statement on this side, where every edge is resolved by
     // construction and a `CallTarget` would say `Resolved` every time.
     let mut unplaced_arrivals = 0usize;
+    let mut call_evidence = Vec::new();
     let hits: Vec<(
         crate::code::types::SymbolId,
         Option<crate::code::symbol::Symbol>,
     )> = match params.direction.as_str() {
-        "calls" => facade
-            .get_called_functions(symbol.id)
-            .into_iter()
-            .map(|s| (s.id, Some(s)))
-            .collect(),
+        "calls" => {
+            let (calls, _) = crate::core::code::classify_calls(facade, symbol.id);
+            calls
+                .into_iter()
+                .map(|call| {
+                    call_evidence.push((call.tier, call.is_unique));
+                    (call.symbol.id, Some(call.symbol))
+                })
+                .collect()
+        }
         "callers" => facade
             .get_callers_by_tier(symbol.id)
             .into_iter()
@@ -2682,10 +2688,20 @@ pub async fn code_graph_impl(
             unplaced_suffix_arrivals(unplaced_arrivals, &symbol.name)
         ),
     };
-    for (sid, sym) in &hits {
+    for (index, (sid, sym)) in hits.iter().enumerate() {
         match sym {
             Some(s) => {
                 text.push_str(&format_symbol(s));
+                if let Some((tier, is_unique)) = call_evidence.get(index) {
+                    text.push_str(&format!(
+                        "    Resolution: tier {tier}, {}\n",
+                        if *is_unique {
+                            "unique"
+                        } else {
+                            "candidate list"
+                        }
+                    ));
+                }
                 text.push('\n');
             }
             None => text.push_str(&format!("  sym#{} (not found in index)\n", sid.value())),
@@ -2710,22 +2726,7 @@ fn unplaced_calls(
     facade: &crate::code::indexing::IndexFacade,
     symbol_id: crate::code::types::SymbolId,
 ) -> crate::core::code::UnplacedCalls {
-    use crate::code::relationship::CallTarget;
-
-    let mut unplaced = crate::core::code::UnplacedCalls::default();
-    for target in facade.get_call_targets(symbol_id) {
-        match target {
-            CallTarget::Resolved(_) => {}
-            CallTarget::External { qualifier, name } => {
-                unplaced.external.push(format!("{qualifier}::{name}"));
-            }
-            CallTarget::Unknown { name } => unplaced.unknown.push(name),
-        }
-    }
-    unplaced.external.sort_unstable();
-    unplaced.external.dedup();
-    unplaced.unknown.sort_unstable();
-    unplaced.unknown.dedup();
+    let (_, unplaced) = crate::core::code::classify_calls(facade, symbol_id);
     unplaced
 }
 

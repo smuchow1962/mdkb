@@ -633,22 +633,11 @@ impl IndexFacade {
             })
     }
 
-    /// Get functions/methods called by the given symbol.
-    pub fn get_called_functions(&self, symbol_id: SymbolId) -> Vec<Symbol> {
-        self.db
-            .get_called_functions(i64::from(symbol_id.value()))
-            .unwrap_or_else(|e| {
-                tracing::error!("DB error in get_called_functions({symbol_id:?}): {e}");
-                Vec::new()
-            })
-    }
-
     /// Every call the given symbol makes, classified as resolved, external or
     /// unknown.
     ///
-    /// [`Self::get_called_functions`] answers only the first of those three, so
-    /// a symbol whose calls all leave the index answers with an empty list —
-    /// indistinguishable from a symbol that calls nothing.
+    /// A symbol whose calls all leave the index therefore does not answer with
+    /// an empty list indistinguishable from a symbol that calls nothing.
     pub fn get_call_targets(&self, symbol_id: SymbolId) -> Vec<CallTarget> {
         self.db
             .get_call_targets(i64::from(symbol_id.value()))

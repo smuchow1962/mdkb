@@ -678,26 +678,12 @@ impl CodeDb {
 
     // --- Relationship queries ---
 
-    /// Get symbols called by the given symbol.
-    pub fn get_called_functions(&self, symbol_id: i64) -> rusqlite::Result<Vec<Symbol>> {
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT DISTINCT {SYMBOL_COLUMNS_BARE} \
-                 FROM ({}) c \
-                 JOIN code_symbols s ON s.id = c.sym_id \
-                 WHERE c.tier = c.nearest AND c.tier <> {TIER_EXTERNAL}",
-            resolved_edges("r.from_symbol_id = ?1")
-        ))?;
-        let rows = stmt.query_map([symbol_id], row_to_symbol)?;
-        rows.collect()
-    }
-
     /// Every `Calls` edge leaving `symbol_id`, classified.
     ///
     /// One entry per edge, in call-site order. Unlike
-    /// [`Self::get_called_functions`] this never silently drops an edge: a call
-    /// the index cannot place comes back as `External` or `Unknown` rather than
-    /// as nothing, which is the difference between "this calls nothing here"
-    /// and "this calls nothing".
+    /// This never silently drops an edge: a call the index cannot place comes
+    /// back as `External` or `Unknown` rather than as nothing, which is the
+    /// difference between "this calls nothing here" and "this calls nothing".
     pub fn get_call_targets(&self, symbol_id: i64) -> rusqlite::Result<Vec<CallTarget>> {
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT r.id, r.to_name, r.to_qualifier, s.id, {RESOLUTION_TIER} \
@@ -745,13 +731,14 @@ impl CodeDb {
                         CallTarget::External { qualifier, name }
                     }
                     (None, None) => CallTarget::Unknown { name },
-                    (Some(nearest), _) => CallTarget::Resolved(
-                        candidates
+                    (Some(nearest), _) => CallTarget::Resolved {
+                        tier: nearest,
+                        targets: candidates
                             .iter()
                             .filter(|(tier, _)| *tier == nearest)
                             .filter_map(|(_, id)| SymbolId::new(*id as u32))
                             .collect(),
-                    ),
+                    },
                 }
             })
             .collect())
@@ -1813,52 +1800,53 @@ mod tests {
         assert!(batch.is_empty());
     }
 
+    /// The tier travels with the target. `helper` in the calling file is
+    /// placed by proximity (tier 4) and `Store::open` by its qualifier
+    /// (tier 1); a list of symbols alone would put the two on an equal footing,
+    /// and the reader could not tell a certainty from a guess.
     #[test]
-    fn test_get_called_functions() {
+    fn a_resolved_target_carries_the_tier_it_was_placed_at() {
         let (_dir, db) = temp_db();
-        let file_id = insert_test_file(&db);
-        let caller_id = db
-            .insert_symbol(
-                "caller", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None,
-                None,
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let helper = function_in(&db, "helper", (here_file, "here.rs"), "crate::here", 10);
+        let (store_file, _) = file_with_function(&db, "unrelated", "store.rs", "crate::store");
+        let open = method_in(
+            &db,
+            "open",
+            "Store",
+            (store_file, "store.rs"),
+            "crate::store",
+            5,
+        );
+        for (name, qualifier) in [("helper", None), ("open", Some("Store"))] {
+            db.insert_relationship(
+                Some(caller),
+                "caller",
+                name,
+                &CallSite {
+                    qualifier,
+                    ..CallSite::default()
+                },
+                "Calls",
+                here_file,
+                (None, None),
             )
             .unwrap();
-        db.insert_symbol(
-            "callee_a", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None,
-            None,
-        )
-        .unwrap();
-        db.insert_symbol(
-            "callee_b", "Function", file_id, "test.rs", 20, None, None, None, 0, None, None, None,
-            None,
-        )
-        .unwrap();
-        db.insert_relationship(
-            Some(caller_id),
-            "caller",
-            "callee_a",
-            &CallSite::default(),
-            "Calls",
-            file_id,
-            (None, None),
-        )
-        .unwrap();
-        db.insert_relationship(
-            Some(caller_id),
-            "caller",
-            "callee_b",
-            &CallSite::default(),
-            "Calls",
-            file_id,
-            (None, None),
-        )
-        .unwrap();
+        }
 
-        let called = db.get_called_functions(caller_id).unwrap();
-        assert_eq!(called.len(), 2);
-        let names: Vec<&str> = called.iter().map(|s| s.as_name()).collect();
-        assert!(names.contains(&"callee_a"));
-        assert!(names.contains(&"callee_b"));
+        assert_eq!(
+            db.get_call_targets(caller).unwrap(),
+            vec![
+                CallTarget::Resolved {
+                    tier: 4,
+                    targets: vec![SymbolId::new(helper as u32).unwrap()],
+                },
+                CallTarget::Resolved {
+                    tier: 1,
+                    targets: vec![SymbolId::new(open as u32).unwrap()],
+                },
+            ]
+        );
     }
 
     /// Insert a function symbol, returning its id.
@@ -1915,12 +1903,22 @@ mod tests {
         (here_file, caller, imported, elsewhere)
     }
 
+    /// Every indexed symbol the caller's calls resolved to, each once, in id
+    /// order.
     fn called_ids(db: &CodeDb, caller: i64) -> Vec<i64> {
-        db.get_called_functions(caller)
+        let mut ids: Vec<i64> = db
+            .get_call_targets(caller)
             .unwrap()
-            .iter()
-            .map(|s| i64::from(s.id.value()))
-            .collect()
+            .into_iter()
+            .flat_map(|target| match target {
+                CallTarget::Resolved { targets, .. } => targets,
+                CallTarget::External { .. } | CallTarget::Unknown { .. } => Vec::new(),
+            })
+            .map(|id| i64::from(id.value()))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// Three calls, three fates. An answer that reported only the first would
@@ -1954,7 +1952,10 @@ mod tests {
         assert_eq!(
             db.get_call_targets(caller).unwrap(),
             vec![
-                CallTarget::Resolved(vec![SymbolId::new(local as u32).unwrap()]),
+                CallTarget::Resolved {
+                    tier: 4,
+                    targets: vec![SymbolId::new(local as u32).unwrap()],
+                },
                 CallTarget::External {
                     qualifier: "std::fs".to_string(),
                     name: "write".to_string(),
@@ -2073,8 +2074,19 @@ mod tests {
         let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
         let field = db
             .insert_symbol(
-                "kind", "Field", here_file, "here.rs", 5, None, None, None, 0, None, None,
-                Some("crate::here"), None,
+                "kind",
+                "Field",
+                here_file,
+                "here.rs",
+                5,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                Some("crate::here"),
+                None,
             )
             .unwrap();
         let (_, function) = file_with_function(&db, "kind", "other.rs", "crate::other");
@@ -2109,8 +2121,19 @@ mod tests {
             ("MAX", "Constant"),
         ] {
             db.insert_symbol(
-                name, kind, here_file, "here.rs", 5, None, None, None, 0, None, None,
-                Some("crate::here"), None,
+                name,
+                kind,
+                here_file,
+                "here.rs",
+                5,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                Some("crate::here"),
+                None,
             )
             .unwrap();
             db.insert_relationship(
@@ -2136,8 +2159,19 @@ mod tests {
         let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
         let strukt = db
             .insert_symbol(
-                "SymbolId", "Struct", here_file, "here.rs", 5, None, None, None, 0, None, None,
-                Some("crate::here"), None,
+                "SymbolId",
+                "Struct",
+                here_file,
+                "here.rs",
+                5,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                Some("crate::here"),
+                None,
             )
             .unwrap();
         db.insert_relationship(
@@ -2471,7 +2505,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(called_ids(&db, caller), Vec::<i64>::new());
+        assert_eq!(
+            db.get_call_targets(caller).unwrap(),
+            vec![CallTarget::External {
+                qualifier: "PathBuf".to_string(),
+                name: "join".to_string(),
+            }],
+            "the type the call was made on names the external target"
+        );
     }
 
     /// `tempdir().path()` — the receiver's type is whatever `tempdir` returns,
@@ -2497,7 +2538,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(called_ids(&db, caller), Vec::<i64>::new());
+        assert_eq!(
+            db.get_call_targets(caller).unwrap(),
+            vec![CallTarget::Unknown {
+                name: "path".to_string(),
+            }],
+            "no type to name and no candidate: the local `path` is not offered"
+        );
     }
 
     /// The resolution pass leaves a name alone for two different reasons, and
