@@ -361,10 +361,33 @@ fn in_process_config(root: &Path) -> Result<DaemonConfig> {
     Ok(config)
 }
 
-/// In-process fallback for `MDKB_NO_DAEMON=1`. Same logic as `run_in_process`
-/// but uses `emit_hook_response`.
-async fn run_hook_in_process(method: &str, params: Value, root: &Path) -> Result<()> {
-    let registry = Arc::new(RepoRegistry::new(in_process_config(root)?));
+/// Open an ephemeral `RepoRegistry` in this process and route one call through
+/// `dispatch_call` — the same code path the daemon runs, without IPC. `emit`
+/// decides how a result reaches stdout.
+///
+/// Every failure is printed to stderr and swallowed, because both callers sit
+/// under the hook contract (exit 0, no matter what). A `~/.mdkb/daemon.toml`
+/// that does not parse used to escape here through `?` and fail every hook
+/// (story 062); it is now one warning. The TOML error spans several lines with
+/// a source snippet, so it is folded onto one line: a host shows hook stderr
+/// as-is.
+async fn dispatch_in_process(method: &str, params: Value, root: &Path, emit: impl FnOnce(&Value)) {
+    let config = match in_process_config(root) {
+        Ok(config) => config,
+        Err(e) => {
+            let reason = e
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "mdkb hook {method}: {}: {reason}; skipping",
+                DaemonConfig::config_path().display()
+            );
+            return;
+        }
+    };
+    let registry = Arc::new(RepoRegistry::new(config));
     let dctx = DispatchContext {
         metrics: Arc::new(UsageMetrics::new()),
         session_id: Arc::new(AtomicI64::new(0)),
@@ -375,11 +398,17 @@ async fn run_hook_in_process(method: &str, params: Value, root: &Path) -> Result
 
     match registry.get_or_open(root) {
         Ok(handle) => match dispatch_call(method, params, handle, &dctx).await {
-            Ok(result) => emit_hook_response(&result),
+            Ok(result) => emit(&result),
             Err(e) => eprintln!("mdkb hook {method}: {}", e.message),
         },
         Err(e) => eprintln!("mdkb hook {method}: repo registry: {e}"),
     }
+}
+
+/// In-process fallback for lifecycle hooks: the raw envelope goes to stdout
+/// through `emit_hook_response`.
+async fn run_hook_in_process(method: &str, params: Value, root: &Path) -> Result<()> {
+    dispatch_in_process(method, params, root, emit_hook_response).await;
     Ok(())
 }
 
@@ -419,26 +448,13 @@ async fn run(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<(
     Ok(())
 }
 
-/// Direct in-process dispatch for `MDKB_NO_DAEMON=1`. Opens an ephemeral
-/// `RepoRegistry` in the current process and routes the call through
-/// `dispatch_call` — identical code path to the daemon, no IPC.
+/// In-process fallback for the one-shot RPC subcommands: the result's text goes
+/// to stdout through `print_tool_text`.
 async fn run_in_process(method: &str, params: Value, root: &Path) -> Result<()> {
-    let registry = Arc::new(RepoRegistry::new(in_process_config(root)?));
-    let dctx = DispatchContext {
-        metrics: Arc::new(UsageMetrics::new()),
-        session_id: Arc::new(AtomicI64::new(0)),
-        persistent_call_count: Arc::new(AtomicU64::new(0)),
-        optimize_interval_calls: 200,
-        hook_dedup: Arc::new(std::sync::Mutex::new(Default::default())),
-    };
-
-    match registry.get_or_open(root) {
-        Ok(handle) => match dispatch_call(method, params, handle, &dctx).await {
-            Ok(result) => print_tool_text(method, &result),
-            Err(e) => eprintln!("mdkb hook {method}: {}", e.message),
-        },
-        Err(e) => eprintln!("mdkb hook {method}: repo registry: {e}"),
-    }
+    dispatch_in_process(method, params, root, |result| {
+        print_tool_text(method, result)
+    })
+    .await;
     Ok(())
 }
 

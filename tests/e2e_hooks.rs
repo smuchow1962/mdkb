@@ -24,10 +24,25 @@ fn mdkb_bin() -> &'static str {
 
 /// Run `mdkb hook <event>` with the given stdin payload and return stdout.
 fn run_hook(event: &str, cwd: &Path, stdin_payload: &str) -> (String, String, i32) {
-    let mut child = Command::new(mdkb_bin())
-        .args(["hook", event])
+    run_hook_with_home(event, cwd, stdin_payload, None)
+}
+
+/// Like [`run_hook`], but with `HOME` pointed at `home` when given, so the
+/// hook reads that directory's `.mdkb/daemon.toml` instead of the developer's.
+fn run_hook_with_home(
+    event: &str,
+    cwd: &Path,
+    stdin_payload: &str,
+    home: Option<&Path>,
+) -> (String, String, i32) {
+    let mut cmd = Command::new(mdkb_bin());
+    cmd.args(["hook", event])
         .current_dir(cwd)
-        .env("MDKB_NO_DAEMON", "1")
+        .env("MDKB_NO_DAEMON", "1");
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -182,4 +197,49 @@ fn hooks_e2e_respects_mdkbignore_marker() {
         stdout.trim().is_empty(),
         ".mdkbignore-hooks must suppress all output. Got: {stdout}"
     );
+}
+
+/// Story 062: a `~/.mdkb/daemon.toml` that does not parse must not fail the
+/// host. Every lifecycle hook exits 0, prints nothing to stdout and warns
+/// exactly once on stderr. Before the fix the in-process route propagated the
+/// parse error with `?` and the host saw exit 1 on every event.
+#[test]
+fn hooks_e2e_malformed_daemon_toml_never_fails_the_host() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    handle_init(&root).expect("init mdkb");
+
+    let home = tempfile::tempdir().expect("home tempdir");
+    let mdkb_home = home.path().join(".mdkb");
+    std::fs::create_dir_all(&mdkb_home).expect("mkdir home/.mdkb");
+    std::fs::write(mdkb_home.join("daemon.toml"), "whitelist_dirs = [\n").expect("write bad toml");
+
+    let tool_payload = r#"{"tool_name": "Edit", "tool_input": {"file_path": "notes.md"}}"#;
+    let events = [
+        ("session-start", "{}"),
+        ("user-prompt-submit", r#"{"prompt": "* anything"}"#),
+        ("pre-tool-use", tool_payload),
+        ("post-tool-use", tool_payload),
+    ];
+    for (event, payload) in events {
+        let (stdout, stderr, code) = run_hook_with_home(event, &root, payload, Some(home.path()));
+        assert_eq!(
+            code, 0,
+            "{event} must exit 0 on a malformed daemon.toml. stderr={stderr} stdout={stdout}"
+        );
+        assert!(
+            stdout.is_empty(),
+            "{event} must print nothing on a malformed daemon.toml. Got: {stdout}"
+        );
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "{event} must warn exactly once on stderr. Got: {stderr}"
+        );
+        assert!(
+            lines[0].contains("daemon.toml"),
+            "{event} warning must name the file. Got: {stderr}"
+        );
+    }
 }
