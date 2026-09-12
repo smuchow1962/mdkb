@@ -37,6 +37,7 @@ pub struct AppState {
 /// Health check endpoint.
 ///
 /// Returns JSON with status, version, and optional TLS flag.
+#[allow(clippy::unused_async)] // axum handlers must return a Future.
 pub async fn health_handler(tls_enabled: bool) -> impl IntoResponse {
     let mut response = serde_json::json!({
         "status": "ok",

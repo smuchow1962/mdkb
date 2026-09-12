@@ -452,7 +452,7 @@ async fn run(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<(
 /// to stdout through `print_tool_text`.
 async fn run_in_process(method: &str, params: Value, root: &Path) -> Result<()> {
     dispatch_in_process(method, params, root, |result| {
-        print_tool_text(method, result)
+        print_tool_text(method, result);
     })
     .await;
     Ok(())

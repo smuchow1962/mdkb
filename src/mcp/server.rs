@@ -895,6 +895,7 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
 
 // rmcp 3 defaults to `Self::tool_router()`, a fresh router on every call;
 // point it at the one this server built at construction.
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {

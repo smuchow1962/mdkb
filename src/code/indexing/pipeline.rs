@@ -417,7 +417,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
         // bit so a sparse result is never mistaken for a clean parse.
         let has_error = parser
             .tree(&fc.content)
-            .map_or(true, |tree| tree.root_node().has_error());
+            .is_none_or(|tree| tree.root_node().has_error());
         errors += u32::from(has_error);
         let calls = parser.find_calls(&fc.content);
         let macro_expansions = parser.find_macro_expansions(&fc.content);
@@ -597,7 +597,8 @@ fn stage_collect(
     // separate traits). Attribute a call to the symbol whose source span
     // encloses its call site; a `(name, file)` fallback would silently choose
     // whichever same-named declaration was processed last.
-    let mut symbols_in_file: HashMap<(Box<str>, u32), Vec<(Range, SymbolId)>> = HashMap::new();
+    type SymbolsByNameAndFile = HashMap<(Box<str>, u32), Vec<(Range, SymbolId)>>;
+    let mut symbols_in_file: SymbolsByNameAndFile = HashMap::new();
 
     while let Ok(parsed) = rx.recv() {
         file_counter += 1;
