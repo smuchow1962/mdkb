@@ -1367,7 +1367,7 @@ MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<n
             CodeCommand::Calls { name } => {
                 let (source, callees, unplaced) =
                     mdkb::cli::handlers::handle_code_calls(&cwd, &name)?;
-                format_code_graph("Calls", &source, &callees, cli.format);
+                format_code_calls(&source, &callees, cli.format);
                 format_unplaced_calls(&unplaced, cli.format);
             }
             CodeCommand::Callers { name } => {
@@ -3726,6 +3726,65 @@ fn format_code_graph(
                     println!(
                         "  - {} {} ({}:{})",
                         t.kind, t.name, t.file_path, t.range.start_line,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn format_code_calls(
+    source: &mdkb::code::symbol::Symbol,
+    related: &[mdkb::core::code::ResolvedCall],
+    format: OutputFormat,
+) {
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "source": source,
+                "relationship": "Calls",
+                "targets": related,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("source,relationship,target,target_kind,file,line,tier,is_unique");
+            for call in related {
+                let t = &call.symbol;
+                println!(
+                    "{},Calls,{},{},{},{},{},{}",
+                    source.name,
+                    t.name,
+                    t.kind,
+                    t.file_path,
+                    t.range.start_line,
+                    call.tier,
+                    call.is_unique,
+                );
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!(
+                "Calls for {} {} ({}:{})",
+                source.kind, source.name, source.file_path, source.range.start_line,
+            );
+            if related.is_empty() {
+                println!("  (none)");
+            } else {
+                for call in related {
+                    let t = &call.symbol;
+                    println!(
+                        "  - {} {} ({}:{}) [tier {}, {}]",
+                        t.kind,
+                        t.name,
+                        t.file_path,
+                        t.range.start_line,
+                        call.tier,
+                        if call.is_unique {
+                            "unique"
+                        } else {
+                            "candidate list"
+                        },
                     );
                 }
             }

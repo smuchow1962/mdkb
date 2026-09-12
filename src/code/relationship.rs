@@ -39,15 +39,27 @@ pub enum RelationKind {
 /// reads as "nothing calls this" and is wrong for all but a few of them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CallTarget {
-    /// The cascade placed the call inside this index. More than one id means
-    /// the rules narrowed it that far and no further.
-    Resolved(Vec<crate::code::types::SymbolId>),
+    /// The cascade placed the call inside this index. `tier` is the rule that
+    /// placed it — see `RESOLUTION_TIER` in the storage layer — and more than
+    /// one target means that rule narrowed it that far and no further.
+    Resolved {
+        tier: i64,
+        targets: Vec<crate::code::types::SymbolId>,
+    },
     /// The call site named an owner or module this index does not contain:
     /// `std::fs::write`, `tempfile::tempdir`. Nameable, not indexable.
     External { qualifier: String, name: String },
     /// A bare name with no candidate — a method on a receiver whose type the
     /// index does not know.
     Unknown { name: String },
+}
+
+/// One indexed target of a call, with the evidence the cascade used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedCall {
+    pub symbol: crate::code::symbol::Symbol,
+    pub tier: i64,
+    pub is_unique: bool,
 }
 
 impl RelationKind {

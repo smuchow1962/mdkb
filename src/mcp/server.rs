@@ -796,7 +796,7 @@ impl McpServer {
 
     /// Query the code call graph: outgoing calls, incoming callers, or impact radius.
     #[tool(
-        description = "Query code call graph. Resolves fuzzy/partial names. Directions: calls (default), callers, impact."
+        description = "Query code call graph. Resolves fuzzy/partial names. Directions: calls (default), callers, impact. For calls, tier <= 2 is resolved; tier >= 3 is a candidate list to confirm with grep."
     )]
     async fn code_graph(
         &self,
@@ -3477,6 +3477,12 @@ if (require.main === module) {
                 "Should list called functions or report none: {}",
                 text
             );
+            if text.contains("validate") {
+                assert!(
+                    text.contains("Resolution: tier "),
+                    "resolved MCP calls must expose the tier: {text}"
+                );
+            }
         }
 
         #[tokio::test]

@@ -289,28 +289,43 @@ pub struct UnplacedCalls {
     pub unknown: Vec<String>,
 }
 
-/// Handle `mdkb code calls` - show what a symbol calls.
-pub fn handle_code_calls(
-    root: &Path,
-    name: &str,
-) -> Result<(
-    crate::code::symbol::Symbol,
-    Vec<crate::code::symbol::Symbol>,
-    UnplacedCalls,
-)> {
+/// One indexed callee and the confidence of the rule that placed it.
+pub use crate::code::relationship::ResolvedCall;
+
+/// Classify every outgoing call once, retaining both resolved and unplaced
+/// targets. A tier at or below 2 is resolved; tier 3 and above is a candidate
+/// to confirm against the source.
+pub fn classify_calls(
+    facade: &crate::code::indexing::IndexFacade,
+    symbol_id: crate::code::types::SymbolId,
+) -> (Vec<ResolvedCall>, UnplacedCalls) {
     use crate::code::relationship::CallTarget;
 
-    let facade = open_code_read_only(root)?;
-
-    let symbol = facade
-        .get_symbol_by_name(name)
-        .ok_or_else(|| Error::other(format!("Symbol '{}' not found", name)))?;
-
-    let callees = facade.get_called_functions(symbol.id);
+    let targets = facade.get_call_targets(symbol_id);
+    let ids = targets
+        .iter()
+        .flat_map(|target| match target {
+            CallTarget::Resolved { targets, .. } => targets.as_slice(),
+            CallTarget::External { .. } | CallTarget::Unknown { .. } => &[],
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let symbols = facade.get_symbols_batch(&ids);
+    let mut resolved = Vec::new();
     let mut unplaced = UnplacedCalls::default();
-    for target in facade.get_call_targets(symbol.id) {
+
+    for target in targets {
         match target {
-            CallTarget::Resolved(_) => {}
+            CallTarget::Resolved { tier, targets } => {
+                let is_unique = targets.len() == 1;
+                resolved.extend(targets.into_iter().filter_map(|id| {
+                    symbols.get(&id).cloned().map(|symbol| ResolvedCall {
+                        symbol,
+                        tier,
+                        is_unique,
+                    })
+                }));
+            }
             CallTarget::External { qualifier, name } => {
                 unplaced.external.push(format!("{qualifier}::{name}"));
             }
@@ -321,6 +336,25 @@ pub fn handle_code_calls(
     unplaced.external.dedup();
     unplaced.unknown.sort_unstable();
     unplaced.unknown.dedup();
+    (resolved, unplaced)
+}
+
+/// Handle `mdkb code calls` - show what a symbol calls.
+pub fn handle_code_calls(
+    root: &Path,
+    name: &str,
+) -> Result<(
+    crate::code::symbol::Symbol,
+    Vec<ResolvedCall>,
+    UnplacedCalls,
+)> {
+    let facade = open_code_read_only(root)?;
+
+    let symbol = facade
+        .get_symbol_by_name(name)
+        .ok_or_else(|| Error::other(format!("Symbol '{}' not found", name)))?;
+
+    let (callees, unplaced) = classify_calls(&facade, symbol.id);
     Ok((symbol, callees, unplaced))
 }
 /// Handle `mdkb code callers` - show what calls a symbol.
