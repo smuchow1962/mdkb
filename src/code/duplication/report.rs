@@ -596,6 +596,10 @@ pub fn ignore_cluster(
         None,
         None,
         Some("user_statement"),
+        &[],
+        None,
+        None,
+        false,
     )?;
     Ok(id)
 }

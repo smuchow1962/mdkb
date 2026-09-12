@@ -141,6 +141,10 @@ fn the_sweep_leaves_live_entries_and_ordinary_files_alone() {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add");
         mdkb::cli::handlers::sync_memory_files(&ctx).expect("project");

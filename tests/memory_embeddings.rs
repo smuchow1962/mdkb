@@ -112,6 +112,10 @@ fn memory_add_default_source_type_is_user_statement() {
         None,
         None,
         None,
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     let e = handle_memory_show(&env.ctx, "st-default")
@@ -134,6 +138,10 @@ fn memory_add_persists_explicit_source_type() {
         None,
         None,
         Some("official_docs"),
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     let e = handle_memory_show(&env.ctx, "st-docs")
@@ -156,6 +164,10 @@ fn memory_add_rejects_invalid_source_type() {
         None,
         None,
         Some("gospel"),
+        &[],
+        None,
+        None,
+        false,
     )
     .expect_err("invalid source_type must be rejected");
     assert!(err.to_string().contains("source_type"), "{err}");
@@ -175,11 +187,28 @@ fn rewrite_preserves_source_type_when_flag_absent() {
         None,
         None,
         Some("official_docs"),
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     // Re-write WITHOUT --source-type: a defaulted re-write must not downgrade.
     handle_memory_add(
-        &env.ctx, "st-keep", "T2", "topic", None, "body2", None, None, None, None,
+        &env.ctx,
+        "st-keep",
+        "T2",
+        "topic",
+        None,
+        "body2",
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("rewrite");
     let e = handle_memory_show(&env.ctx, "st-keep")
@@ -206,6 +235,10 @@ fn rewrite_overrides_source_type_when_flag_given() {
         None,
         None,
         Some("official_docs"),
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     handle_memory_add(
@@ -219,6 +252,10 @@ fn rewrite_overrides_source_type_when_flag_given() {
         None,
         None,
         Some("inference"),
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("rewrite");
     let e = handle_memory_show(&env.ctx, "st-change")
@@ -289,6 +326,10 @@ fn memory_add_produces_embedding_row() {
         None,
         None,
         None,
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     assert_eq!(embedding_row_count(&env), 1);

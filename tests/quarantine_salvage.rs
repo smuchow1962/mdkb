@@ -129,6 +129,10 @@ fn memory_revisions_survive_a_quarantine() {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add");
         // A second write of the same id records a revision.
@@ -143,6 +147,10 @@ fn memory_revisions_survive_a_quarantine() {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("rewrite");
         assert!(

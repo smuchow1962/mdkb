@@ -38,7 +38,7 @@ use mdkb::core::Context;
 use mdkb::core::surface::{SURFACE_MAP, SurfaceEntry};
 use mdkb::daemon::registry::RepoHandle;
 use mdkb::mcp::tools::{MemoryWriteBatchEntry, RelatesInput, SearchParams};
-use mdkb::store::memory::EntryType;
+use mdkb::store::memory::{EntryType, PRIOR_TTL_SECS};
 
 #[path = "common/cli.rs"]
 mod cli;
@@ -426,7 +426,7 @@ impl MemoryInput {
             tags: self.tags.iter().map(|t| t.to_string()).collect(),
             // The schema default, which is also what the CLI applies when
             // `--source-type` is omitted.
-            source_type: self.source_type.unwrap_or("user_statement").to_string(),
+            source_type: Some(self.source_type.unwrap_or("user_statement").to_string()),
             ttl: self.ttl,
             due_in: self.due_in,
             relates,
@@ -693,6 +693,20 @@ async fn memory_add_and_memory_write_persist_the_same_row_for_a_prior() {
         "CLI prior has no expires_at; MCP sets PRIOR_TTL_SECS — unified by story 068-db06"
     );
     assert_eq!(cli, mcp, "unified by story 068-db06");
+}
+
+/// The CLI half of the prior rule on its own, so a regression names the rule
+/// and not just the disagreement: a prior with no `--ttl` expires after
+/// `PRIOR_TTL_SECS`, whichever door wrote it.
+#[test]
+fn a_cli_prior_without_ttl_expires_after_the_default_ttl() {
+    let repo = Repo::init("");
+    MemoryInput::of("prior").via_cli(&repo);
+    assert_eq!(
+        row(&repo, "parity-entry").expires_in,
+        Some(PRIOR_TTL_SECS),
+        "a prior written by `mdkb memory add` must carry the default TTL"
+    );
 }
 
 /// The write-level columns the CLI does expose, all set at once.

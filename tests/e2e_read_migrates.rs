@@ -38,6 +38,10 @@ fn seeded_store() -> (tempfile::TempDir, std::path::PathBuf) {
         None,
         None,
         None,
+        &[],
+        None,
+        None,
+        false,
     )
     .expect("add");
     drop(ctx);

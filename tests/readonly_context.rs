@@ -175,6 +175,10 @@ fn a_read_only_context_can_read() {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add");
     }
@@ -299,6 +303,10 @@ fn search_and_stats_work_with_no_daemon() {
             None,
             None,
             None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add");
     }
@@ -337,7 +345,20 @@ fn read_commands_leave_no_write_trace_on_the_store() {
     {
         let ctx = Context::open(&root).expect("open");
         mdkb::cli::handlers::handle_memory_add(
-            &ctx, "seeded", "Seeded", "topic", None, "body", None, None, None, None,
+            &ctx,
+            "seeded",
+            "Seeded",
+            "topic",
+            None,
+            "body",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
         )
         .expect("add");
     }

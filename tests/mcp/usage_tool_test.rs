@@ -39,7 +39,7 @@ async fn server_with_activity() -> (tempfile::TempDir, McpServer) {
             source_file: None,
             entry_type: "topic".to_string(),
             tags: vec!["test".to_string()],
-            source_type: "user_statement".to_string(),
+            source_type: Some("user_statement".to_string()),
             ttl: None,
             due_in: None,
             relates: vec![],

@@ -21,13 +21,13 @@ use tokio::sync::Mutex;
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 
 use crate::code::indexing::IndexFacade;
-use crate::code::types::SymbolId;
 use crate::config::McpConfig;
 use crate::core::Context;
 use crate::core::indexing::handle_update;
+#[cfg(test)]
 use crate::domain::SearchResult;
 use crate::metrics::{UsageMetrics, count_tokens};
-use crate::store::{collections, documents, memory, stats};
+use crate::store::{collections, memory, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
@@ -477,76 +477,6 @@ impl McpServer {
         Ok(idx_guard)
     }
 
-    /// Resolve a symbol by ID or name, returning an error for disambiguation.
-    ///
-    /// If `symbol_id` is provided, looks up by ID directly.
-    /// If only `name` is provided, finds all matches. Returns an error with
-    /// a disambiguation list if multiple symbols share the name.
-    pub(super) fn resolve_symbol(
-        facade: &IndexFacade,
-        name: &str,
-        symbol_id: Option<u32>,
-    ) -> Result<crate::code::symbol::Symbol, McpError> {
-        if let Some(id) = symbol_id {
-            let sid =
-                SymbolId::new(id).ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved."))?;
-            return facade
-                .get_symbol(sid)
-                .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}.")));
-        }
-
-        let matches = facade.find_symbols_by_name(name);
-        match matches.len() {
-            0 => {
-                // Fuzzy fallback: try FTS trigram search (needs >= 3 chars)
-                if name.len() >= 3 {
-                    let fuzzy = facade.search_symbols(name, 10);
-                    match fuzzy.len() {
-                        0 => {}
-                        1 => return Ok(fuzzy.into_iter().next().unwrap()),
-                        _ => return Err(Self::disambiguation_error(name, &fuzzy)),
-                    }
-                }
-                Err(mcp_error(format!("No symbol found: '{name}'.")))
-            }
-            1 => Ok(matches.into_iter().next().unwrap()),
-            _ => Err(Self::disambiguation_error(name, &matches)),
-        }
-    }
-
-    /// Build a disambiguation error listing candidate symbols.
-    fn disambiguation_error(name: &str, candidates: &[crate::code::symbol::Symbol]) -> McpError {
-        let mut msg = format!("Multiple symbols match '{}'. Pass symbol_id:\n", name);
-        for sym in candidates {
-            let scope = match &sym.scope_context {
-                Some(crate::code::symbol::ScopeContext::ClassMember {
-                    class_name: Some(cn),
-                }) => format!(" [in {cn}]"),
-                Some(crate::code::symbol::ScopeContext::Local {
-                    parent_name: Some(pn),
-                    ..
-                }) => format!(" [in {pn}]"),
-                _ => String::new(),
-            };
-            let sig = sym
-                .signature
-                .as_ref()
-                .map(|s| format!(" `{}`", truncate_text(s.trim(), 60)))
-                .unwrap_or_default();
-            msg.push_str(&format!(
-                "  sym#{} - {:?} {} in {} ({}){}{}\n",
-                sym.id.value(),
-                sym.kind,
-                sym.name,
-                sym.file_path,
-                sym.range,
-                scope,
-                sig,
-            ));
-        }
-        mcp_error(msg)
-    }
-
     /// Record a tool call to persistent stats.
     /// The current session id as a provenance string, or `None` before a session
     /// is established (session_id == 0).
@@ -849,71 +779,11 @@ impl McpServer {
     }
 }
 
-/// Format a code symbol for MCP output.
-pub(super) fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
-    format_symbol_with_file_tokens(sym, None)
-}
-
-/// Format a code symbol, optionally annotating the containing file's token estimate.
-pub(super) fn format_symbol_with_file_tokens(
-    sym: &crate::code::symbol::Symbol,
-    file_tokens: Option<u32>,
-) -> String {
-    let suffix = match file_tokens {
-        Some(n) => format!(" (file: ~{}tok)", n),
-        None => String::new(),
-    };
-    let mut out = format!(
-        "  sym#{} {:?} {} in {}:{}{}\n",
-        sym.id.value(),
-        sym.kind,
-        sym.name,
-        sym.file_path,
-        sym.range.start_line,
-        suffix,
-    );
-    if let Some(ref sig) = sym.signature {
-        out.push_str(&format!("    Signature: {}\n", sig));
-    }
-    if let Some(ref doc) = sym.doc_comment {
-        let truncated = truncate_text(doc, 120);
-        out.push_str(&format!("    Doc: {}\n", truncated));
-    }
-    out
-}
-
-/// Resolve a document by path or ID.
 /// Convert a `file://` URI to a local filesystem path.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let path_str = uri.strip_prefix("file://")?;
     let path = PathBuf::from(path_str);
     if path.is_absolute() { Some(path) } else { None }
-}
-
-pub(super) fn resolve_document(
-    conn: &rusqlite::Connection,
-    path_or_id: &str,
-) -> crate::error::Result<crate::domain::Document> {
-    // Try to parse as ID first
-    if let Ok(id) = path_or_id.parse::<i64>() {
-        if let Some(doc) = documents::get_document(conn, id)? {
-            return Ok(doc);
-        }
-    }
-
-    // Try as path in all collections
-    let all_collections = collections::list_collections(conn)?;
-    for coll in &all_collections {
-        if let Some(doc) = documents::get_document_by_path(conn, &coll.name, path_or_id)? {
-            return Ok(doc);
-        }
-    }
-
-    Err(crate::error::Error::from(
-        crate::error::ErrorKind::DocumentNotFound {
-            id: path_or_id.to_string(),
-        },
-    ))
 }
 
 // rmcp 3 defaults to `Self::tool_router()`, a fresh router on every call;
@@ -1953,227 +1823,6 @@ fn load_server_instructions(root: &std::path::Path, limit: usize) -> String {
     instructions
 }
 
-/// Format a Unix timestamp as a compact relative time string (e.g., "3d ago", "2mo ago").
-pub(super) fn relative_time_ago(unix_ts: i64) -> String {
-    let now = chrono::Utc::now().timestamp();
-    let secs = (now - unix_ts).max(0);
-
-    if secs < 60 {
-        "just now".into()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else if secs < 7 * 86400 {
-        format!("{}d ago", secs / 86400)
-    } else if secs < 30 * 86400 {
-        format!("{}w ago", secs / (7 * 86400))
-    } else if secs < 365 * 86400 {
-        format!("{}mo ago", secs / (30 * 86400))
-    } else {
-        format!("{}y ago", secs / (365 * 86400))
-    }
-}
-
-/// Truncate text to a maximum length with ellipsis.
-pub(super) fn truncate_text(text: &str, max_len: usize) -> String {
-    let text = text.replace('\n', " ");
-    if text.len() <= max_len {
-        text
-    } else {
-        let mut cut = max_len.saturating_sub(3);
-        while !text.is_char_boundary(cut) && cut > 0 {
-            cut -= 1;
-        }
-        format!("{}...", &text[..cut])
-    }
-}
-
-/// Format search results for output.
-/// OOD (out-of-domain) threshold — normalized scores below this suggest weak relevance.
-const OOD_SCORE_THRESHOLD: f64 = 0.3;
-
-/// Returns an OOD hint when search results appear outside the indexed knowledge.
-///
-/// Returns `None` when results are strong enough to be useful.
-/// Returns a hint string when results are absent or weak — to be appended to output.
-pub(super) fn ood_hint(
-    query: &str,
-    result_count: usize,
-    top_score: Option<f64>,
-) -> Option<&'static str> {
-    // An empty query returns no rows by contract (it carries no term to match),
-    // so it lands here — where the generic advice is worse than none: it sends
-    // the caller to Grep for a query it never supplied.
-    if query.trim().is_empty() {
-        return Some("\n> The query is empty. Pass search terms — an empty query matches nothing.");
-    }
-    if result_count == 0 {
-        return Some(
-            "\n> No results. mdkb is semantic search — it won't match literal strings. \
-             Use Grep for exact string/regex matching in source files.",
-        );
-    }
-    if top_score.is_some_and(|s| s < OOD_SCORE_THRESHOLD) {
-        return Some(
-            "\n> Low-confidence results. If searching for a literal string or pattern, \
-             use Grep instead — mdkb only does semantic/fuzzy matching.",
-        );
-    }
-    None
-}
-
-pub(super) fn format_search_results(results: &[SearchResult], limit: usize) -> String {
-    use crate::store::hybrid::lost_in_middle_reorder;
-
-    let filtered: Vec<_> = results.iter().filter(|r| r.score != 0.0).collect();
-
-    if filtered.is_empty() {
-        return "No matching documents found.".to_string();
-    }
-
-    // Apply lost-in-the-middle reordering
-    let mut ordered: Vec<_> = filtered;
-    lost_in_middle_reorder(&mut ordered);
-
-    let mut output = if ordered.len() >= limit {
-        format!(
-            "Showing {} results (limit reached, refine query for more precise results):\n",
-            ordered.len()
-        )
-    } else {
-        String::new()
-    };
-
-    for r in &ordered {
-        let title = r.title.as_deref().unwrap_or("(untitled)");
-        if let Some(ref root) = r.repo_root {
-            output.push_str(&format!(
-                "[{}] {} - {} (score: {:.2}, repo: {})\n",
-                r.id, r.path, title, r.score, root
-            ));
-        } else {
-            output.push_str(&format!(
-                "[{}] {} - {} (score: {:.2})\n",
-                r.id, r.path, title, r.score
-            ));
-        }
-        for snippet in &r.snippets {
-            output.push_str(&format!("  {}\n", snippet));
-        }
-    }
-
-    // Hint: guide the model toward get() for retrieval
-    let retrieval_ids: Vec<_> = ordered
-        .iter()
-        .map(|r| {
-            if r.collection == "memory" && !r.path.is_empty() {
-                r.path.clone()
-            } else {
-                r.id.to_string()
-            }
-        })
-        .collect();
-    let repo_roots: Vec<_> = ordered
-        .iter()
-        .filter_map(|r| r.repo_root.as_deref())
-        .collect();
-
-    if let Some(root) = repo_roots.first() {
-        let id = serde_json::to_string(&retrieval_ids[0]).expect("string serialization");
-        let root = serde_json::to_string(root).expect("string serialization");
-        output.push_str(&format!("\nUse get({id}, root={root}) to read one."));
-        if retrieval_ids.len() > 1 {
-            output.push_str(" For another result, pass its listed repo as root.");
-        }
-        output.push_str(" root=\"*\" is search-only.");
-    } else if retrieval_ids.len() == 1 {
-        output.push_str(&format!("\nUse get(\"{}\") to read.", retrieval_ids[0]));
-    } else {
-        output.push_str(&format!(
-            "\nUse get(\"{}\") to read one, or get(\"{}\") for all.",
-            retrieval_ids[0],
-            retrieval_ids.join(",")
-        ));
-    }
-
-    output
-}
-
-/// Format memory search results for output.
-pub(super) fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
-    use crate::store::hybrid::lost_in_middle_reorder;
-
-    if entries.is_empty() {
-        return "No matching memory entries found.".to_string();
-    }
-
-    // Apply lost-in-the-middle reordering
-    let mut ordered: Vec<_> = entries.iter().collect();
-    lost_in_middle_reorder(&mut ordered);
-
-    let mut out = format!("Found {} memory entries:\n\n", entries.len());
-    for entry in &ordered {
-        let ttl_info = format_ttl_info(entry.expires_at);
-        let confirmed_info = format_confirmed_info(entry.last_confirmed_at);
-        out.push_str(&format!(
-            "- [{}] {} ({}, conf:{:.2}, confirms:{}, access:{}{}, {}{}): {}\n",
-            entry.id,
-            entry.title,
-            entry.entry_type,
-            entry.confidence(),
-            entry.confirmations,
-            entry.access_count,
-            confirmed_info,
-            relative_time_ago(entry.updated_at),
-            ttl_info,
-            truncate_text(&entry.content, 100)
-        ));
-    }
-    out
-}
-
-/// Format last_confirmed_at for display. Returns empty string when never confirmed.
-fn format_confirmed_info(last_confirmed_at: Option<i64>) -> String {
-    match last_confirmed_at {
-        Some(ts) => format!(", confirmed:{}", relative_time_ago(ts)),
-        None => String::new(),
-    }
-}
-
-/// Drop memory entries whose confidence() falls below `min`.
-/// Omitted filter or `0.0` is a no-op (current behavior).
-pub(super) fn apply_min_confidence(
-    entries: Vec<memory::MemoryEntry>,
-    min: Option<f64>,
-) -> Vec<memory::MemoryEntry> {
-    match min {
-        Some(threshold) if threshold > 0.0 => entries
-            .into_iter()
-            .filter(|e| e.confidence() >= threshold)
-            .collect(),
-        _ => entries,
-    }
-}
-
-/// Format TTL info for display. Returns empty string for permanent entries.
-pub(super) fn format_ttl_info(expires_at: Option<i64>) -> String {
-    match expires_at {
-        Some(ts) => {
-            let now = chrono::Utc::now().timestamp();
-            if ts <= now {
-                ", EXPIRED".to_string()
-            } else {
-                let dt = chrono::DateTime::from_timestamp(ts, 0)
-                    .map(|d| d.format("%Y-%m-%d").to_string())
-                    .unwrap_or_else(|| ts.to_string());
-                format!(", expires:{dt}")
-            }
-        }
-        None => String::new(),
-    }
-}
-
 /// The tool names this server advertises to a client.
 ///
 /// Read from the generated tool router rather than a list maintained by hand,
@@ -2212,6 +1861,9 @@ pub fn surface_instructions() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::dispatch::{
+        disambiguation_error, format_search_results, ood_hint, relative_time_ago,
+    };
 
     /// Daemon config whitelisting the system temp dir, so global-mode tests that
     /// open repos under a `TempDir` (outside home) pass the default-deny
@@ -2275,7 +1927,7 @@ mod tests {
         .with_signature(sig);
 
         // Must not panic; the truncated signature is char-boundary safe.
-        let err = McpServer::disambiguation_error("f", std::slice::from_ref(&sym));
+        let err = disambiguation_error("f", std::slice::from_ref(&sym));
         assert!(err.message.contains("Multiple symbols match 'f'"));
     }
 
@@ -2756,7 +2408,7 @@ mod tests {
                 source_file: None,
                 entry_type: "topic".to_string(),
                 tags: vec![],
-                source_type: "user_statement".to_string(),
+                source_type: Some("user_statement".to_string()),
                 ttl: None,
                 due_in: None,
                 relates: vec![],
@@ -2847,7 +2499,7 @@ mod tests {
                 source_file: None,
                 entry_type: "topic".to_string(),
                 tags: vec![],
-                source_type: "user_statement".to_string(),
+                source_type: Some("user_statement".to_string()),
                 ttl: None,
                 due_in: None,
                 relates: vec![],
@@ -3092,7 +2744,7 @@ mod tests {
                 source_file: None,
                 entry_type: "topic".to_string(),
                 tags: vec!["tag1".to_string()],
-                source_type: "user_statement".to_string(),
+                source_type: Some("user_statement".to_string()),
                 ttl: None,
                 due_in: None,
                 relates: vec![],
@@ -3112,7 +2764,7 @@ mod tests {
                 source_file: None,
                 entry_type: "problem".to_string(),
                 tags: vec![],
-                source_type: "user_statement".to_string(),
+                source_type: Some("user_statement".to_string()),
                 ttl: None,
                 due_in: None,
                 relates: vec![],
@@ -3148,6 +2800,59 @@ mod tests {
             text.contains("Found 2"),
             "Should indicate 2 entries, got: {}",
             text
+        );
+    }
+
+    /// The rmcp route and the hook-socket route must cap `limit` in the same
+    /// place. Before story 068-db06 only `dispatch_call` clamped to 200 and
+    /// this route returned every row.
+    #[tokio::test]
+    async fn test_memory_list_clamps_limit_to_200_entries() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        {
+            let ctx = Context::open(&root).expect("open store");
+            let now = chrono::Utc::now().timestamp();
+            for i in 0..201 {
+                let entry = memory::MemoryEntry {
+                    id: format!("bulk-{i}"),
+                    title: format!("Bulk {i}"),
+                    content: format!("Entry number {i}."),
+                    entry_type: memory::EntryType::Topic,
+                    tags: vec![],
+                    status: memory::EntryStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                    superseded_by: None,
+                    access_count: 0,
+                    last_accessed: None,
+                    source_path: None,
+                    confirmations: 0,
+                    last_confirmed_at: None,
+                    source_type: memory::SourceType::UserStatement,
+                    expires_at: None,
+                    due_at: None,
+                };
+                memory::add_entry(&ctx.conn, &entry).expect("seed entry");
+            }
+        }
+        let server = McpServer::new(root);
+
+        let result = server
+            .memory_list(Parameters(MemoryListParams {
+                limit: 100_000,
+                sort: "newest".to_string(),
+                root: None,
+            }))
+            .await
+            .expect("memory_list should not error");
+
+        let text = extract_text(&result);
+        assert!(
+            text.starts_with("Found 200 memory entries"),
+            "the limit must be clamped to 200 on this route too, got: {}",
+            text.lines().next().unwrap_or_default()
         );
     }
 
@@ -4033,7 +3738,7 @@ if (require.main === module) {
                 source_file: None,
                 entry_type: "topic".to_string(),
                 tags: vec![],
-                source_type: "user_statement".to_string(),
+                source_type: Some("user_statement".to_string()),
                 ttl: None,
                 due_in: None,
                 relates: vec![],
@@ -4064,7 +3769,7 @@ if (require.main === module) {
                 source_file: None,
                 entry_type: "topic".to_string(),
                 tags: vec![],
-                source_type: "user_statement".to_string(),
+                source_type: Some("user_statement".to_string()),
                 ttl: None,
                 due_in: None,
                 relates: vec![],
@@ -4546,7 +4251,7 @@ if (require.main === module) {
                         source_file: None,
                         entry_type: "topic".to_string(),
                         tags: vec!["test".to_string()],
-                        source_type: "user_statement".to_string(),
+                        source_type: Some("user_statement".to_string()),
                         ttl: None,
                         due_in: None,
                         relates: vec![],
@@ -4560,7 +4265,7 @@ if (require.main === module) {
                         source_file: None,
                         entry_type: "decision".to_string(),
                         tags: vec![],
-                        source_type: "user_statement".to_string(),
+                        source_type: Some("user_statement".to_string()),
                         ttl: None,
                         due_in: None,
                         relates: vec![],
@@ -4633,7 +4338,7 @@ if (require.main === module) {
                 source_file: None,
                 entry_type: "topic".to_string(),
                 tags: vec![],
-                source_type: "user_statement".to_string(),
+                source_type: Some("user_statement".to_string()),
                 ttl: None,
                 due_in: None,
                 relates: vec![],

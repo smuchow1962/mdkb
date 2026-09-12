@@ -103,8 +103,8 @@ pub struct MemoryWriteParams {
     pub tags: Vec<String>,
 
     /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
-    #[serde(default = "default_source_type")]
-    pub source_type: String,
+    #[serde(default)]
+    pub source_type: Option<String>,
 
     /// TTL in seconds. Entry expires after this duration. Omit for permanent.
     #[serde(default)]
@@ -133,10 +133,6 @@ pub struct MemoryWriteParams {
 
 fn default_entry_type() -> String {
     "topic".to_string()
-}
-
-fn default_source_type() -> String {
-    "user_statement".to_string()
 }
 
 fn default_target_kind() -> String {
@@ -185,8 +181,8 @@ pub struct MemoryWriteBatchEntry {
     pub tags: Vec<String>,
 
     /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
-    #[serde(default = "default_source_type")]
-    pub source_type: String,
+    #[serde(default)]
+    pub source_type: Option<String>,
 
     /// TTL in seconds. Entry expires after this duration. Omit for permanent.
     #[serde(default)]

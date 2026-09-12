@@ -224,6 +224,10 @@ pub fn mutation_request(
                 ttl,
                 due_in,
                 source_type,
+                relates,
+                agent,
+                on_conflict,
+                dry_run,
             } => {
                 let (body, source_path) = if let Some(path) = file.as_ref() {
                     let abs = absolute(path);
@@ -261,6 +265,10 @@ pub fn mutation_request(
                     ttl: *ttl,
                     due_in: *due_in,
                     source_type: source_type.clone(),
+                    relates: relates.clone(),
+                    agent: agent.clone(),
+                    on_conflict: on_conflict.clone(),
+                    dry_run: *dry_run,
                 }
             }
             MemoryCommand::Confirm { id, outcome } => M::MemoryConfirm {
