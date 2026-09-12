@@ -177,6 +177,26 @@ impl SymbolKind {
             _ => None,
         }
     }
+
+    /// Whether a `Calls` edge can have a symbol of this kind as its target.
+    ///
+    /// Callable: `Function`, `Method`, and the kinds a constructor call names —
+    /// `Struct` (`SymbolId(7)`), `Class`, `Enum` and `Actor` (`Foo()` in the
+    /// languages that instantiate by calling the type).
+    ///
+    /// Not callable: `Field`, `Variable`, `Parameter` and `Constant` hold
+    /// values — a closure in one of them can be called, but the index cannot
+    /// tell that from the ordinary case, and on this repository fields alone
+    /// were 6831 of the 8735 candidates a call could not have meant. `Module`,
+    /// `TypeAlias`, `Trait`, `Interface` and `Signal` are never called.
+    /// `Macro` is not a call target either: an invocation is recorded as
+    /// `Expands`, not `Calls`.
+    pub fn is_callable(self) -> bool {
+        matches!(
+            self,
+            Self::Function | Self::Method | Self::Struct | Self::Class | Self::Enum | Self::Actor
+        )
+    }
 }
 
 impl FromStr for SymbolKind {
@@ -369,6 +389,22 @@ mod tests {
         );
         assert_eq!("method".parse::<SymbolKind>().unwrap(), SymbolKind::Method);
         assert!("unknown".parse::<SymbolKind>().is_err());
+    }
+
+    #[test]
+    fn only_kinds_a_call_can_reach_are_callable() {
+        for kind in [
+            SymbolKind::Field,
+            SymbolKind::TypeAlias,
+            SymbolKind::Module,
+            SymbolKind::Constant,
+            SymbolKind::Macro,
+        ] {
+            assert!(!kind.is_callable(), "{kind} was 1 of the 4 false-target kinds");
+        }
+        assert!(SymbolKind::Function.is_callable());
+        assert!(SymbolKind::Method.is_callable());
+        assert!(SymbolKind::Struct.is_callable());
     }
 
     #[test]

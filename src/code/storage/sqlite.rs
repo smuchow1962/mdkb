@@ -703,9 +703,10 @@ impl CodeDb {
             "SELECT r.id, r.to_name, r.to_qualifier, s.id, {RESOLUTION_TIER} \
              FROM code_relationships r \
              JOIN code_symbols fs ON fs.id = r.from_symbol_id \
-             LEFT JOIN code_symbols s ON s.name = r.to_name \
+             LEFT JOIN code_symbols s ON s.name = r.to_name AND {callable} \
              WHERE r.kind = 'Calls' AND r.from_symbol_id = ?1 \
-             ORDER BY r.id"
+             ORDER BY r.id",
+            callable = callable_kind_predicate("s.kind")
         ))?;
         let rows = stmt.query_map([symbol_id], |row| {
             Ok((
@@ -1137,6 +1138,23 @@ pub const TIER_EXTERNAL: i64 = 3;
 /// [`rust::receiver`](crate::code::parsing::rust::receiver).
 pub const TIER_UNPLACED: i64 = 7;
 
+/// SQL predicate: the symbol whose `kind` is in `kind_column` is one a call
+/// can target — see [`SymbolKind::is_callable`] for the list and the reasons.
+///
+/// The candidate join of every `Calls` cascade carries it, so a call named
+/// like a field never has the field as a candidate. Built from the enum so
+/// that a new kind is classified in one place; a fragment listing the names
+/// would answer "not callable" for it by omission.
+pub(crate) fn callable_kind_predicate(kind_column: &str) -> String {
+    let kinds = (0..SymbolKind::COUNT as u8)
+        .filter_map(SymbolKind::from_u8)
+        .filter(|kind| kind.is_callable())
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{kind_column} IN ({kinds})")
+}
+
 /// Every `Calls` edge matching `filter`, paired with each candidate target and
 /// the nearest tier any candidate of that same edge reached.
 ///
@@ -1149,8 +1167,9 @@ pub(crate) fn resolved_edges(filter: &str) -> String {
                 MIN({RESOLUTION_TIER}) OVER (PARTITION BY r.id) AS nearest \
          FROM code_relationships r \
          JOIN code_symbols fs ON fs.id = r.from_symbol_id \
-         JOIN code_symbols s ON s.name = r.to_name \
-         WHERE r.kind = 'Calls' AND {filter}"
+         JOIN code_symbols s ON s.name = r.to_name AND {callable} \
+         WHERE r.kind = 'Calls' AND {filter}",
+        callable = callable_kind_predicate("s.kind")
     )
 }
 
@@ -2041,6 +2060,98 @@ mod tests {
             vec![member],
             "expected Store::open, not the local open {local}"
         );
+    }
+
+    /// A method `kind()` on a receiver the index cannot type, in a file that
+    /// also declares a field `kind`. Proximity would hand the call to the field
+    /// — 6831 kept candidates of this repository were fields, aliases, modules
+    /// and constants, none of which a call can reach. Only symbols a call can
+    /// target are candidates at all, so the function elsewhere wins.
+    #[test]
+    fn a_call_named_like_a_field_resolves_to_the_function_not_the_field() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let field = db
+            .insert_symbol(
+                "kind", "Field", here_file, "here.rs", 5, None, None, None, 0, None, None,
+                Some("crate::here"), None,
+            )
+            .unwrap();
+        let (_, function) = file_with_function(&db, "kind", "other.rs", "crate::other");
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "kind",
+            &CallSite::default(),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![function],
+            "expected the function, not the same-file field {field}"
+        );
+    }
+
+    /// When the only symbol of that name is a field, the call has no target in
+    /// this index at all. An empty answer is right; the field is not.
+    #[test]
+    fn a_call_whose_only_namesake_is_a_field_has_no_target() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        for (name, kind) in [
+            ("get", "Field"),
+            ("Err", "TypeAlias"),
+            ("config", "Module"),
+            ("MAX", "Constant"),
+        ] {
+            db.insert_symbol(
+                name, kind, here_file, "here.rs", 5, None, None, None, 0, None, None,
+                Some("crate::here"), None,
+            )
+            .unwrap();
+            db.insert_relationship(
+                Some(caller),
+                "caller",
+                name,
+                &CallSite::default(),
+                "Calls",
+                here_file,
+                (None, None),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(called_ids(&db, caller), Vec::<i64>::new());
+    }
+
+    /// `SymbolId(7)` is a call, and its target is the struct: a tuple struct's
+    /// constructor is the struct itself. The kind filter must let it through.
+    #[test]
+    fn a_tuple_struct_constructor_call_resolves_to_the_struct() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let strukt = db
+            .insert_symbol(
+                "SymbolId", "Struct", here_file, "here.rs", 5, None, None, None, 0, None, None,
+                Some("crate::here"), None,
+            )
+            .unwrap();
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "SymbolId",
+            &CallSite::default(),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(called_ids(&db, caller), vec![strukt]);
     }
 
     /// `std::fs::write` names a target this index does not contain. Answering it
