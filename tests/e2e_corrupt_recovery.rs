@@ -33,6 +33,12 @@ const PAGE: u64 = 4096;
 /// salvage 165 of itview's entries rather than none.
 const CORRUPT_PAGE_COUNT: u64 = 40;
 
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
 struct Repo {
     _dir: TempDir,
     root: PathBuf,
@@ -363,6 +369,10 @@ fn a_corrupt_code_index_is_released_and_rebuilt_instead_of_retried() {
         .conn()
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .expect("checkpoint");
+    let wal = sqlite_sidecar(&db, "-wal");
+    let shm = sqlite_sidecar(&db, "-shm");
+    assert!(wal.is_file(), "fixture must have a WAL to preserve");
+    assert!(shm.is_file(), "fixture must have an SHM file to preserve");
 
     corrupt_middle(&db);
     // The probe is throttled by the marker the seed run just wrote; clearing it
@@ -410,6 +420,16 @@ fn a_corrupt_code_index_is_released_and_rebuilt_instead_of_retried() {
         1,
         "preserve exactly one corrupt database"
     );
+    let quarantined_wal = sqlite_sidecar(&quarantined[0], "-wal");
+    let quarantined_shm = sqlite_sidecar(&quarantined[0], "-shm");
+    assert!(
+        quarantined_wal.is_file(),
+        "quarantine must preserve the corrupt generation's WAL"
+    );
+    assert!(
+        quarantined_shm.is_file(),
+        "quarantine must preserve the corrupt generation's SHM file"
+    );
     let rebuilt = healed.index_directory(&root).expect("rebuild");
     assert!(
         rebuilt.symbols_indexed > 0,
@@ -446,6 +466,14 @@ fn a_corrupt_code_index_is_released_and_rebuilt_instead_of_retried() {
     assert!(
         quarantined[0].is_file(),
         "repeat startup must preserve the quarantined corrupt database"
+    );
+    assert!(
+        quarantined_wal.is_file(),
+        "repeat startup must preserve the quarantined WAL"
+    );
+    assert!(
+        quarantined_shm.is_file(),
+        "repeat startup must preserve the quarantined SHM file"
     );
 }
 
