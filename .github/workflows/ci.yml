@@ -31,6 +31,29 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
+      # Retrieval eval (docs/retrieval-eval.md). The ONNX model is restored
+      # from the cache when a previous run fetched it; on a miss the warm step
+      # tries once and may fail without failing the job, and the eval then
+      # prints the embedding and hybrid modes as skipped with the reason.
+      - name: Cache ONNX embedding model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed/models--Qdrant--all-MiniLM-L6-v2-onnx
+          key: ${{ runner.os }}-fastembed-AllMiniLML6V2
+
+      - name: Warm ONNX model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: cargo run --all-features --quiet -- eval recall --mode embedding --download
+
+      - name: Retrieval eval
+        run: |
+          cargo run --all-features --quiet -- eval recall --mode bm25 --min-recall 0.16
+          cargo run --all-features --quiet -- eval recall --mode hybrid --min-recall 0.9
+          cargo run --all-features --quiet -- eval recall --mode embedding
+          cargo run --all-features --quiet -- eval judge
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
