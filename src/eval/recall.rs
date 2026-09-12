@@ -118,6 +118,7 @@ impl Retrieval<'_> {
             self.memory_cfg.access_recency_weight,
             self.memory_cfg.recency_half_life_secs,
         )
+        .map(|results| results.into_iter().map(|result| result.entry).collect())
     }
 }
 

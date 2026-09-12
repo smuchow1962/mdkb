@@ -570,7 +570,7 @@ pub struct HooksConfig {
     /// Latency budget in milliseconds; hook truncates output if exceeded.
     pub latency_budget_ms: u64,
 
-    /// Minimum hybrid score for a recall result to be injected.
+    /// Minimum final hybrid score for a recall result to be injected.
     pub min_recall_score: f64,
 
     /// Minimum confidence for a warmup entry to be injected. `0.0` (default)

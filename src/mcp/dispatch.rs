@@ -1308,6 +1308,8 @@ pub async fn search_impl(
             })
             .ok_or_else(|| mcp_error("Database not initialized"))?
             .map_err(|e| mcp_error(format!("Memory search failed: {e}")))?;
+            let entries: Vec<memory::MemoryEntry> =
+                entries.into_iter().map(|result| result.entry).collect();
             let entries = apply_min_confidence(entries, params.min_confidence);
 
             let mut output = format_memory_search_results(&entries);
@@ -1345,6 +1347,8 @@ pub async fn search_impl(
                 })
                 .ok_or_else(|| mcp_error("Database not initialized"))?
                 .map_err(|e| mcp_error(format!("Search failed: {e}")))?;
+            let mem_entries: Vec<memory::MemoryEntry> =
+                mem_entries.into_iter().map(|result| result.entry).collect();
             let mem_entries = apply_min_confidence(mem_entries, params.min_confidence);
 
             let total = doc_results.len() + mem_entries.len();
@@ -1592,6 +1596,8 @@ pub async fn cross_repo_search_impl(
                     );
                     match result {
                         Some(Ok(entries)) => {
+                            let entries: Vec<memory::MemoryEntry> =
+                                entries.into_iter().map(|result| result.entry).collect();
                             let entries = apply_min_confidence(entries, min_confidence);
                             if !entries.is_empty() {
                                 let text = format_memory_search_results(&entries);
@@ -3046,6 +3052,23 @@ fn entry_in_scope(entry: &crate::store::memory::MemoryEntry, token: &str) -> boo
 /// the recall gate and the warmup reserved-prior slot both key off.
 const PRIOR_CONFIDENCE_GATE: f64 = 0.7;
 
+/// Apply the UserPromptSubmit recall floor to final retrieval scores.
+///
+/// Confidence remains a ranking component, but the injection decision must
+/// reflect relevance and confidence together. A non-positive floor disables
+/// filtering, matching the configuration's established no-floor behavior.
+fn apply_min_recall_score(
+    entries: Vec<memory::ScoredMemoryEntry>,
+    min_recall_score: f64,
+) -> Vec<memory::MemoryEntry> {
+    let floor = (min_recall_score > 0.0).then_some(min_recall_score);
+    entries
+        .into_iter()
+        .filter(|result| floor.is_none_or(|score| result.score >= score))
+        .map(|result| result.entry)
+        .collect()
+}
+
 /// True when `entry` is a `Prior` whose confidence at `now` clears the gate.
 fn is_high_confidence_prior(entry: &crate::store::memory::MemoryEntry, now: i64) -> bool {
     entry.entry_type == crate::store::memory::EntryType::Prior
@@ -3676,7 +3699,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         return json!({});
     }
 
-    let mut results = Vec::new();
+    let mut results: Vec<memory::MemoryEntry> = Vec::new();
     let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
     if let Some(ref q) = fts_query {
         if ensure_handle_context(handle).await.is_err() {
@@ -3701,7 +3724,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
                 handle.config.search.memory.recency_half_life_secs,
             )
         });
-        results = match search {
+        let mut scored_results = match search {
             Some(Ok(entries)) => entries,
             Some(Err(error)) => {
                 tracing::warn!("hook memory recall failed: {error}");
@@ -3717,7 +3740,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
                 query_hash: crate::store::documents::compute_hash(prompt),
                 query_text: String::new(),
                 search_type: "recall".to_string(),
-                result_count: results.len() as i64,
+                result_count: scored_results.len() as i64,
                 latency_ms: search_t0.elapsed().as_millis() as i64,
                 top_score: None,
                 session_id: None,
@@ -3765,11 +3788,11 @@ async fn hook_user_prompt_submit_impl_with_dedup(
 
         // prior-specific gate: only high-confidence priors surface
         let now = chrono::Utc::now().timestamp();
-        results.retain(|e| {
+        scored_results.retain(|e| {
             e.entry_type != crate::store::memory::EntryType::Prior
                 || e.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
         });
-        results = apply_min_confidence(results, Some(cfg.min_recall_score));
+        results = apply_min_recall_score(scored_results, cfg.min_recall_score);
 
         // Global rank: float high-confidence priors to the top WITHOUT
         // scrambling the rest (stable sort on a boolean key preserves the
@@ -5582,6 +5605,124 @@ mod tests {
             due_at: None,
         };
         crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed entry");
+    }
+
+    async fn seed_stale_handoff_entry(handle: &RepoHandle, id: &str, content: &str) {
+        ensure_handle_context(handle).await.expect("init ctx");
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let entry = crate::store::memory::MemoryEntry {
+            id: id.to_string(),
+            title: format!("Title for {id}"),
+            content: content.to_string(),
+            entry_type: crate::store::memory::EntryType::Handoff,
+            tags: vec!["recall".to_string()],
+            status: crate::store::memory::EntryStatus::Active,
+            created_at: now - 175 * 86_400,
+            updated_at: now - 175 * 86_400,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: crate::store::memory::SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        assert!(
+            entry.confidence() < 0.07,
+            "control: stale handoff confidence should be about 0.06"
+        );
+        crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed stale handoff");
+    }
+
+    #[test]
+    fn min_recall_score_filters_final_score_not_confidence() {
+        let now = chrono::Utc::now().timestamp();
+        let low_confidence_entry = crate::store::memory::MemoryEntry {
+            id: "above-gate".to_string(),
+            title: "Above gate".to_string(),
+            content: "Recall gate test entry".to_string(),
+            entry_type: crate::store::memory::EntryType::Handoff,
+            tags: vec![],
+            status: crate::store::memory::EntryStatus::Active,
+            created_at: now - 175 * 86_400,
+            updated_at: now - 175 * 86_400,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: crate::store::memory::SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        assert!(
+            low_confidence_entry.confidence() < 0.07,
+            "control: entry confidence should be about 0.06"
+        );
+        let below_gate_entry = crate::store::memory::MemoryEntry {
+            id: "below-gate".to_string(),
+            ..low_confidence_entry.clone()
+        };
+        let injected = apply_min_recall_score(
+            vec![
+                memory::ScoredMemoryEntry {
+                    entry: low_confidence_entry,
+                    score: 0.31,
+                },
+                memory::ScoredMemoryEntry {
+                    entry: below_gate_entry,
+                    score: 0.29,
+                },
+            ],
+            0.3,
+        );
+
+        assert_eq!(
+            injected
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["above-gate"],
+            "the above-gate result must be injected even with 0.06 confidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn min_recall_score_injects_only_the_above_score_result() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 0;
+            config.hooks.recall_limit = 2;
+            config.hooks.min_recall_score = 0.5;
+        });
+        // The repeated matching terms make this the top BM25 fallback result:
+        // final score ≈ 0.7 * 1.0 + 0.3 * 0.06, above the 0.5 gate.
+        seed_stale_handoff_entry(
+            &handle,
+            "above-score",
+            "recallgate target recallgate target recallgate target recallgate target",
+        )
+        .await;
+        // Rank two gets reciprocal-rank relevance 0.5, so its final score is
+        // ≈ 0.7 * 0.5 + 0.3 * 0.06, below the same gate.
+        seed_stale_handoff_entry(&handle, "below-score", "recallgate target").await;
+
+        let output = hook_user_prompt_submit_impl(&handle, "recallgate target").await;
+        let context = additional_context(&output);
+        assert!(
+            context.contains("above-score"),
+            "the high final-score result should be injected: {context}"
+        );
+        assert!(
+            !context.contains("below-score"),
+            "the low final-score result must not be injected: {context}"
+        );
     }
 
     /// Seed an indexed document so the recall documents leg has something to

@@ -211,6 +211,24 @@ pub struct MemoryEntry {
     pub due_at: Option<i64>,
 }
 
+/// A memory entry together with the final score assigned by hybrid retrieval.
+///
+/// The score is query-specific and is intentionally not persisted with the
+/// memory entry itself.
+#[derive(Debug, Clone)]
+pub struct ScoredMemoryEntry {
+    pub entry: MemoryEntry,
+    pub score: f64,
+}
+
+impl std::ops::Deref for ScoredMemoryEntry {
+    type Target = MemoryEntry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entry
+    }
+}
+
 impl MemoryEntry {
     /// Calculate confidence score [0.05, 1.0].
     ///
@@ -225,12 +243,16 @@ impl MemoryEntry {
         // Belief: sigmoid over confirmations. 0 confirms = 0.5, 10 = 0.91, 50 = 0.98.
         let belief = (1.0 + f64::from(self.confirmations)) / (2.0 + f64::from(self.confirmations));
 
-        // Temporal decay: how fresh is the verification?
-        let reference_time = self.last_confirmed_at.unwrap_or(self.created_at);
-        let days = (now - reference_time) as f64 / 86400.0;
-        let days = days.max(0.0); // guard against negative (clock skew)
-        let strength = 1.0 + (1.0 + self.access_count as f64).ln();
-        let decay = (-days / (90.0 * strength)).exp();
+        // Durable knowledge stays valid until it is explicitly superseded or
+        // refuted. Lifecycle records decay from their last verification.
+        let decay = if self.entry_type.is_durable() {
+            1.0
+        } else {
+            let reference_time = self.last_confirmed_at.unwrap_or(self.created_at);
+            let days = ((now - reference_time) as f64 / 86400.0).max(0.0);
+            let strength = 1.0 + (1.0 + self.access_count as f64).ln();
+            (-days / (90.0 * strength)).exp()
+        };
 
         // Source authority multiplier
         let source_mult = match self.source_type {
@@ -1014,6 +1036,11 @@ const RELEVANCE_WEIGHT: f64 = 0.7;
 /// Weight for confidence score in confidence-weighted ranking.
 const CONFIDENCE_WEIGHT: f64 = 0.3;
 
+/// Combine query relevance and entry confidence into one retrieval score.
+fn final_hybrid_score(relevance_score: f64, entry: &MemoryEntry) -> f64 {
+    relevance_score * RELEVANCE_WEIGHT + entry.confidence() * CONFIDENCE_WEIGHT
+}
+
 /// Find memory entries similar to the given embedding, excluding `exclude_rowid`.
 ///
 /// Returns a formatted warning string for any matches above the similarity threshold.
@@ -1128,7 +1155,7 @@ pub fn search_entries_hybrid(
     limit: usize,
     access_recency_weight: f64,
     recency_half_life_secs: i64,
-) -> Result<Vec<MemoryEntry>> {
+) -> Result<Vec<ScoredMemoryEntry>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
     search_entries_hybrid_fts(
         conn,
@@ -1153,7 +1180,7 @@ pub fn search_entries_hybrid_fts(
     limit: usize,
     access_recency_weight: f64,
     recency_half_life_secs: i64,
-) -> Result<Vec<MemoryEntry>> {
+) -> Result<Vec<ScoredMemoryEntry>> {
     use crate::store::{hybrid, vectors};
 
     // An empty expression is not a query, so neither leg runs: the vector leg
@@ -1168,8 +1195,9 @@ pub fn search_entries_hybrid_fts(
 
     // BM25-only fallback: preserve BM25 order but stable-sort by the
     // access-recency signal so frequently/recently used entries float up
-    // (mirrors the third RRF signal in the fused path below).
-    let bm25_fallback = |results: Vec<(i64, MemoryEntry)>| -> Vec<MemoryEntry> {
+    // (mirrors the third RRF signal in the fused path below). With no vector
+    // leg, reciprocal BM25 rank supplies the relevance component.
+    let bm25_fallback = |results: Vec<(i64, MemoryEntry)>| -> Vec<ScoredMemoryEntry> {
         let mut entries: Vec<MemoryEntry> = results.into_iter().map(|(_, e)| e).collect();
         if access_recency_weight > 0.0 {
             let now = Utc::now().timestamp();
@@ -1189,7 +1217,15 @@ pub fn search_entries_hybrid_fts(
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
-        entries.into_iter().take(limit).collect()
+        entries
+            .into_iter()
+            .take(limit)
+            .enumerate()
+            .map(|(rank, entry)| ScoredMemoryEntry {
+                score: final_hybrid_score(1.0 / (rank + 1) as f64, &entry),
+                entry,
+            })
+            .collect()
     };
 
     // If no embedding provided, fall back to BM25-only
@@ -1283,7 +1319,7 @@ pub fn search_entries_hybrid_fts(
         } else {
             continue;
         };
-        let final_score = rrf_score * RELEVANCE_WEIGHT + entry.confidence() * CONFIDENCE_WEIGHT;
+        let final_score = final_hybrid_score(rrf_score, &entry);
         scored_results.push((entry, final_score));
     }
 
@@ -1293,7 +1329,7 @@ pub fn search_entries_hybrid_fts(
     Ok(scored_results
         .into_iter()
         .take(limit)
-        .map(|(e, _)| e)
+        .map(|(entry, score)| ScoredMemoryEntry { entry, score })
         .collect())
 }
 
@@ -3976,7 +4012,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_search_falls_back_to_bm25_without_embedding() {
+    fn hybrid_recall_returns_final_score_without_embedding() {
         let conn = setup_db_with_vectors();
 
         let entry = MemoryEntry {
@@ -4004,6 +4040,11 @@ mod tests {
         let results = search_entries_hybrid(&conn, "OAuth PKCE", None, 10, 0.2, 2_592_000).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "test-entry");
+        assert!(
+            (results[0].score - 0.8275).abs() < 0.001,
+            "final score should combine rank-1 relevance and confidence: {}",
+            results[0].score
+        );
     }
 
     #[test]
@@ -4274,6 +4315,19 @@ mod tests {
         assert!(
             (conf - 0.156).abs() < 0.02,
             "90-day stale should be ~0.156, got {conf}"
+        );
+    }
+
+    #[test]
+    fn durable_recall_confidence_does_not_decay_after_200_days() {
+        let now = 200 * 86_400;
+        let mut decision = make_entry_at(0, 0, 0, None, SourceType::UserStatement);
+        decision.entry_type = EntryType::Decision;
+
+        let confidence = decision.confidence_at(now);
+        assert!(
+            (confidence - 0.425).abs() < 0.001,
+            "a durable decision must retain its initial confidence, got {confidence}"
         );
     }
 
@@ -5008,12 +5062,12 @@ mod tests {
         let run_a = search_entries_hybrid(&conn, "deterministic", None, 10, 0.3, 2_592_000)
             .unwrap()
             .into_iter()
-            .map(|e| e.id)
+            .map(|e| e.entry.id)
             .collect::<Vec<_>>();
         let run_b = search_entries_hybrid(&conn, "deterministic", None, 10, 0.3, 2_592_000)
             .unwrap()
             .into_iter()
-            .map(|e| e.id)
+            .map(|e| e.entry.id)
             .collect::<Vec<_>>();
         assert_eq!(run_a, run_b, "ranking must be deterministic across calls");
     }
