@@ -176,7 +176,8 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
 /// - `.mdkb/code-index/` — legacy tantivy index dir, superseded by `code.sqlite`.
 /// - `.mdkb/reindex-queue.jsonl` — the file-based reindex queue; the daemon now
 ///   uses an in-process channel, so it has no writer.
-/// - dead `[models]` embedding keys — the embedder is fixed to all-MiniLM-L6-v2.
+/// - keys in `config.toml` that no field of `Config` reads — a typo, or a knob
+///   a release removed, is ignored on load, so it is named here instead.
 ///
 /// Runs against `.mdkb/` itself, not the namespaced store: every artifact listed
 /// here is a legacy of the project-level store, and a namespace never had them
@@ -208,15 +209,12 @@ fn housekeeping(root: &Path) {
         }
     }
 
-    // Warn (do not silently accept) dead [models] embedding keys.
+    // Warn (do not silently accept) keys nothing reads, one line per key so
+    // each names the setting the user has to look at.
     let config_path = mdkb_dir.join("config.toml");
     if let Ok(raw) = std::fs::read_to_string(&config_path) {
-        let dead = crate::config::detect_dead_model_keys(&raw);
-        if !dead.is_empty() {
-            tracing::warn!(
-                "[models] {} ignored: the embedder is fixed (all-MiniLM-L6-v2)",
-                dead.join(", ")
-            );
+        for key in crate::config::unknown_keys(&raw) {
+            tracing::warn!("config.toml: unknown key `{key}` ignored");
         }
     }
 }

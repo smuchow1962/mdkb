@@ -1,6 +1,6 @@
 //! Integration tests for vestigial-artifact housekeeping on `mdkb update`
 //! (story 046): orphan mdkb.sqlite, legacy code-index dir, writer-less
-//! reindex-queue.jsonl, and the dead [models] embedding-key warning.
+//! reindex-queue.jsonl, and the unknown-config-key warning.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -63,45 +63,48 @@ fn update_preserves_nonempty_mdkb_sqlite() {
     assert!(file.exists(), "non-empty mdkb.sqlite must be preserved");
 }
 
+/// `[code] index_path` was a knob for years and never moved the index. A user
+/// who still sets it must be told by the dotted path, and the load must not
+/// fail over it.
 #[test]
-fn update_warns_on_dead_models_keys() {
+fn update_warns_on_unknown_config_keys() {
     let tmp = init_repo();
     let config = tmp.path().join(".mdkb/config.toml");
     let raw = std::fs::read_to_string(&config).unwrap();
     // Declare the table rather than patching one out of what `init` wrote:
-    // `init` writes its defaults commented out, so a rewrite of "[models]\n"
-    // matches inside "# [models]" and leaves the dead key at the document root,
-    // where nothing is looking for it and the warning never fires.
+    // `init` writes its defaults commented out, so a rewrite of "[code]\n"
+    // matches inside "# [code]" and leaves the key at the document root,
+    // where it would be reported under the wrong path.
     assert!(
-        !raw.lines().any(|l| l.trim_end() == "[models]"),
-        "init must not write a live [models] table; this fixture declares it"
+        !raw.lines().any(|l| l.trim_end() == "[code]"),
+        "init must not write a live [code] table; this fixture declares it"
     );
     std::fs::write(
         &config,
-        format!("{raw}\n[models]\nembedding_repo = \"nomic-ai/whatever\"\n"),
+        format!("{raw}\n[code]\nindex_path = \"elsewhere.sqlite\"\n"),
     )
     .unwrap();
 
     let out = mdkb(&["update"], tmp.path());
     assert!(
         out.status.success(),
-        "update must still succeed with dead keys"
+        "update must still succeed with unknown keys"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("embedding_repo") && stderr.contains("embedder is fixed"),
-        "must warn that the dead key is ignored, got stderr: {stderr}"
+        stderr.contains("code.index_path") && stderr.contains("ignored"),
+        "must warn that the unknown key is ignored, got stderr: {stderr}"
     );
 }
 
 #[test]
-fn update_is_quiet_without_dead_keys_or_artifacts() {
+fn update_is_quiet_without_unknown_keys_or_artifacts() {
     let tmp = init_repo();
     let out = mdkb(&["update"], tmp.path());
     assert!(out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("embedder is fixed"),
-        "no dead-key warning when config is clean: {stderr}"
+        !stderr.contains("unknown key"),
+        "no unknown-key warning when config is clean: {stderr}"
     );
 }
