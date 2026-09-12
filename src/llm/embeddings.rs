@@ -4,7 +4,7 @@
 //! This is the shared embedding backend for both document search and code
 //! intelligence semantic search.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
@@ -149,6 +149,41 @@ fn shared_cache_dir() -> PathBuf {
     PathBuf::from(".fastembed_cache")
 }
 
+/// The directory fastembed reads the AllMiniLML6V2 weights from.
+///
+/// fastembed resolves `HF_HOME` before the cache dir we pass it, so the same
+/// order applies here — otherwise a presence check could look in one place
+/// while `EmbeddingService::new` downloads into another.
+pub fn model_cache_path() -> PathBuf {
+    let base = std::env::var("HF_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| shared_cache_dir());
+    let code = TextEmbedding::get_model_info(&EmbeddingModel::AllMiniLML6V2)
+        .map(|info| info.model_code.clone())
+        .unwrap_or_else(|_| "Qdrant/all-MiniLM-L6-v2-onnx".to_string());
+    base.join(format!("models--{}", code.replace('/', "--")))
+}
+
+/// True when a complete download of the model sits in `model_dir`, so
+/// `EmbeddingService::new` will load it from disk and touch no network.
+///
+/// hf-hub links each file into `snapshots/<revision>/` only after its blob is
+/// complete, so a snapshot holding `model.onnx` is the signal; a bare cache
+/// directory left by an interrupted download is not.
+pub fn model_cached_at(model_dir: &Path) -> bool {
+    let Ok(snapshots) = std::fs::read_dir(model_dir.join("snapshots")) else {
+        return false;
+    };
+    snapshots
+        .flatten()
+        .any(|snapshot| snapshot.path().join("model.onnx").exists())
+}
+
+/// True when the AllMiniLML6V2 weights are cached (see [`model_cached_at`]).
+pub fn model_is_cached() -> bool {
+    model_cached_at(&model_cache_path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +232,30 @@ mod tests {
         // neither panic nor change it.
         cap_rayon_global_pool();
         assert_eq!(rayon::current_num_threads(), 1);
+    }
+
+    #[test]
+    fn model_cached_at_needs_a_complete_snapshot_not_just_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("models--Qdrant--all-MiniLM-L6-v2-onnx");
+        // No directory at all.
+        assert!(!model_cached_at(&model_dir));
+        // The layout an interrupted download leaves: blobs, no snapshot file.
+        std::fs::create_dir_all(model_dir.join("blobs")).unwrap();
+        std::fs::create_dir_all(model_dir.join("snapshots/abc")).unwrap();
+        assert!(!model_cached_at(&model_dir));
+        // A snapshot holding the weights is a complete download.
+        std::fs::write(model_dir.join("snapshots/abc/model.onnx"), b"onnx").unwrap();
+        assert!(model_cached_at(&model_dir));
+    }
+
+    #[test]
+    fn model_cache_path_ends_in_the_hf_hub_folder_for_the_production_model() {
+        let path = model_cache_path();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("models--Qdrant--all-MiniLM-L6-v2-onnx")
+        );
     }
 
     #[test]

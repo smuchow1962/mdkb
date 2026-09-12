@@ -33,12 +33,13 @@ pub use crate::core::memory_sync::{
     load_memory_index, projection_drift, projection_file_and_row_counts, sync_memory_files,
 };
 pub use crate::core::ops::{
-    EmbedResult, EvolutionHistoryEntry, ExperimentCreateResult, GetResult, PruneSessionsSummary,
-    handle_current, handle_embed, handle_eval_judge, handle_eval_recall, handle_experiment_cancel,
-    handle_experiment_create, handle_experiment_end, handle_experiment_list,
-    handle_experiment_status, handle_get, handle_history, handle_init, handle_journal_import,
-    handle_journal_import_all, handle_metrics_export, handle_metrics_latency, handle_metrics_show,
-    handle_prune_sessions, handle_search, handle_vsearch, parse_retention_secs,
+    EmbedResult, EvalOptions, EvolutionHistoryEntry, ExperimentCreateResult, GetResult,
+    PruneSessionsSummary, handle_current, handle_embed, handle_eval_judge, handle_eval_recall,
+    handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
+    handle_experiment_list, handle_experiment_status, handle_get, handle_history, handle_init,
+    handle_journal_import, handle_journal_import_all, handle_metrics_export,
+    handle_metrics_latency, handle_metrics_show, handle_prune_sessions, handle_search,
+    handle_vsearch, parse_retention_secs,
 };
 pub use crate::core::search::{handle_hybrid_search, handle_mget, hybrid_search_fts};
 pub use crate::core::sessions::handle_session_index;
