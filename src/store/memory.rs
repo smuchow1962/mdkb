@@ -4309,7 +4309,8 @@ mod tests {
     fn test_confidence_90_day_stale() {
         let created = 0;
         let now = 90 * 86400; // 90 days later
-        let entry = make_entry_at(created, 0, 0, None, SourceType::UserStatement);
+        let mut entry = make_entry_at(created, 0, 0, None, SourceType::UserStatement);
+        entry.entry_type = EntryType::Prior;
         let conf = entry.confidence_at(now);
         // belief=0.5, decay=e^(-1)≈0.368, source=0.85 → ~0.156
         assert!(
@@ -4347,8 +4348,10 @@ mod tests {
     fn test_confidence_access_slows_decay() {
         let created = 0;
         let now = 90 * 86400;
-        let no_access = make_entry_at(created, 0, 0, None, SourceType::UserStatement);
-        let high_access = make_entry_at(created, 0, 10, None, SourceType::UserStatement);
+        let mut no_access = make_entry_at(created, 0, 0, None, SourceType::UserStatement);
+        no_access.entry_type = EntryType::Prior;
+        let mut high_access = make_entry_at(created, 0, 10, None, SourceType::UserStatement);
+        high_access.entry_type = EntryType::Prior;
         let conf_no = no_access.confidence_at(now);
         let conf_hi = high_access.confidence_at(now);
         assert!(
@@ -4361,7 +4364,8 @@ mod tests {
     fn test_confidence_floor() {
         let created = 0;
         let now = 365 * 5 * 86400; // 5 years
-        let entry = make_entry_at(created, 0, 0, None, SourceType::Inference);
+        let mut entry = make_entry_at(created, 0, 0, None, SourceType::Inference);
+        entry.entry_type = EntryType::Prior;
         let conf = entry.confidence_at(now);
         assert!(
             (conf - CONFIDENCE_FLOOR).abs() < 0.001,
@@ -4396,7 +4400,8 @@ mod tests {
     fn test_confidence_auto_extracted_90_day_stale() {
         let created = 0;
         let now = 90 * 86400;
-        let entry = make_entry_at(created, 0, 0, None, SourceType::AutoExtracted);
+        let mut entry = make_entry_at(created, 0, 0, None, SourceType::AutoExtracted);
+        entry.entry_type = EntryType::Prior;
         let conf = entry.confidence_at(now);
         // belief=0.5, decay=e^(-1)≈0.368, source=0.70 → ~0.129
         assert!(
