@@ -10,7 +10,8 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, EmptyObject, ErrorCode, Implementation, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, EmptyObject, ErrorCode, Implementation, ServerCapabilities,
+    ServerInfo,
 };
 use rmcp::service::NotificationContext;
 use rmcp::service::RoleServer;
@@ -213,7 +214,7 @@ impl McpServer {
         self.record_persistent_call("search", tokens, result_count, false)
             .await;
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Resolve the repo handle for a tool call.
@@ -296,6 +297,11 @@ impl McpServer {
     /// Query MCP roots from the client peer and register them in the registry.
     /// Takes `peer` by value so this can run inside a detached task without
     /// blocking the server's notification loop on a slow client reply.
+    ///
+    /// Roots are deprecated by MCP SEP-2577 and rmcp marks the API as such,
+    /// but every client mdkb serves still sends them and the daemon's
+    /// multi-repo mode has no other source for the project path.
+    #[allow(deprecated)]
     async fn sync_roots_from_peer(peer: &rmcp::Peer<RoleServer>, registry: &RepoRegistry) {
         match peer.list_roots().await {
             Ok(result) => {
@@ -601,7 +607,7 @@ impl McpServer {
             .await;
         tracing::debug!("mdkb_search: {} tokens, {} results", tokens, result_count);
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Retrieve a document by ID or path, with optional line range.
@@ -625,7 +631,7 @@ impl McpServer {
             count,
             truncated
         );
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Get index status including documents, collections, and code index.
@@ -643,7 +649,7 @@ impl McpServer {
             .await;
         tracing::debug!("mdkb_status: {} tokens", tokens);
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Reindex everything: documents (from collections) and source code (from project root).
@@ -663,7 +669,7 @@ impl McpServer {
             .await;
         tracing::debug!("mdkb_update: {} tokens", tokens);
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Write or update a memory entry.
@@ -699,7 +705,7 @@ impl McpServer {
             .await;
         tracing::debug!("mdkb_memory_write: {}", output);
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Write multiple memory entries in one call.
@@ -725,7 +731,7 @@ impl McpServer {
             .await;
         tracing::debug!("mdkb_memory_write_batch: {} entries", count);
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Delete a memory entry by ID.
@@ -743,7 +749,7 @@ impl McpServer {
             .await;
         tracing::debug!("mdkb_memory_delete: {}", output);
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Record a Bayesian confirmation signal for a memory entry.
@@ -763,7 +769,7 @@ impl McpServer {
             .await;
         tracing::debug!("mdkb_memory_confirm: {}", output);
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// List memory entries with configurable sort order.
@@ -781,7 +787,7 @@ impl McpServer {
         self.record_persistent_call("memory_list", tokens, count, false)
             .await;
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     // -----------------------------------------------------------------------
@@ -806,7 +812,7 @@ impl McpServer {
         self.record_persistent_call("code_graph", tokens, 1, false)
             .await;
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Query the knowledge graph: links, backlinks, neighbors, or shortest path.
@@ -822,7 +828,7 @@ impl McpServer {
         let tokens = count_tokens(&output);
         self.record_persistent_call("graph", tokens, 1, false).await;
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 
     /// Audit token economy: session/lifetime token counts, per-tool usage, top-5 most-called.
@@ -839,7 +845,7 @@ impl McpServer {
         let tokens = count_tokens(&output);
         self.record_persistent_call("usage", tokens, 1, false).await;
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 }
 
@@ -910,26 +916,22 @@ pub(super) fn resolve_document(
     ))
 }
 
-#[tool_handler]
+// rmcp 3 defaults to `Self::tool_router()`, a fresh router on every call;
+// point it at the one this server built at construction.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "mdkb".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                ..Default::default()
-            },
-            // The surface map always ships; warmup content, when present,
-            // follows it. An agent holding an MCP tool name otherwise has no
-            // way to reach the CLI spelling of the same capability without
-            // leaving MCP (story 024-0c7e).
-            instructions: Some(match &self.warmup_instructions {
-                Some(warmup) => format!("{}\n{warmup}", surface_instructions()),
-                None => surface_instructions(),
-            }),
-        }
+        // The surface map always ships; warmup content, when present,
+        // follows it. An agent holding an MCP tool name otherwise has no
+        // way to reach the CLI spelling of the same capability without
+        // leaving MCP (story 024-0c7e).
+        let instructions = match &self.warmup_instructions {
+            Some(warmup) => format!("{}\n{warmup}", surface_instructions()),
+            None => surface_instructions(),
+        };
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("mdkb", env!("CARGO_PKG_VERSION")))
+            .with_instructions(instructions)
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {

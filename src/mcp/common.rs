@@ -1,11 +1,21 @@
 //! Shared types and middleware for HTTP/HTTPS MCP servers.
 
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
-use axum::middleware::Next;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
+use rmcp::transport::streamable_http_server::StreamableHttpService;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
 use subtle::ConstantTimeEq;
+use tokio_util::sync::CancellationToken;
+
+use super::McpServer;
 
 /// Shared state for middleware.
 #[derive(Clone, Debug)]
@@ -27,6 +37,67 @@ pub async fn health_handler(tls_enabled: bool) -> impl IntoResponse {
     }
 
     Json(response)
+}
+
+/// The router both network transports serve: `/health` open, the rmcp
+/// streamable-HTTP endpoint at `/mcp` behind the bearer-token middleware.
+///
+/// rmcp validates the `Host` header of every `/mcp` request against
+/// [`allowed_hosts`] and answers 403 to any other value. That is the
+/// DNS-rebinding guard (RUSTSEC-2026-0189): a web page the operator visits
+/// cannot reach this server through a name it controls.
+pub fn mcp_router(
+    server: McpServer,
+    bind: &str,
+    token: Option<&str>,
+    tls_enabled: bool,
+    cancellation_token: CancellationToken,
+) -> Router {
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(true)
+        .with_cancellation_token(cancellation_token)
+        .with_allowed_hosts(allowed_hosts(bind));
+
+    let session_manager = Arc::new(LocalSessionManager::default());
+
+    let mcp_service =
+        StreamableHttpService::new(move || Ok(server.clone()), session_manager, config);
+
+    let state = AppState {
+        token: token.map(String::from),
+    };
+
+    Router::new()
+        .route(
+            "/health",
+            axum::routing::get(move || health_handler(tls_enabled)),
+        )
+        .nest_service("/mcp", mcp_service)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state)
+}
+
+/// The `Host` values rmcp accepts: its loopback defaults plus the concrete
+/// address in `bind`, so a server bound to one LAN address answers clients
+/// that name that address. A wildcard bind (`0.0.0.0`, `[::]`) names no
+/// address, so it adds nothing and such a server answers loopback clients
+/// only. Entries carry no port: rmcp then accepts any port for that host.
+pub fn allowed_hosts(bind: &str) -> Vec<String> {
+    let mut hosts = StreamableHttpServerConfig::default().allowed_hosts;
+    let bound = match bind.parse::<SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => None,
+        Ok(addr) => Some(addr.ip().to_string()),
+        Err(_) => bind.rsplit_once(':').map(|(host, _)| host.to_string()),
+    };
+    if let Some(host) = bound
+        && !hosts.contains(&host)
+    {
+        hosts.push(host);
+    }
+    hosts
 }
 
 /// Bearer token authentication middleware.
@@ -71,8 +142,6 @@ pub async fn auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::Router;
-    use axum::middleware;
     use tower::ServiceExt;
 
     /// Build a test router with auth middleware and a simple OK handler.
@@ -99,6 +168,58 @@ mod tests {
         let request = req_builder.body(Body::empty()).unwrap();
         let response = router.oneshot(request).await.unwrap();
         response.status()
+    }
+
+    /// The loopback names rmcp ships stay on every list: a browser on the
+    /// same machine reaches the server as `localhost` whatever it is bound as.
+    fn assert_loopback(hosts: &[String]) {
+        for name in ["localhost", "127.0.0.1", "::1"] {
+            assert!(
+                hosts.iter().any(|h| h == name),
+                "{name} missing from {hosts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_default_bind_is_loopback_only() {
+        let hosts = allowed_hosts("127.0.0.1:8080");
+        assert_loopback(&hosts);
+        assert_eq!(hosts.len(), 3, "loopback bind adds no duplicate: {hosts:?}");
+    }
+
+    #[test]
+    fn allowed_hosts_lan_bind_adds_that_address() {
+        let hosts = allowed_hosts("192.168.1.20:8080");
+        assert_loopback(&hosts);
+        assert!(hosts.contains(&"192.168.1.20".to_string()), "{hosts:?}");
+    }
+
+    #[test]
+    fn allowed_hosts_ipv6_bind_adds_bare_address() {
+        // rmcp strips the brackets from the `Host` header before matching,
+        // so the entry must be the bare address.
+        let hosts = allowed_hosts("[fd00::7]:8080");
+        assert!(hosts.contains(&"fd00::7".to_string()), "{hosts:?}");
+    }
+
+    #[test]
+    fn allowed_hosts_wildcard_bind_adds_nothing() {
+        for bind in ["0.0.0.0:8080", "[::]:8080"] {
+            let hosts = allowed_hosts(bind);
+            assert_loopback(&hosts);
+            assert_eq!(
+                hosts.len(),
+                3,
+                "{bind} must not allow every Host: {hosts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_hostname_bind_adds_the_name() {
+        let hosts = allowed_hosts("mdkb.internal:8080");
+        assert!(hosts.contains(&"mdkb.internal".to_string()), "{hosts:?}");
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@
 //! these fields, not just the id/title/type the formatter used to emit.
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, RawContent};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 use mdkb::cli::handlers::handle_init;
 use mdkb::core::Context;
@@ -17,8 +17,8 @@ fn first_text(result: &CallToolResult) -> String {
     result
         .content
         .iter()
-        .find_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.clone()),
+        .find_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.clone()),
             _ => None,
         })
         .unwrap_or_default()

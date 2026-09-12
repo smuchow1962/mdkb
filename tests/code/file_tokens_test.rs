@@ -8,7 +8,7 @@
 use std::fs;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::RawContent;
+use rmcp::model::ContentBlock;
 
 use mdkb::cli::handlers::{handle_code_index, handle_init};
 use mdkb::code::indexing::IndexFacade;
@@ -94,8 +94,8 @@ pub struct UniqueGreeterStruct {
     let text = result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
