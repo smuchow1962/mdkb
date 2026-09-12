@@ -523,11 +523,6 @@ pub fn get_provenance(conn: &Connection, id: &str) -> Result<(Option<String>, Op
     Ok(row.unwrap_or((None, None)))
 }
 
-/// Confirm a memory entry — positive confidence signal.
-///
-/// Increments confirmations counter, updates last_confirmed_at.
-/// Auto-restores archived entries to active (strong relevance signal).
-/// Returns error if entry is superseded.
 /// Map a confirmation outcome string to a Bayesian delta.
 /// `"confirmed"` → +1, `"refuted"` → -1 (floor 0). Any other value errors.
 /// Shared by the MCP `memory_confirm` tool and the CLI `memory confirm` command.
@@ -542,6 +537,15 @@ pub fn outcome_to_delta(outcome: &str) -> Result<i32> {
     }
 }
 
+/// Apply a confidence signal of `delta` confirmations to a memory entry.
+///
+/// A positive delta is a fresh verification: it raises the counter and moves
+/// `last_confirmed_at` to now, which restarts the decay clock. A negative
+/// delta only lowers the counter (floor 0) and leaves the clock alone — a
+/// refutation is not evidence the entry was just checked and found good, so
+/// it must never make the entry more confident. A zero delta changes nothing.
+/// Auto-restores archived entries to active on a positive delta (strong
+/// relevance signal). Returns error if entry is superseded.
 pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> {
     let entry = get_entry_without_tracking(conn, id)?
         .ok_or_else(|| ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")))?;
@@ -567,7 +571,7 @@ pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> 
     let status_changed = new_status != entry.status.to_string();
     conn.execute(
         "UPDATE memory_entries SET confirmations = MAX(0, CAST(confirmations AS INTEGER) + ?1), \
-         last_confirmed_at = ?2, status = ?3, \
+         last_confirmed_at = CASE WHEN ?1 > 0 THEN ?2 ELSE last_confirmed_at END, status = ?3, \
          updated_at = CASE WHEN ?5 THEN ?2 ELSE updated_at END WHERE id = ?4",
         params![delta, now, new_status, id, status_changed],
     )?;
@@ -4582,6 +4586,113 @@ mod tests {
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
         assert_eq!(updated.confirmations, 1);
         assert!(updated.last_confirmed_at.is_some());
+    }
+
+    /// A positive signal is a fresh verification: the decay clock moves to now.
+    #[test]
+    fn test_confirm_moves_decay_clock_forward() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let stale = now - 60 * 86400;
+        let entry = make_entry_at(
+            now - 90 * 86400,
+            0,
+            0,
+            Some(stale),
+            SourceType::UserStatement,
+        );
+        add_entry(&conn, &entry).unwrap();
+        let before = entry.confidence_at(now);
+
+        confirm_entry(&conn, "test", 1).unwrap();
+
+        let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        assert_eq!(updated.confirmations, 1);
+        assert!(
+            updated.last_confirmed_at.is_some_and(|t| t >= now),
+            "confirm must move the decay clock to now, got {:?}",
+            updated.last_confirmed_at
+        );
+        assert!(updated.confidence_at(now) > before);
+    }
+
+    /// Refuting is a negative signal, so it must never make an entry look
+    /// more trustworthy. At 0 confirmations the counter cannot drop, and a
+    /// reset decay clock was the only effect: the refuted entry came out MORE
+    /// confident than before.
+    #[test]
+    fn test_refute_at_zero_confirmations_never_raises_confidence() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let entry = make_entry_at(now - 60 * 86400, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+        let before = entry.confidence_at(now);
+
+        let result = confirm_entry(&conn, "test", -1).unwrap();
+        assert!(result.contains("Refuted"), "{result}");
+
+        let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        assert_eq!(updated.confirmations, 0);
+        assert_eq!(
+            updated.last_confirmed_at, None,
+            "refute must not move the decay clock"
+        );
+        let after = updated.confidence_at(now);
+        assert!(
+            after <= before,
+            "refute raised confidence: {before} -> {after}"
+        );
+    }
+
+    /// With confirmations to lose, refuting drops the counter and leaves the
+    /// decay clock where the last real verification put it.
+    #[test]
+    fn test_refute_drops_confirmations_and_keeps_decay_clock() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let stale = now - 60 * 86400;
+        let entry = make_entry_at(
+            now - 90 * 86400,
+            3,
+            0,
+            Some(stale),
+            SourceType::UserStatement,
+        );
+        add_entry(&conn, &entry).unwrap();
+        let before = entry.confidence_at(now);
+
+        confirm_entry(&conn, "test", -1).unwrap();
+
+        let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        assert_eq!(updated.confirmations, 2);
+        assert_eq!(updated.last_confirmed_at, Some(stale));
+        let after = updated.confidence_at(now);
+        assert!(
+            after <= before,
+            "refute raised confidence: {before} -> {after}"
+        );
+    }
+
+    /// A zero delta carries no evidence either way: nothing moves.
+    #[test]
+    fn test_zero_delta_leaves_confirmations_and_decay_clock() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let stale = now - 60 * 86400;
+        let entry = make_entry_at(
+            now - 90 * 86400,
+            2,
+            0,
+            Some(stale),
+            SourceType::UserStatement,
+        );
+        add_entry(&conn, &entry).unwrap();
+
+        confirm_entry(&conn, "test", 0).unwrap();
+
+        let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        assert_eq!(updated.confirmations, 2);
+        assert_eq!(updated.last_confirmed_at, Some(stale));
     }
 
     #[test]
