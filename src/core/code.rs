@@ -15,6 +15,8 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
+
 use crate::code::storage::NameMatch;
 use crate::error::{Error, Result};
 
@@ -59,7 +61,7 @@ pub fn handle_code_index(
             .update(root)
             .map_err(|e| Error::other(format!("Indexing failed: {}", e)))
     } else {
-        index_paths(&mut facade, root, paths).map_err(|e| Error::other(e.to_string()))
+        index_paths(&mut facade, root, paths).map_err(|e| Error::other(format!("{e:#}")))
     };
     crate::llm::release_cached_service();
     result
@@ -94,9 +96,11 @@ pub fn index_paths(
         if !canonical.starts_with(&root_canonical) {
             anyhow::bail!("Path '{p}' escapes project root");
         }
+        // `.context`, not a rebuilt message: `run_code_mutation` walks the chain
+        // for the SQLite cause, and a fresh `anyhow!` string has no chain.
         let stats = facade
             .index_scope(&root_canonical, &canonical)
-            .map_err(|e| anyhow::anyhow!("Indexing '{p}' failed: {e}"))?;
+            .with_context(|| format!("Indexing '{p}' failed"))?;
         total.absorb(&stats);
     }
     Ok(total)
@@ -112,7 +116,7 @@ pub fn handle_code_reindex(
 
     let result = reindex_paths(&mut facade, root, paths);
     crate::llm::release_cached_service();
-    result.map_err(|e| Error::other(e.to_string()))
+    result.map_err(|e| Error::other(format!("{e:#}")))
 }
 
 /// Reindex through an already-open facade owned by the daemon.
@@ -145,7 +149,7 @@ pub fn reindex_paths(
 
     facade
         .reindex_scope(&root_canonical, &scope)
-        .map_err(|e| anyhow::anyhow!("Reindexing failed: {e}"))
+        .context("Reindexing failed")
 }
 /// Translate a `kind` filter to its stored spelling, with the message both the
 /// CLI and the MCP server report for an unknown kind.

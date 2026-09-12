@@ -2192,8 +2192,8 @@ pub async fn update_impl(
                 None,
             ),
             Some(Err(e)) => {
-                tracing::error!("Code reindex failed: {e}");
-                (None, Some(e.to_string()))
+                tracing::error!("Code reindex failed: {e:#}");
+                (None, Some(format!("{e:#}")))
             }
             None => (None, None),
         }
@@ -4409,7 +4409,7 @@ async fn cli_mutate_impl(
                     }
                 })
                 .ok_or_else(|| mcp_error("Code index not initialized"))?
-                .map_err(|e| mcp_error(format!("Code indexing failed: {e}")))?;
+                .map_err(|e| mcp_error(format!("Code indexing failed: {e:#}")))?;
             crate::llm::release_cached_service();
             Ok(CliMutationResult::CodeIndexed { stats })
         }

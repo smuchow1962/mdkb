@@ -28,6 +28,11 @@ use crate::error::Result;
 /// Re-run the integrity probe at most once per this interval per database.
 pub const CHECK_INTERVAL: Duration = Duration::from_hours(6);
 
+/// How long a probe waits on a locked database before it gives up. One value
+/// for `index.sqlite` and `code.sqlite`, so both indexes tolerate the same
+/// contention before an open fails.
+pub const PROBE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Outcome of [`ensure_sound`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Heal {
@@ -105,32 +110,73 @@ pub fn invalidate_marker(db_path: &Path) {
     let _ = std::fs::remove_file(marker_path(db_path));
 }
 
-/// Run `PRAGMA quick_check`; `true` iff the database is structurally sound.
+/// What one `PRAGMA quick_check` probe established about a database file.
+#[derive(Debug)]
+pub enum Soundness {
+    /// `quick_check` answered `ok`.
+    Sound,
+    /// The file is torn: `quick_check` described damage, or SQLite could not
+    /// read the file as a database at all. `reason` is SQLite's own wording.
+    Corrupt { reason: String },
+    /// The probe reached no verdict: the file was locked (`SQLITE_BUSY`),
+    /// unreadable (`SQLITE_IOERR`), or memory ran out. The file may be healthy,
+    /// so the caller must leave it in place and report the error instead.
+    Undetermined(rusqlite::Error),
+}
+
+/// Open a throwaway connection for an integrity probe.
+///
+/// A fresh connection, because a long-lived one answers `quick_check` out of
+/// its own page cache and reports a torn file as sound. Read-write, like every
+/// other connection to this file, so closing it checkpoints and removes the
+/// `-wal`/`-shm` it created instead of leaving them for the quarantine to move.
+/// Waits [`PROBE_BUSY_TIMEOUT`] on a lock: a probe that gives up at once turns
+/// every concurrent writer into a `BUSY` verdict.
+fn open_probe(db_path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    conn.busy_timeout(PROBE_BUSY_TIMEOUT)?;
+    Ok(conn)
+}
+
+/// Run `PRAGMA quick_check` and classify the answer.
 ///
 /// `quick_check` returns the single row `"ok"` on a clean database and one row
-/// per problem otherwise. An `Err` means the file could not even be probed
-/// (`SQLITE_NOTADB`, `SQLITE_CORRUPT`) — also treated as unsound.
-pub fn is_structurally_sound(conn: &Connection) -> bool {
+/// per problem otherwise. An `Err` is [`Soundness::Corrupt`] only when SQLite
+/// names the file as the problem ([`crate::error::is_sqlite_corruption`]);
+/// any other failure is [`Soundness::Undetermined`], because a lock or an I/O
+/// fault says nothing about the bytes on disk.
+pub fn is_structurally_sound(conn: &Connection) -> Soundness {
     match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
-        Ok(first) => first == "ok",
-        Err(_) => false,
+        Ok(first) if first == "ok" => Soundness::Sound,
+        Ok(first) => Soundness::Corrupt { reason: first },
+        Err(e) if crate::error::is_sqlite_corruption(&e) => Soundness::Corrupt {
+            reason: e.to_string(),
+        },
+        Err(e) => Soundness::Undetermined(e),
     }
 }
 
-/// Verify a live connection after an index-wide mutation and record success.
+/// Verify a connection after an index-wide mutation and record success.
 ///
-/// The caller must hold the project mutation lock. On failure the marker stays
-/// absent, forcing the next process to quarantine/rebuild before normal use.
+/// The caller must hold the project mutation lock. On corruption the marker is
+/// removed, forcing the next process to quarantine/rebuild before normal use.
+/// An undetermined probe neither certifies nor condemns: the marker is left as
+/// it is and the probe's own error is returned.
 pub fn verify_and_mark(conn: &Connection, db_path: &Path) -> Result<()> {
-    if !is_structurally_sound(conn) {
-        invalidate_marker(db_path);
-        return Err(crate::error::ErrorKind::IndexCorrupt {
-            path: db_path.to_path_buf(),
+    match is_structurally_sound(conn) {
+        Soundness::Sound => {
+            touch_marker(&marker_path(db_path));
+            Ok(())
         }
-        .into());
+        Soundness::Corrupt { .. } => {
+            invalidate_marker(db_path);
+            Err(crate::error::ErrorKind::IndexCorrupt {
+                path: db_path.to_path_buf(),
+            }
+            .into())
+        }
+        Soundness::Undetermined(e) => Err(e.into()),
     }
-    touch_marker(&marker_path(db_path));
-    Ok(())
 }
 
 /// [`verify_and_mark`], skipped when the last probe is younger than
@@ -163,20 +209,8 @@ pub fn verify_and_mark_throttled_at(
     // connection answers `quick_check` out of its own page cache, so damage
     // written to the file underneath it — the whole failure mode this guards —
     // reads back as sound. A fresh connection sees the file (plus its WAL).
-    let sound = {
-        let probe = Connection::open(db_path)?;
-        is_structurally_sound(&probe)
-    };
-
-    if !sound {
-        invalidate_marker(db_path);
-        return Err(crate::error::ErrorKind::IndexCorrupt {
-            path: db_path.to_path_buf(),
-        }
-        .into());
-    }
-    touch_marker(&marker_path(db_path));
-    Ok(())
+    let probe = open_probe(db_path)?;
+    verify_and_mark(&probe, db_path)
 }
 
 /// Rename `db_path` and its `-wal`/`-shm` sidecars to `*.corrupt-<unix_secs>` so
@@ -605,14 +639,20 @@ fn ensure_sound_at_locked(db_path: &Path, interval: Duration, now: SystemTime) -
     }
 
     // Probe on a throwaway connection so no open handle survives the rename.
-    let sound = {
-        let conn = Connection::open(db_path)?;
-        is_structurally_sound(&conn)
+    let verdict = {
+        let probe = open_probe(db_path)?;
+        is_structurally_sound(&probe)
     };
 
-    if sound {
-        touch_marker(&marker);
-        return Ok(Heal::Sound);
+    match verdict {
+        Soundness::Sound => {
+            touch_marker(&marker);
+            return Ok(Heal::Sound);
+        }
+        Soundness::Corrupt { .. } => {}
+        // A locked or unreadable file is not a torn one. Leave it where it is,
+        // leave the marker alone, and let the caller report why the open failed.
+        Soundness::Undetermined(e) => return Err(e.into()),
     }
 
     // Only rename when nobody is holding the database open — see [`Heal::CorruptInUse`].
@@ -653,7 +693,7 @@ mod tests {
         make_db(&db);
 
         let conn = Connection::open(&db).unwrap();
-        assert!(is_structurally_sound(&conn));
+        assert!(matches!(is_structurally_sound(&conn), Soundness::Sound));
     }
 
     #[test]
@@ -663,7 +703,10 @@ mod tests {
         std::fs::write(&db, b"this is definitely not a sqlite database").unwrap();
 
         let conn = Connection::open(&db).unwrap();
-        assert!(!is_structurally_sound(&conn));
+        assert!(matches!(
+            is_structurally_sound(&conn),
+            Soundness::Corrupt { .. }
+        ));
     }
 
     #[test]
@@ -680,7 +723,31 @@ mod tests {
         drop(f);
 
         let conn = Connection::open(&db).unwrap();
-        assert!(!is_structurally_sound(&conn));
+        assert!(matches!(
+            is_structurally_sound(&conn),
+            Soundness::Corrupt { .. }
+        ));
+    }
+
+    #[test]
+    fn a_locked_database_probes_as_undetermined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        let holder = Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        // rusqlite gives every connection a 5 s busy timeout; zero it so the
+        // verdict is immediate.
+        let probe = Connection::open(&db).unwrap();
+        probe.busy_timeout(Duration::ZERO).unwrap();
+        let verdict = is_structurally_sound(&probe);
+
+        assert!(
+            matches!(verdict, Soundness::Undetermined(_)),
+            "BUSY says nothing about the file: {verdict:?}"
+        );
+        drop(holder);
     }
 
     #[test]
@@ -892,6 +959,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.sqlite");
         assert_eq!(ensure_sound(&db).unwrap(), Heal::Sound);
+    }
+
+    /// Names in `dir` that carry the quarantine suffix.
+    fn quarantined_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".corrupt-"))
+            .collect()
+    }
+
+    #[test]
+    fn a_locked_database_is_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+
+        // Another connection holds the write lock for the whole probe. The db
+        // is in rollback-journal mode, so that lock also keeps readers out and
+        // `quick_check` comes back with SQLITE_BUSY — a fact about the lock,
+        // not about the file.
+        let holder = Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let outcome = ensure_sound(&db);
+
+        let err = outcome.expect_err("a locked file yields no verdict, so the open fails");
+        assert!(
+            !err.is_index_corrupt(),
+            "BUSY must not be reported as corruption: {err}"
+        );
+        assert!(
+            db.exists(),
+            "the locked file stays where its holder sees it"
+        );
+        assert!(
+            quarantined_names(dir.path()).is_empty(),
+            "nothing may be quarantined on an undetermined probe"
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn a_truncated_database_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        let f = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        f.set_len(100).unwrap();
+        drop(f);
+
+        let outcome = ensure_sound(&db).unwrap();
+
+        assert!(
+            matches!(outcome, Heal::Quarantined { .. }),
+            "a torn file is corrupt, not undetermined: {outcome:?}"
+        );
+        assert!(!db.exists(), "path is freed for a fresh database");
+        assert_eq!(quarantined_names(dir.path()).len(), 1);
     }
 
     /// A database with memory rows, standing in for the quarantined file.

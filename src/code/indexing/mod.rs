@@ -994,14 +994,9 @@ fn is_corruption(err: &anyhow::Error) -> bool {
         if let Some(e) = cause.downcast_ref::<crate::error::Error>() {
             return e.is_index_corrupt();
         }
-        matches!(
-            cause.downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::SqliteFailure(e, _))
-                if matches!(
-                    e.code,
-                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
-                )
-        )
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(crate::error::is_sqlite_corruption)
     })
 }
 
@@ -1306,6 +1301,31 @@ pub fn world() {
 
         let keys: Vec<String> = facade.db.get_file_mtimes().unwrap().into_keys().collect();
         assert_eq!(keys, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn a_torn_file_under_path_scoped_indexing_is_classified_as_corruption() {
+        let (src_dir, db_dir, mut facade) = project_with_a_source_subdir();
+        let root = src_dir.path();
+        facade.index_scope(root, &root.join("src")).unwrap();
+
+        // Leave WAL so the next read re-checks the file header instead of the
+        // WAL index, then tear the file under the open connection. A whole page
+        // of garbage, so SQLite sees a foreign file rather than a short read.
+        facade
+            .db
+            .conn()
+            .execute_batch("PRAGMA journal_mode=DELETE")
+            .unwrap();
+        fs::write(db_dir.path().join("code.sqlite"), vec![0xA5_u8; 8192]).unwrap();
+
+        let err = crate::core::code::index_paths(&mut facade, root, &["src".to_string()])
+            .expect_err("indexing over a torn file must fail");
+
+        assert!(
+            is_corruption(&err),
+            "the daemon closes its handle only when the SQLite cause survives the wrap: {err:#}"
+        );
     }
 
     #[test]
