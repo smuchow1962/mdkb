@@ -51,7 +51,22 @@ fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {
 fn prepare_home() -> TempDir {
     let home = TempDir::new().unwrap();
     std::fs::create_dir_all(home.path().join(".mdkb")).unwrap();
+    std::fs::create_dir_all(home.path().join("repo")).unwrap();
     home
+}
+
+/// The binary under an isolated `HOME`, run from a scratch repo inside it.
+///
+/// The store is per repo, not per `HOME`: a process started from the
+/// developer checkout indexes and mutates that checkout's live `.mdkb/`
+/// next to the developer's daemon, which is how the live index went corrupt
+/// on 2026-09-12. `serve` creates a fresh store in an empty directory.
+fn mdkb(home: &TempDir) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env("HOME", home.path())
+        .env("MDKB_NO_DAEMON", "1")
+        .current_dir(home.path().join("repo"));
+    cmd
 }
 
 /// `mdkb serve --daemon --detach` returns immediately; the real daemon is
@@ -60,11 +75,10 @@ fn prepare_home() -> TempDir {
 fn detach_survives_parent_exit() {
     let home = prepare_home();
 
-    let output = Command::new(BIN)
+    let output = mdkb(&home)
         .arg("serve")
         .arg("--daemon")
         .arg("--detach")
-        .env("HOME", home.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -99,11 +113,10 @@ fn status_stop_restart_cycle() {
     let home = prepare_home();
 
     // Start the daemon (detached so the test doesn't have to wait on it).
-    let start = Command::new(BIN)
+    let start = mdkb(&home)
         .arg("serve")
         .arg("--daemon")
         .arg("--detach")
-        .env("HOME", home.path())
         .output()
         .expect("spawn daemon");
     assert!(start.status.success());
@@ -112,10 +125,9 @@ fn status_stop_restart_cycle() {
     }));
 
     // status: should print "running"
-    let status = Command::new(BIN)
+    let status = mdkb(&home)
         .arg("daemon")
         .arg("status")
-        .env("HOME", home.path())
         .output()
         .expect("daemon status");
     let status_text = String::from_utf8_lossy(&status.stdout).into_owned();
@@ -128,10 +140,9 @@ fn status_stop_restart_cycle() {
     let pid_before = read_pid(home.path()).unwrap();
 
     // stop: should reap sockets and release the lock.
-    let stop = Command::new(BIN)
+    let stop = mdkb(&home)
         .arg("daemon")
         .arg("stop")
-        .env("HOME", home.path())
         .output()
         .expect("daemon stop");
     assert!(
@@ -144,10 +155,9 @@ fn status_stop_restart_cycle() {
     assert!(!mcp_socket(home.path()).exists());
 
     // restart from a stopped state: fresh pid, sockets back.
-    let restart = Command::new(BIN)
+    let restart = mdkb(&home)
         .arg("daemon")
         .arg("restart")
-        .env("HOME", home.path())
         .output()
         .expect("daemon restart");
     assert!(
@@ -180,7 +190,8 @@ fn http_server_exits_on_sigterm() {
     let port = listener.local_addr().expect("local_addr").port();
     drop(listener);
 
-    let mut child = Command::new(BIN)
+    let home = prepare_home();
+    let mut child = mdkb(&home)
         .arg("serve")
         .arg("--http")
         .arg("--bind")
