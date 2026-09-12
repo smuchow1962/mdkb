@@ -201,6 +201,18 @@ impl CodeDb {
         Ok(id)
     }
 
+    /// Record whether tree-sitter recovered from a syntax error in this file.
+    ///
+    /// The file row is inserted before symbols and relationships, so this is a
+    /// separate update rather than widening `insert_file`'s widely used API.
+    pub fn set_file_has_error(&self, file_id: i64, has_error: bool) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE code_files SET has_error = ?2 WHERE id = ?1",
+            params![file_id, has_error],
+        )?;
+        Ok(())
+    }
+
     /// Record an import statement found in `file_id`.
     ///
     /// `OR IGNORE` against `idx_imports_unique`: a file re-indexed without its

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::code::indexing::hasher;
 use crate::code::indexing::module_path::module_path_for;
@@ -33,7 +33,7 @@ use crate::code::parsing::java::JavaParser;
 use crate::code::parsing::kotlin::KotlinParser;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::lua::LuaParser;
-use crate::code::parsing::parser::{LanguageParser, ReceiverType, split_call_target};
+use crate::code::parsing::parser::{split_call_target, LanguageParser, ReceiverType};
 use crate::code::parsing::php::PhpParser;
 use crate::code::parsing::python::PythonParser;
 use crate::code::parsing::rust::RustParser;
@@ -388,7 +388,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
     let mut parsers: HashMap<Language, Option<Box<dyn LanguageParser>>> = HashMap::new();
 
     while let Ok(fc) = rx.recv() {
-        let Some(language) = Language::from_path(&fc.path) else {
+        let Some(language) = Language::from_path_and_content(&fc.path, &fc.content) else {
             tracing::warn!(
                 "Unsupported or unknown language for file: {}",
                 fc.path.display()
@@ -412,6 +412,13 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
         let mut counter = SymbolCounter::new();
 
         let symbols = parser.parse(&fc.content, dummy_file_id, &mut counter);
+        // Tree-sitter produces a recoverable tree for many syntax errors. Its
+        // extracted symbols remain useful, but the file must carry the error
+        // bit so a sparse result is never mistaken for a clean parse.
+        let has_error = parser
+            .tree(&fc.content)
+            .map_or(true, |tree| tree.root_node().has_error());
+        errors += u32::from(has_error);
         let calls = parser.find_calls(&fc.content);
         let macro_expansions = parser.find_macro_expansions(&fc.content);
         let implementations = parser.find_implementations(&fc.content);
@@ -546,6 +553,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
             path: fc.path,
             content_hash: fc.hash,
             language,
+            has_error,
             token_estimate: fc.token_estimate,
             raw_symbols,
             raw_relationships,
@@ -585,10 +593,11 @@ fn stage_collect(
         relationships_collected: 0,
     };
 
-    // Cache for resolving from_id in relationships: (name, file_id, range) → SymbolId
-    let mut symbol_lookup: HashMap<(Box<str>, u32, u32), SymbolId> = HashMap::new();
-    // Fallback: (name, file_id) → SymbolId
-    let mut name_in_file: HashMap<(Box<str>, u32), SymbolId> = HashMap::new();
+    // Symbols sharing a name are legal (for example, default methods in
+    // separate traits). Attribute a call to the symbol whose source span
+    // encloses its call site; a `(name, file)` fallback would silently choose
+    // whichever same-named declaration was processed last.
+    let mut symbols_in_file: HashMap<(Box<str>, u32), Vec<(Range, SymbolId)>> = HashMap::new();
 
     while let Ok(parsed) = rx.recv() {
         file_counter += 1;
@@ -608,6 +617,7 @@ fn stage_collect(
             file_id,
             content_hash: parsed.content_hash,
             language: parsed.language,
+            has_error: parsed.has_error,
             mtime,
             token_estimate: parsed.token_estimate,
         });
@@ -620,13 +630,12 @@ fn stage_collect(
         for raw in parsed.raw_symbols {
             let sym_id = symbol_counter.next_id();
 
-            // Cache for relationship resolution
+            // Cache the declaration range for caller attribution below.
             let name_key: Box<str> = (*raw.name).into();
-            symbol_lookup.insert(
-                (name_key.clone(), file_id.value(), raw.range.start_line),
-                sym_id,
-            );
-            name_in_file.insert((name_key, file_id.value()), sym_id);
+            symbols_in_file
+                .entry((name_key, file_id.value()))
+                .or_default()
+                .push((raw.range, sym_id));
 
             let symbol = Symbol {
                 id: sym_id,
@@ -647,14 +656,25 @@ fn stage_collect(
 
         // Create synthetic <module> symbol if any relationship uses it as caller
         let module_key: Box<str> = "<module>".into();
-        if !name_in_file.contains_key(&(module_key.clone(), file_id.value()))
+        if !symbols_in_file.contains_key(&(module_key.clone(), file_id.value()))
             && parsed
                 .raw_relationships
                 .iter()
                 .any(|r| &*r.from_name == "<module>")
         {
             let sym_id = symbol_counter.next_id();
-            name_in_file.insert((module_key, file_id.value()), sym_id);
+            symbols_in_file.insert(
+                (module_key, file_id.value()),
+                vec![(
+                    Range {
+                        start_line: 0,
+                        start_column: 0,
+                        end_line: u32::MAX,
+                        end_column: u16::MAX,
+                    },
+                    sym_id,
+                )],
+            );
 
             let symbol = Symbol {
                 id: sym_id,
@@ -681,17 +701,26 @@ fn stage_collect(
 
         // Convert raw relationships, resolving from_id where possible
         for raw_rel in parsed.raw_relationships {
-            let from_id = symbol_lookup
-                .get(&(
-                    raw_rel.from_name.clone(),
-                    file_id.value(),
-                    raw_rel.from_range.start_line,
-                ))
-                .copied()
-                .or_else(|| {
-                    name_in_file
-                        .get(&(raw_rel.from_name.clone(), file_id.value()))
-                        .copied()
+            let from_id = symbols_in_file
+                .get(&(raw_rel.from_name.clone(), file_id.value()))
+                .and_then(|symbols| {
+                    symbols
+                        .iter()
+                        .filter(|(range, _)| {
+                            range.contains(
+                                raw_rel.from_range.start_line,
+                                raw_rel.from_range.start_column,
+                            )
+                        })
+                        // Nested callables with the same name are unusual but
+                        // valid. The narrowest enclosing span is the caller.
+                        .min_by_key(|(range, _)| {
+                            (
+                                range.end_line.saturating_sub(range.start_line),
+                                range.end_column.saturating_sub(range.start_column),
+                            )
+                        })
+                        .map(|(_, id)| *id)
                 });
 
             batch.unresolved_relationships.push(CollectedRelationship {
@@ -772,6 +801,7 @@ fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyho
             Some(reg.mtime as i64),
             Some(i64::from(reg.token_estimate)),
         )?;
+        db.set_file_has_error(real_id, reg.has_error)?;
         file_id_map.insert(reg.file_id.value(), real_id);
         stats.files_discovered += 1;
         stats.files_indexed += 1;
@@ -973,6 +1003,29 @@ struct Foo {
     }
 
     #[test]
+    fn cpp_header_is_indexed_with_cpp_language() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("widget.h"),
+            "namespace engine { class Widget { public: void draw(); }; }\n",
+        )
+        .unwrap();
+
+        let (_db_dir, db) = temp_db();
+        index_directory(dir.path(), &db, &test_config()).unwrap();
+
+        let language: String = db
+            .conn()
+            .query_row(
+                "SELECT language FROM code_files WHERE rel_path = 'widget.h'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(language, "cpp");
+    }
+
+    #[test]
     fn test_index_extracts_relationships() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -1091,6 +1144,78 @@ fn callee() {}
         assert!(
             stats.symbols_indexed >= 1,
             "the supported file must still be indexed"
+        );
+    }
+
+    #[test]
+    fn syntax_errors_are_persisted_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("broken.rs"), "fn incomplete( {\n").unwrap();
+
+        let (_db_dir, db) = temp_db();
+        let stats = index_directory(dir.path(), &db, &test_config()).unwrap();
+
+        assert_eq!(stats.parse_errors, 1, "tree-sitter error must be reported");
+        assert_eq!(
+            db.file_count().unwrap(),
+            1,
+            "recoverable trees stay indexed"
+        );
+        let has_error: bool = db
+            .conn()
+            .query_row(
+                "SELECT has_error FROM code_files WHERE rel_path = 'broken.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_error, "the per-file parse error bit must be persisted");
+    }
+
+    #[test]
+    fn caller_attribution_uses_the_enclosing_same_named_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            "struct First;\n\
+             impl First {\n\
+                 fn default() { first_target(); }\n\
+             }\n\
+             struct Second;\n\
+             impl Second {\n\
+                 fn default() { second_target(); }\n\
+             }\n\
+             fn first_target() {}\n\
+             fn second_target() {}\n",
+        )
+        .unwrap();
+
+        let (_db_dir, db) = temp_db();
+        index_directory(dir.path(), &db, &test_config()).unwrap();
+
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT r.to_name, s.line_start \
+                 FROM code_relationships r \
+                 JOIN code_symbols s ON s.id = r.from_symbol_id \
+                 WHERE r.to_name IN ('first_target', 'second_target') \
+                 ORDER BY r.to_name",
+            )
+            .unwrap();
+        let callers: Vec<(String, u32)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(
+            callers,
+            vec![
+                ("first_target".to_string(), 2),
+                ("second_target".to_string(), 6)
+            ],
+            "each call must be attached to the enclosing `default`, not the last one"
         );
     }
 

@@ -11,10 +11,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
+use crate::code::duplication::candidates::MAX_SUPPRESSING_TIER;
+use crate::code::storage::resolved_edges;
 use crate::error::{Error, Result};
-use crate::git::{CoChangeHistory, co_change_history};
+use crate::git::{co_change_history, CoChangeHistory};
 
 /// Fewest co-changing commits before a pair is worth reporting.
 ///
@@ -204,25 +206,25 @@ fn count_cochanges(
 /// Every unordered file pair the code graph already connects, in either
 /// direction.
 ///
-/// Matched by name against `code_relationships.to_name`, the same
-/// name-equality join `CodeDb::get_call_targets` uses to classify an edge —
-/// this reuses that heuristic rather than inventing a stricter one, so a name
-/// this audit calls "connected" is a name the call graph itself would have
-/// resolved a candidate for. One query producing the whole connected set is
-/// cheaper than one query per candidate pair, and fast enough (measured
-/// under 0.3s end to end on mdkb's own history) that this reruns from
-/// scratch every time rather than needing a cache.
+/// Uses the same `Calls` candidate cascade as the duplication pass. A bare
+/// name match is only a hypothesis, so it must not hide a co-change pair: only
+/// candidates the cascade placed at tiers 1–2 count as an existing connection.
+/// The cascade itself carries the callable-kind filter, which means a field or
+/// module sharing a call's name cannot suppress a finding either.
 fn connected_file_pairs(code: &Connection) -> Result<HashSet<(String, String)>> {
-    let mut stmt = code.prepare(
+    let edges = resolved_edges("r.from_symbol_id IS NOT NULL");
+    let mut stmt = code.prepare(&format!(
         "SELECT DISTINCT ff.rel_path, tf.rel_path \
-         FROM code_relationships r \
-         JOIN code_symbols fs ON fs.id = r.from_symbol_id \
+         FROM ({edges}) e \
+         JOIN code_symbols fs ON fs.id = e.from_id \
          JOIN code_files ff ON fs.file_id = ff.id \
-         JOIN code_symbols ts ON ts.name = r.to_name \
+         JOIN code_symbols ts ON ts.id = e.sym_id \
          JOIN code_files tf ON ts.file_id = tf.id \
-         WHERE ff.rel_path <> tf.rel_path",
-    )?;
-    let rows = stmt.query_map([], |row| {
+         WHERE e.tier = e.nearest \
+           AND e.nearest <= ?1 \
+           AND ff.rel_path <> tf.rel_path"
+    ))?;
+    let rows = stmt.query_map(params![MAX_SUPPRESSING_TIER], |row| {
         let a: String = row.get(0)?;
         let b: String = row.get(1)?;
         Ok(normalize_pair(a, b))
@@ -255,7 +257,11 @@ fn indexed_file_set(code: &Connection) -> Result<HashSet<String>> {
 /// A pair in a fixed order, so the same two files always hash to the same key
 /// regardless of which one git or the graph query happened to name first.
 fn normalize_pair(a: String, b: String) -> (String, String) {
-    if a <= b { (a, b) } else { (b, a) }
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 /// Order findings worst-first: most co-changes first, then alphabetically for
@@ -457,14 +463,15 @@ mod tests {
             )
             .unwrap();
             code.execute(
-                "INSERT INTO code_symbols (id, name, kind, file_id, file_path, visibility, line_start, line_end) \
-                 VALUES (101, ?1, 'Function', ?2, ?3, 0, 0, 3)",
+                "INSERT INTO code_symbols (id, name, kind, file_id, file_path, visibility, line_start, line_end, owner_name) \
+                 VALUES (101, ?1, 'Function', ?2, ?3, 0, 0, 3, 'Target')",
                 rusqlite::params![callee_sym, callee_file_id, callee_file],
             )
             .unwrap();
             code.execute(
-                "INSERT INTO code_relationships (from_symbol_id, from_name, to_name, kind, file_id) \
-                 VALUES (100, ?1, ?2, 'Calls', ?3)",
+                "INSERT INTO code_relationships \
+                 (from_symbol_id, from_name, to_name, kind, file_id, to_qualifier) \
+                 VALUES (100, ?1, ?2, 'Calls', ?3, 'Target')",
                 rusqlite::params![caller_sym, callee_sym, caller_file_id],
             )
             .unwrap();
@@ -590,6 +597,73 @@ mod tests {
             report.markdown.contains("No hidden coupling"),
             "{}",
             report.markdown
+        );
+    }
+
+    #[test]
+    fn a_bare_name_call_at_the_unplaced_tier_does_not_suppress_coupling() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        cochange_n_times(root.path(), &["src/a.rs", "src/b.rs"], 5);
+        code_index(root.path(), &["src/a.rs", "src/b.rs"], None);
+        let code = Connection::open(root.path().join(".mdkb/code.sqlite")).unwrap();
+        code.execute(
+            "INSERT INTO code_symbols \
+             (id, name, kind, file_id, file_path, visibility, line_start, line_end) \
+             VALUES (100, 'caller', 'Function', 1, 'src/a.rs', 0, 0, 3), \
+                    (101, 'target', 'Function', 2, 'src/b.rs', 0, 0, 3)",
+            [],
+        )
+        .unwrap();
+        code.execute(
+            "INSERT INTO code_relationships (from_symbol_id, from_name, to_name, kind, file_id) \
+             VALUES (100, 'caller', 'target', 'Calls', 1)",
+            [],
+        )
+        .unwrap();
+        drop(code);
+
+        let report = handle_coupling(
+            root.path(),
+            &CouplingOverrides {
+                min_cochanges: Some(5),
+                since: Some("5 years ago".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.pairs(), 1, "a tier-7 name match is not a connection");
+    }
+
+    #[test]
+    fn non_call_or_non_callable_relationships_do_not_suppress_coupling() {
+        let root = tempfile::tempdir().unwrap();
+        code_index(root.path(), &["src/a.rs", "src/b.rs"], None);
+        let code = Connection::open(root.path().join(".mdkb/code.sqlite")).unwrap();
+        code.execute(
+            "INSERT INTO code_symbols \
+             (id, name, kind, file_id, file_path, visibility, line_start, line_end, owner_name) \
+             VALUES (100, 'caller', 'Function', 1, 'src/a.rs', 0, 0, 3, NULL), \
+                    (101, 'callable', 'Function', 2, 'src/b.rs', 0, 0, 3, 'Target'), \
+                    (102, 'field', 'Field', 2, 'src/b.rs', 0, 4, 4, 'Target')",
+            [],
+        )
+        .unwrap();
+        code.execute(
+            "INSERT INTO code_relationships \
+             (from_symbol_id, from_name, to_name, kind, file_id, to_qualifier) \
+             VALUES (100, 'caller', 'callable', 'Uses', 1, 'Target'), \
+                    (100, 'caller', 'field', 'Calls', 1, 'Target')",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            !connected_file_pairs(&code)
+                .unwrap()
+                .contains(&("src/a.rs".to_string(), "src/b.rs".to_string())),
+            "only confident Calls candidates of callable kinds connect files"
         );
     }
 

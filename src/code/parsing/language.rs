@@ -58,6 +58,18 @@ impl Language {
             .or_else(|| Self::from_shebang(path))
     }
 
+    /// Detect language from a path and, for ambiguous C headers, their source.
+    pub fn from_path_and_content(path: &Path, content: &str) -> Option<Self> {
+        let language = Self::from_path(path);
+        if language == Some(Self::C)
+            && path.extension().is_some_and(|extension| extension == "h")
+            && is_cpp_header(content)
+        {
+            return Some(Self::Cpp);
+        }
+        language
+    }
+
     /// Detect language from a shebang line (`#!`).
     ///
     /// Reads only the first 256 bytes to avoid loading large files.
@@ -148,6 +160,38 @@ impl Language {
     }
 }
 
+/// Whether a `.h` file contains a valid C++ declaration that C cannot express.
+///
+/// Inspecting the C++ AST rather than text avoids matching comments or strings.
+fn is_cpp_header(content: &str) -> bool {
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return false;
+    };
+    if tree.root_node().has_error() {
+        return false;
+    }
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_specifier" | "namespace_definition" | "template_declaration"
+        ) {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    false
+}
+
 impl std::fmt::Display for Language {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
@@ -181,6 +225,32 @@ mod tests {
             Some(Language::TypeScript)
         );
         assert_eq!(Language::from_path(Path::new("README.md")), None);
+    }
+
+    #[test]
+    fn cpp_headers_select_cpp_grammar_from_declarations() {
+        for content in [
+            "class Widget { public: void draw(); };\n",
+            "namespace engine { void draw(); }\n",
+            "template <typename T> T identity(T value) { return value; }\n",
+        ] {
+            assert_eq!(
+                Language::from_path_and_content(Path::new("widget.h"), content),
+                Some(Language::Cpp),
+                "C++ header syntax must select the C++ grammar: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_c_header_keeps_c_grammar() {
+        assert_eq!(
+            Language::from_path_and_content(
+                Path::new("widget.h"),
+                "typedef struct Widget { int size; } Widget;\n"
+            ),
+            Some(Language::C)
+        );
     }
 
     #[test]

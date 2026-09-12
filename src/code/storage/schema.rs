@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS code_files (
     language TEXT,
     mtime INTEGER,
     indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    token_estimate INTEGER
+    token_estimate INTEGER,
+    has_error INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS code_symbols (
@@ -129,10 +130,12 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// constructor call, and every call dispatched through an index or a value;
 /// version 14 is the receiver a method call was made on, which no index held
 /// and which is the only thing that tells 5210 bare method names apart.
+/// Version 15 records whether tree-sitter recovered from a syntax error in
+/// each file, so a partial parse is distinguishable from a clean sparse file.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 14;
+pub const RESOLUTION_VERSION: i64 = 15;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///
@@ -203,6 +206,12 @@ pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // database that does not exist yet, so every one of them also has to be
     // added here for the indexes already on disk.
     add_column(conn, "code_files", "token_estimate", "INTEGER")?;
+    add_column(
+        conn,
+        "code_files",
+        "has_error",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column(conn, "code_symbols", "owner_name", "TEXT")?;
     add_column(conn, "code_relationships", "to_qualifier", "TEXT")?;
     add_column(conn, "code_relationships", "to_receiver", "TEXT")?;
@@ -322,6 +331,31 @@ mod tests {
                 .unwrap();
             assert!(exists, "table {table} should exist");
         }
+    }
+
+    #[test]
+    fn an_existing_index_gets_the_parse_error_column_with_a_clean_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE code_files (\
+                id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, rel_path TEXT NOT NULL, \
+                hash TEXT NOT NULL, language TEXT, mtime INTEGER, \
+                indexed_at INTEGER NOT NULL DEFAULT (unixepoch())\
+             ); \
+             INSERT INTO code_files (path, rel_path, hash) VALUES ('old.rs', 'old.rs', 'h');",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let has_error: bool = conn
+            .query_row(
+                "SELECT has_error FROM code_files WHERE path = 'old.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_error, "old indexes migrate as clean until reparsed");
     }
 
     /// An index written before the parse contract existed holds symbols without

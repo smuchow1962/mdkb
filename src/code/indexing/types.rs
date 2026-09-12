@@ -84,6 +84,8 @@ pub struct ParsedFile {
     pub path: PathBuf,
     pub content_hash: String,
     pub language: Language,
+    /// Whether tree-sitter recovered from a syntax error in this file.
+    pub has_error: bool,
     pub token_estimate: u32,
     pub raw_symbols: Vec<RawSymbol>,
     pub raw_relationships: Vec<RawRelationship>,
@@ -103,6 +105,9 @@ pub struct FileRegistration {
     pub file_id: FileId,
     pub content_hash: String,
     pub language: Language,
+    /// The parse result carried from PARSE so INDEX can persist it with the
+    /// file row.
+    pub has_error: bool,
     pub mtime: u64,
     /// Approximate LLM token count (cl100k_base) for the file's text.
     pub token_estimate: u32,
@@ -176,8 +181,8 @@ pub struct IndexStats {
     pub files_removed: u32,
     pub symbols_indexed: u32,
     pub relationships_collected: u32,
-    /// Files the PARSE stage could not handle: unsupported/unknown language or a
-    /// parser that failed to construct. Surfaced so a partial index is visible
+    /// Files the PARSE stage could not handle, or whose tree-sitter tree
+    /// recovered from syntax errors. Surfaced so a partial index is visible
     /// rather than silently reported as a clean success.
     pub parse_errors: u32,
 }
