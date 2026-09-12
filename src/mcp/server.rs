@@ -91,6 +91,7 @@ impl std::fmt::Debug for McpServer {
 
 #[tool_router]
 impl McpServer {
+    #[cfg(feature = "http-server")]
     pub(crate) fn hook_runtime(
         &self,
     ) -> (Arc<RepoRegistry>, Arc<super::dispatch::DispatchContext>) {

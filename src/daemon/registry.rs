@@ -195,6 +195,7 @@ impl RepoRegistry {
     ///
     /// Network MCP and HTTP hooks then resolve the same `RepoHandle` and share
     /// its SQLite connection, index facade, and startup state.
+    #[cfg(feature = "http-server")]
     pub(crate) fn with_handle(config: DaemonConfig, handle: Arc<RepoHandle>) -> Self {
         let registry = Self::new(config);
         registry

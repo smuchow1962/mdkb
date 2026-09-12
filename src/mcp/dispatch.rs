@@ -465,6 +465,7 @@ fn session_provenance(dctx: &DispatchContext) -> Option<String> {
 }
 
 impl DispatchContext {
+    #[cfg(feature = "http-server")]
     pub(crate) fn new(
         metrics: Arc<UsageMetrics>,
         session_id: Arc<AtomicI64>,
