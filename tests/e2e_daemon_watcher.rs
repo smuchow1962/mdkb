@@ -503,7 +503,7 @@ async fn watcher_deletions_still_go_through_the_set_level_breaker() {
             None,
             &[],
             None,
-            None,
+            Some("contradicts"),
             false,
         )
         .expect("add");

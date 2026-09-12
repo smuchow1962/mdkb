@@ -99,6 +99,8 @@ fn hook_writer(root: &Path, worker: usize, iters: usize) {
                 "stress",
                 "-c",
                 &body,
+                "--on-conflict",
+                "contradicts",
             ])
             .current_dir(root)
             .stdin(Stdio::null())

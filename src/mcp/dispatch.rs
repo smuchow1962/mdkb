@@ -5280,7 +5280,7 @@ mod tests {
             // Old inference (~40 days) → confidence < 0.25 → dropped.
             warmup_entry(
                 "stale",
-                EntryType::Topic,
+                EntryType::Prior,
                 "c",
                 SourceType::Inference,
                 0,
