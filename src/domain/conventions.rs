@@ -57,8 +57,7 @@ pub fn detect_conventions(
     // in subdirectories: `*.md` indexed only the two or three files beside the
     // README and silently ignored the other few hundred, so a fresh `mdkb init`
     // produced a store that knew nothing (issue #8). `**/*.md` is already the
-    // default for `[indexing] default_pattern` and for `mdkb collection add`;
-    // this was the one place that disagreed.
+    // default for `mdkb collection add`; this was the one place that disagreed.
     //
     // It does not double-index what `docs`/`archive` above already hold:
     // indexing gives a file to the collection with the most specific path

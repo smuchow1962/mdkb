@@ -509,11 +509,7 @@ The report is stacked: header (repo, version, db size, last update) → index he
 Configuration lives in `.mdkb/config.toml`:
 
 ```toml
-[search]
-default_limit = 10
-
 [indexing]
-debounce_ms = 100
 # When true, the doc/collection walker honors .gitignore.
 # When false (default), it reads .mdkbignore instead.
 respect_gitignore = false
@@ -528,7 +524,7 @@ max_response_tokens = 50000
 max_document_tokens = 10000
 ```
 
-Environment overrides: `MDKB_SEARCH_DEFAULT_LIMIT=20`, `MDKB_INDEXING_DEBOUNCE_MS=200`.
+`mdkb init` writes every setting with its default, commented out. A key mdkb does not read is ignored on load; `mdkb update` warns and names it by its dotted path.
 
 ### Controlling what gets indexed
 

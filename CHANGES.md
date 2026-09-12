@@ -345,6 +345,25 @@ by a session on the host that reported them.
   interrupted writer on the next open, exactly as after the SIGKILL this
   replaces. *(#10, reported by Stefano Straus (@sstraus))*
 
+### Removed
+
+- **21 configuration keys nothing read.** They parsed, some were validated,
+  four were round-trip-tested, and no code path looked at the value:
+  `[indexing]` `default_pattern`, `debounce_ms`, `parse_frontmatter`,
+  `parse_wikilinks`, `index_headings`; `[search]` `default_limit`, `min_score`,
+  `rrf_k`, `bm25_weight`, `vector_weight`; `[memory]` `enabled`, `directory`,
+  `title_max_chars`, `order_by`, `track_access`; the whole `[models]` table;
+  `[mcp] include_token_count`; `[code] index_path`; `[code.indexing]
+  parallelism`; `[code.semantic_search] model`; `[hooks]
+  recall_half_life_secs`. The worst was `[code] index_path`: the index has
+  always lived at `.mdkb/code.sqlite`, a path resolved in over a hundred
+  places, so a user who set the key believed the index had moved when nothing
+  had. The `MDKB_SEARCH_DEFAULT_LIMIT`, `MDKB_INDEXING_DEBOUNCE_MS` and
+  `MDKB_MEMORY_WARMUP_LIMIT` environment overrides go with them: the function
+  that read them had no caller. In their place, `mdkb update` warns once per
+  key it does not know, naming the key by its dotted path — which also covers
+  the two `[models]` embedding keys that had a warning of their own before.
+
 
 ## 3.8.0 (2026-08-29)
 

@@ -22,9 +22,6 @@ pub struct Config {
     /// Memory index configuration (Phase 6).
     pub memory: MemoryConfig,
 
-    /// LLM models configuration (Phase 3+).
-    pub models: ModelsConfig,
-
     /// MCP server configuration.
     pub mcp: McpConfig,
 
@@ -65,21 +62,6 @@ pub struct TelemetryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexingConfig {
-    /// Default glob pattern for markdown files.
-    pub default_pattern: String,
-
-    /// Debounce interval for file watcher (ms).
-    pub debounce_ms: u64,
-
-    /// Parse YAML frontmatter.
-    pub parse_frontmatter: bool,
-
-    /// Parse [[wiki-links]].
-    pub parse_wikilinks: bool,
-
-    /// Index heading structure.
-    pub index_headings: bool,
-
     /// When true, the document/collection walker honors `.gitignore`,
     /// `.git/info/exclude` and the global gitignore. When false (default),
     /// gitignore is ignored and `.mdkbignore` is read instead — preserving
@@ -109,21 +91,6 @@ pub struct ChunkingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
-    /// Default result limit.
-    pub default_limit: usize,
-
-    /// Minimum score threshold.
-    pub min_score: f64,
-
-    /// RRF fusion constant.
-    pub rrf_k: u32,
-
-    /// BM25 weight in hybrid search.
-    pub bm25_weight: f64,
-
-    /// Vector weight in hybrid search.
-    pub vector_weight: f64,
-
     /// Auto-embed changed documents during `mdkb update` so hybrid search never
     /// silently degrades to BM25. Killable if the ONNX cost is unwanted.
     pub auto_embed_docs: bool,
@@ -172,53 +139,68 @@ impl Default for SearchMemoryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryConfig {
-    /// Enable memory index.
-    pub enabled: bool,
-
-    /// Memory directory relative to .mdkb/.
-    pub directory: String,
-
     /// Maximum entries in warmup index.
     pub warmup_limit: usize,
-
-    /// Maximum title length.
-    pub title_max_chars: usize,
-
-    /// Ordering field: access_count, updated_at, created_at.
-    pub order_by: String,
-
-    /// Track access counts.
-    pub track_access: bool,
 }
 
-/// LLM models settings (Phase 3+).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ModelsConfig {
-    /// Inactivity timeout before unloading models (seconds).
-    pub inactivity_timeout_secs: u64,
+/// Dotted paths of the keys in `raw_toml` that no field of [`Config`] reads.
+///
+/// `Config` is `#[serde(default)]` without `deny_unknown_fields`, so a key the
+/// schema does not know is accepted and ignored on load: a typo, or a knob a
+/// release removed, changes nothing and says nothing. The caller warns per key
+/// instead of failing the load. A file that does not parse reports nothing;
+/// [`Config::load`] is where that error is raised.
+pub fn unknown_keys(raw_toml: &str) -> Vec<String> {
+    let Ok(raw) = raw_toml.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut schema = Config::default();
+    // The serializer writes no key for `None`, so every `Option` field has to
+    // be `Some` here or a user who sets it is told the key is unknown.
+    schema.priors.distiller_program = Some(String::new());
+    let Ok(toml::Value::Table(schema)) = toml::Value::try_from(schema) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_unknown_keys(&raw, &schema, "", &mut out);
+    out
 }
 
-/// Dead `[models]` keys that once selected the embedding model. The embedder is
-/// now fixed to all-MiniLM-L6-v2 (384-dim), so these are ignored if present —
-/// [`detect_dead_model_keys`] surfaces a warning rather than silently accepting
-/// them (they were never functional).
-pub const DEAD_MODEL_KEYS: &[&str] = &["embedding_repo", "embedding_file"];
+fn collect_unknown_keys(
+    raw: &toml::Table,
+    schema: &toml::Table,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    for (key, value) in raw {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match (schema.get(key), value) {
+            (None, toml::Value::Table(unknown)) if !unknown.is_empty() => {
+                collect_unknown_table(unknown, &path, out);
+            }
+            (None, _) => out.push(path),
+            (Some(toml::Value::Table(known)), toml::Value::Table(given)) => {
+                collect_unknown_keys(given, known, &path, out);
+            }
+            _ => {}
+        }
+    }
+}
 
-/// Return any dead `[models]` embedding keys present in raw config TOML so the
-/// caller can warn the user they are ignored (the embedder is fixed).
-pub fn detect_dead_model_keys(raw_toml: &str) -> Vec<&'static str> {
-    let Ok(value) = raw_toml.parse::<toml::Table>() else {
-        return Vec::new();
-    };
-    let Some(models) = value.get("models").and_then(|m| m.as_table()) else {
-        return Vec::new();
-    };
-    DEAD_MODEL_KEYS
-        .iter()
-        .filter(|k| models.contains_key(**k))
-        .copied()
-        .collect()
+fn collect_unknown_table(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
+    for (key, value) in table {
+        let path = format!("{prefix}.{key}");
+        match value {
+            toml::Value::Table(nested) if !nested.is_empty() => {
+                collect_unknown_table(nested, &path, out);
+            }
+            _ => out.push(path),
+        }
+    }
 }
 
 /// Convention-based auto-collection detection settings.
@@ -269,9 +251,6 @@ pub struct McpConfig {
 
     /// Truncate content with ellipsis when exceeding limits.
     pub truncate_with_ellipsis: bool,
-
-    /// Include token count in response metadata.
-    pub include_token_count: bool,
 }
 
 /// Code intelligence configuration.
@@ -280,9 +259,6 @@ pub struct McpConfig {
 pub struct CodeConfig {
     /// Enable code intelligence features.
     pub enabled: bool,
-
-    /// Index path relative to .mdkb/.
-    pub index_path: String,
 
     /// Code indexing pipeline settings.
     pub indexing: CodeIndexingConfig,
@@ -331,9 +307,6 @@ pub struct CodeDuplicationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeIndexingConfig {
-    /// Worker threads for parsing (0 = auto-detect from CPU count).
-    pub parallelism: usize,
-
     /// Glob patterns to ignore during indexing.
     pub ignore_patterns: Vec<String>,
 
@@ -365,9 +338,6 @@ pub struct CodeSemanticSearchConfig {
     /// Enable semantic (embedding-based) code search.
     pub enabled: bool,
 
-    /// Embedding model identifier (e.g., "AllMiniLML6V2").
-    pub model: String,
-
     /// Minimum cosine similarity threshold for results.
     pub threshold: f64,
 }
@@ -376,7 +346,6 @@ impl Default for CodeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            index_path: "code.sqlite".to_string(),
             indexing: CodeIndexingConfig::default(),
             semantic_search: CodeSemanticSearchConfig::default(),
             duplication: CodeDuplicationConfig::default(),
@@ -399,7 +368,6 @@ impl Default for CodeDuplicationConfig {
 impl Default for CodeIndexingConfig {
     fn default() -> Self {
         Self {
-            parallelism: DEFAULT_CODE_PARALLELISM,
             ignore_patterns: DEFAULT_CODE_IGNORE_PATTERNS
                 .iter()
                 .map(|s| (*s).to_string())
@@ -416,7 +384,6 @@ impl Default for CodeSemanticSearchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            model: DEFAULT_CODE_SEMANTIC_MODEL.to_string(),
             threshold: DEFAULT_CODE_SEMANTIC_THRESHOLD,
         }
     }
@@ -429,7 +396,6 @@ impl Default for Config {
             chunking: ChunkingConfig::default(),
             search: SearchConfig::default(),
             memory: MemoryConfig::default(),
-            models: ModelsConfig::default(),
             mcp: McpConfig::default(),
             conventions: ConventionsConfig::default(),
             code: CodeConfig::default(),
@@ -577,12 +543,6 @@ pub struct HooksConfig {
     /// disables the floor — every access-ranked entry is eligible.
     pub warmup_min_confidence: f64,
 
-    /// Half-life for access-recency re-ranking in seconds (default 7 days).
-    ///
-    /// Controls how quickly the recency signal decays. Entries accessed more
-    /// recently get a larger boost. Set to 0 to disable re-ranking.
-    pub recall_half_life_secs: i64,
-
     /// When true, hooks require a running daemon and skip every in-process
     /// fallback, including an explicit `MDKB_NO_DAEMON=1` request.
     pub daemon_required: bool,
@@ -619,7 +579,6 @@ impl Default for HooksConfig {
             latency_budget_ms: 200,
             min_recall_score: 0.3,
             warmup_min_confidence: 0.25,
-            recall_half_life_secs: 7 * 24 * 60 * 60, // 7 days
             daemon_required: false,
             code_hits_in_pretooluse: true,
             doc_graph_in_recall: true,
@@ -653,11 +612,6 @@ impl Default for GraphConfig {
 impl Default for IndexingConfig {
     fn default() -> Self {
         Self {
-            default_pattern: "**/*.md".to_string(),
-            debounce_ms: DEFAULT_DEBOUNCE_MS,
-            parse_frontmatter: true,
-            parse_wikilinks: true,
-            index_headings: true,
             respect_gitignore: false,
         }
     }
@@ -677,11 +631,6 @@ impl Default for ChunkingConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            default_limit: 10,
-            min_score: 0.0,
-            rrf_k: DEFAULT_RRF_K,
-            bm25_weight: DEFAULT_BM25_WEIGHT,
-            vector_weight: DEFAULT_VECTOR_WEIGHT,
             auto_embed_docs: true,
             auto_embed_sessions: false,
             auto_embed_memory: true,
@@ -693,20 +642,7 @@ impl Default for SearchConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            directory: "memory".to_string(),
             warmup_limit: DEFAULT_WARMUP_LIMIT,
-            title_max_chars: 50,
-            order_by: "access_count".to_string(),
-            track_access: true,
-        }
-    }
-}
-
-impl Default for ModelsConfig {
-    fn default() -> Self {
-        Self {
-            inactivity_timeout_secs: DEFAULT_INACTIVITY_TIMEOUT_SECS,
         }
     }
 }
@@ -717,16 +653,12 @@ impl Default for McpConfig {
             max_response_tokens: DEFAULT_MAX_RESPONSE_TOKENS,
             max_document_tokens: DEFAULT_MAX_DOCUMENT_TOKENS,
             truncate_with_ellipsis: true,
-            include_token_count: false,
         }
     }
 }
 
 /// Valid chunking strategies.
 const VALID_CHUNKING_STRATEGIES: &[&str] = &["fixed", "markdown", "semantic"];
-
-/// Valid memory order_by values.
-const VALID_ORDER_BY: &[&str] = &["access_count", "updated_at", "created_at"];
 
 /// Minimum allowed max_tokens for chunking.
 /// 64 tokens is the minimum practical size for semantic coherence.
@@ -735,12 +667,6 @@ const MIN_MAX_TOKENS: usize = 64;
 // =============================================================================
 // Default value constants with documentation
 // =============================================================================
-
-/// Default debounce interval for file watcher (milliseconds).
-/// 100ms provides responsive updates while batching rapid file saves together.
-/// This is fast enough for interactive use but avoids redundant reindexing
-/// when editors save files multiple times in quick succession.
-const DEFAULT_DEBOUNCE_MS: u64 = 100;
 
 /// Maximum tokens per chunk for embedding models.
 /// 512 is the typical context limit for embedding models like nomic-embed-text.
@@ -751,21 +677,6 @@ const DEFAULT_MAX_TOKENS: usize = 512;
 /// 64 tokens (~12.5% of 512) maintains context continuity across chunk boundaries
 /// without excessive redundancy.
 const DEFAULT_OVERLAP_TOKENS: usize = 64;
-
-/// RRF (Reciprocal Rank Fusion) constant k.
-/// Standard value from Cormack et al. (2009) "Reciprocal Rank Fusion outperforms
-/// Condorcet and individual Rank Learning Methods". k=60 balances contributions
-/// from different ranking sources; lower values favor top-ranked results more.
-const DEFAULT_RRF_K: u32 = 60;
-
-/// BM25 weight in hybrid search.
-/// 1.0 gives full weight to keyword/lexical matching.
-const DEFAULT_BM25_WEIGHT: f64 = 1.0;
-
-/// Vector similarity weight in hybrid search.
-/// 0.7 gives semantic search slightly less influence than BM25, reflecting that
-/// exact keyword matches are often more reliable than semantic similarity.
-const DEFAULT_VECTOR_WEIGHT: f64 = 0.7;
 
 /// Maximum tokens per MCP response.
 /// 50,000 tokens is a reasonable limit that fits within most LLM context windows
@@ -780,15 +691,6 @@ const DEFAULT_MAX_DOCUMENT_TOKENS: usize = 10_000;
 /// Maximum documents in memory warmup index.
 /// 50 entries is enough for common documents without excessive memory use.
 const DEFAULT_WARMUP_LIMIT: usize = 50;
-
-/// Model inactivity timeout before unloading (seconds).
-/// 2 minutes allows for interactive use patterns while freeing memory
-/// when the user has moved on to other tasks.
-const DEFAULT_INACTIVITY_TIMEOUT_SECS: u64 = 120;
-
-/// Code indexing worker threads. 0 = auto-detect from CPU count.
-/// Auto-detect uses crossbeam's built-in thread pool sizing.
-const DEFAULT_CODE_PARALLELISM: usize = 0;
 
 /// Glob patterns to ignore during code indexing.
 /// Covers common build output, dependencies, and generated files.
@@ -819,10 +721,6 @@ const DEFAULT_CODE_DEBOUNCE_MS: u64 = 300;
 /// practice. Now config-driven via `[code.indexing] batch_idle_ms`.
 const DEFAULT_CODE_BATCH_IDLE_MS: u64 = 30_000;
 
-/// Default embedding model for semantic code search.
-/// AllMiniLML6V2 is a fast, lightweight model (384 dimensions).
-const DEFAULT_CODE_SEMANTIC_MODEL: &str = "AllMiniLML6V2";
-
 /// Default cosine similarity threshold for semantic code search.
 /// 0.3 is a permissive default; higher values improve precision at cost of recall.
 const DEFAULT_CODE_SEMANTIC_THRESHOLD: f64 = 0.3;
@@ -845,7 +743,7 @@ impl Config {
     /// use mdkb::Config;
     ///
     /// let config = Config::load(".mdkb/config.toml")?;
-    /// println!("Search limit: {}", config.search.default_limit);
+    /// println!("Recall limit: {}", config.hooks.recall_limit);
     /// ```
     ///
     /// # Errors
@@ -922,15 +820,6 @@ impl Config {
 
     /// Validate configuration values.
     pub fn validate(&self) -> Result<()> {
-        // Search validation
-        if self.search.default_limit == 0 {
-            return Err(ErrorKind::ConfigInvalid {
-                field: "search.default_limit".to_string(),
-                message: "must be greater than 0".to_string(),
-            }
-            .into());
-        }
-
         // Chunking validation
         if !VALID_CHUNKING_STRATEGIES.contains(&self.chunking.strategy.as_str()) {
             return Err(ErrorKind::ConfigInvalid {
@@ -1015,68 +904,19 @@ impl Config {
             .into());
         }
 
-        // Memory validation
-        if !VALID_ORDER_BY.contains(&self.memory.order_by.as_str()) {
-            return Err(ErrorKind::ConfigInvalid {
-                field: "memory.order_by".to_string(),
-                message: format!("must be one of: {}", VALID_ORDER_BY.join(", ")),
-            }
-            .into());
-        }
-
         Ok(())
-    }
-
-    /// Create config from environment variables with defaults.
-    ///
-    /// Environment variables follow the pattern: MDKB_SECTION_FIELD
-    /// e.g., MDKB_SEARCH_DEFAULT_LIMIT, MDKB_INDEXING_DEBOUNCE_MS
-    pub fn from_env_with_defaults() -> Self {
-        let mut config = Config::default();
-
-        // Search overrides
-        if let Ok(val) = std::env::var("MDKB_SEARCH_DEFAULT_LIMIT") {
-            if let Ok(limit) = val.parse() {
-                config.search.default_limit = limit;
-            }
-        }
-
-        // Indexing overrides
-        if let Ok(val) = std::env::var("MDKB_INDEXING_DEBOUNCE_MS") {
-            if let Ok(debounce) = val.parse() {
-                config.indexing.debounce_ms = debounce;
-            }
-        }
-
-        // Memory overrides
-        if let Ok(val) = std::env::var("MDKB_MEMORY_WARMUP_LIMIT") {
-            if let Ok(limit) = val.parse() {
-                config.memory.warmup_limit = limit;
-            }
-        }
-
-        config
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
     use super::*;
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.indexing.default_pattern, "**/*.md");
-        assert_eq!(config.search.default_limit, 10);
+        assert!(!config.indexing.respect_gitignore);
+        assert!(config.search.auto_embed_docs);
         assert_eq!(config.memory.warmup_limit, 50);
     }
 
@@ -1085,7 +925,7 @@ mod tests {
         let config = Config::default();
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
-        assert_eq!(config.search.default_limit, parsed.search.default_limit);
+        assert_eq!(config.memory.warmup_limit, parsed.memory.warmup_limit);
     }
 
     #[test]
@@ -1159,35 +999,33 @@ mod tests {
         );
     }
 
-    // ==================== Models Config Tests ====================
+    // ==================== Unknown Key Tests ====================
 
+    /// A removed knob, or a typo, must be named by its dotted path and must
+    /// not fail the load: the keys beside it still apply.
     #[test]
-    fn test_models_config_defaults() {
-        let config = Config::default();
+    fn unknown_keys_names_a_removed_knob_by_its_dotted_path() {
+        let raw = "[code]\nindex_path = \"my-code-idx\"\nenabled = false\n\n\
+                   [models]\nembedding_repo = \"x\"\n";
         assert_eq!(
-            config.models.inactivity_timeout_secs,
-            DEFAULT_INACTIVITY_TIMEOUT_SECS
+            unknown_keys(raw),
+            vec!["code.index_path", "models.embedding_repo"]
         );
+
+        let cfg: Config = toml::from_str(raw).expect("an unknown key never fails the load");
+        assert!(!cfg.code.enabled, "the known key beside it still applies");
     }
 
     #[test]
-    fn test_dead_model_keys_detected() {
-        let raw = "[models]\nembedding_repo = \"x\"\nembedding_file = \"y\"\n";
-        let dead = detect_dead_model_keys(raw);
-        assert!(dead.contains(&"embedding_repo"));
-        assert!(dead.contains(&"embedding_file"));
-    }
-
-    #[test]
-    fn test_no_dead_model_keys_when_absent() {
-        assert!(detect_dead_model_keys("[models]\ninactivity_timeout_secs = 60\n").is_empty());
-        assert!(detect_dead_model_keys("").is_empty());
-        // Legacy config with dead keys still parses (keys ignored, not an error).
-        let cfg: Config =
-            toml::from_str("[models]\nembedding_repo = \"x\"\n").expect("legacy config parses");
-        assert_eq!(
-            cfg.models.inactivity_timeout_secs,
-            DEFAULT_INACTIVITY_TIMEOUT_SECS
+    fn unknown_keys_is_empty_for_every_shipped_key() {
+        assert!(unknown_keys(&Config::default_toml().unwrap()).is_empty());
+        // `None` is never serialised, so this key is absent from a serialised
+        // default and has to be known by other means.
+        assert!(unknown_keys("[priors]\ndistiller_program = \"claude\"\n").is_empty());
+        assert!(unknown_keys("").is_empty());
+        assert!(
+            unknown_keys("not toml [").is_empty(),
+            "a file that does not parse is Config::load's error, not a key report"
         );
     }
 
@@ -1200,30 +1038,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_invalid_search_limit() {
-        let mut config = Config::default();
-        config.search.default_limit = 0;
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("default_limit"));
-    }
-
-    #[test]
     fn test_validate_invalid_chunking_strategy() {
         let mut config = Config::default();
         config.chunking.strategy = "invalid_strategy".to_string();
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("strategy"));
-    }
-
-    #[test]
-    fn test_validate_invalid_memory_order_by() {
-        let mut config = Config::default();
-        config.memory.order_by = "invalid_order".to_string();
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("order_by"));
     }
 
     #[test]
@@ -1254,20 +1074,18 @@ mod tests {
 
         let toml_content = r#"
 [indexing]
-default_pattern = "*.md"
-debounce_ms = 200
+respect_gitignore = true
 
-[search]
-default_limit = 20
+[hooks]
+recall_limit = 20
 "#;
         std::fs::write(&config_path, toml_content).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        assert_eq!(config.indexing.default_pattern, "*.md");
-        assert_eq!(config.indexing.debounce_ms, 200);
-        assert_eq!(config.search.default_limit, 20);
+        assert!(config.indexing.respect_gitignore);
+        assert_eq!(config.hooks.recall_limit, 20);
         // Other fields should have defaults
-        assert!(config.indexing.parse_frontmatter);
+        assert!(config.search.auto_embed_docs);
     }
 
     #[test]
@@ -1275,16 +1093,16 @@ default_limit = 20
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
 
-        // search.default_limit = 0 violates validate()
+        // chunking.strategy outside the allowlist violates validate()
         let toml_content = r#"
-[search]
-default_limit = 0
+[chunking]
+strategy = "invalid_strategy"
 "#;
         std::fs::write(&config_path, toml_content).unwrap();
 
         let result = Config::load(&config_path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("default_limit"));
+        assert!(result.unwrap_err().to_string().contains("strategy"));
     }
 
     #[test]
@@ -1296,7 +1114,7 @@ default_limit = 0
     #[test]
     fn test_load_or_default_nonexistent() {
         let config = Config::load_or_default("/nonexistent/config.toml");
-        assert_eq!(config.indexing.default_pattern, "**/*.md");
+        assert_eq!(config.memory.warmup_limit, DEFAULT_WARMUP_LIMIT);
     }
 
     #[test]
@@ -1305,49 +1123,11 @@ default_limit = 0
         let config_path = dir.path().join("config.toml");
 
         let mut config = Config::default();
-        config.search.default_limit = 42;
+        config.memory.warmup_limit = 42;
         config.save(&config_path).unwrap();
 
         let loaded = Config::load(&config_path).unwrap();
-        assert_eq!(loaded.search.default_limit, 42);
-    }
-
-    // ==================== Environment Override Tests ====================
-
-    #[test]
-    fn test_env_override_search_limit() {
-        let _guard = env_lock();
-        unsafe { std::env::set_var("MDKB_SEARCH_DEFAULT_LIMIT", "25") };
-        let config = Config::from_env_with_defaults();
-        unsafe { std::env::remove_var("MDKB_SEARCH_DEFAULT_LIMIT") };
-        assert_eq!(config.search.default_limit, 25);
-    }
-
-    #[test]
-    fn test_env_override_indexing_debounce() {
-        let _guard = env_lock();
-        unsafe { std::env::set_var("MDKB_INDEXING_DEBOUNCE_MS", "500") };
-        let config = Config::from_env_with_defaults();
-        unsafe { std::env::remove_var("MDKB_INDEXING_DEBOUNCE_MS") };
-        assert_eq!(config.indexing.debounce_ms, 500);
-    }
-
-    #[test]
-    fn test_env_override_memory_warmup_limit() {
-        let _guard = env_lock();
-        unsafe { std::env::set_var("MDKB_MEMORY_WARMUP_LIMIT", "100") };
-        let config = Config::from_env_with_defaults();
-        unsafe { std::env::remove_var("MDKB_MEMORY_WARMUP_LIMIT") };
-        assert_eq!(config.memory.warmup_limit, 100);
-    }
-
-    #[test]
-    fn test_env_override_invalid_value_uses_default() {
-        let _guard = env_lock();
-        unsafe { std::env::set_var("MDKB_SEARCH_DEFAULT_LIMIT", "not_a_number") };
-        let config = Config::from_env_with_defaults();
-        unsafe { std::env::remove_var("MDKB_SEARCH_DEFAULT_LIMIT") };
-        assert_eq!(config.search.default_limit, 10);
+        assert_eq!(loaded.memory.warmup_limit, 42);
     }
 
     // ==================== Default TOML Generation ====================
@@ -1359,7 +1139,6 @@ default_limit = 0
         assert!(toml_str.contains("[chunking]"));
         assert!(toml_str.contains("[search]"));
         assert!(toml_str.contains("[memory]"));
-        assert!(toml_str.contains("[models]"));
         assert!(toml_str.contains("[code]"));
         assert!(toml_str.contains("[graph]"));
     }
@@ -1412,8 +1191,6 @@ default_limit = 0
     fn test_code_config_defaults() {
         let config = Config::default();
         assert!(config.code.enabled);
-        assert_eq!(config.code.index_path, "code.sqlite");
-        assert_eq!(config.code.indexing.parallelism, 0);
         assert_eq!(config.code.indexing.batch_size, 500);
         assert!(!config.code.indexing.ignore_patterns.is_empty());
         assert!(
@@ -1424,7 +1201,6 @@ default_limit = 0
                 .contains(&"**/target/**".to_string())
         );
         assert!(config.code.semantic_search.enabled);
-        assert_eq!(config.code.semantic_search.model, "AllMiniLML6V2");
     }
 
     #[test]
@@ -1437,7 +1213,6 @@ default_limit = 0
 
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.code.enabled, config.code.enabled);
-        assert_eq!(parsed.code.index_path, config.code.index_path);
         assert_eq!(
             parsed.code.indexing.batch_size,
             config.code.indexing.batch_size
@@ -1453,7 +1228,6 @@ default_limit = 0
         let toml_content = r#"
 [code]
 enabled = false
-index_path = "my-code-idx"
 
 [code.indexing]
 batch_size = 1000
@@ -1464,9 +1238,8 @@ threshold = 0.5
 "#;
         let config: Config = toml::from_str(toml_content).unwrap();
         assert!(!config.code.enabled);
-        assert_eq!(config.code.index_path, "my-code-idx");
         assert_eq!(config.code.indexing.batch_size, 1000);
-        assert_eq!(config.code.indexing.parallelism, 0);
+        assert!(config.code.indexing.respect_gitignore);
         assert!(config.code.semantic_search.enabled);
         assert!((config.code.semantic_search.threshold - 0.5).abs() < f64::EPSILON);
     }
