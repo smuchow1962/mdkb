@@ -105,7 +105,16 @@ fn main() -> Result<()> {
             .enable_all()
             .build()
             .map_err(|e| mdkb::Error::other(format!("build tokio runtime: {e}")))?;
-        rt.block_on(run())
+        let result = rt.block_on(run());
+        // Dropping the runtime joins every worker, and a worker stays busy
+        // until its current task yields. `serve` spawns the startup code
+        // reindex as synchronous work on a worker, so a SIGTERM that arrived
+        // during that reindex kept the process alive until it finished
+        // (measured 2026-09-12: 37.8s on a debug build for 38 changed
+        // files). Once `run` has returned nothing awaits that work: bound
+        // the wait. SQLite rolls the interrupted write back on the next open.
+        rt.shutdown_timeout(std::time::Duration::from_secs(1));
+        result
     })
 }
 
