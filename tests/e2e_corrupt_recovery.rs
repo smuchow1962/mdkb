@@ -386,14 +386,66 @@ fn a_corrupt_code_index_is_released_and_rebuilt_instead_of_retried() {
 
     // With the handle closed, the open path can finally quarantine and rebuild.
     let mut healed = IndexFacade::open_or_create(&db).expect("reopen code index");
+    let quarantine = root.join(".mdkb/quarantine");
     assert!(
-        root.join(".mdkb/quarantine").is_dir(),
-        "reopening a released corrupt index must quarantine it"
+        quarantine.is_dir(),
+        "reopening must quarantine the corrupt index"
+    );
+    let quarantined = std::fs::read_dir(&quarantine)
+        .expect("read quarantine")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("code.sqlite.corrupt-")
+                        && !name.ends_with(".report.json")
+                        && !name.ends_with("-wal")
+                        && !name.ends_with("-shm")
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "preserve exactly one corrupt database"
     );
     let rebuilt = healed.index_directory(&root).expect("rebuild");
     assert!(
         rebuilt.symbols_indexed > 0,
         "the rebuilt index must repopulate from source"
+    );
+    assert!(
+        !healed.find_symbols_by_file("m0.rs", 10).is_empty(),
+        "the deterministic replacement must be readable"
+    );
+
+    std::fs::write(
+        root.join("src/m0.rs"),
+        "pub fn changed() {}\npub fn written_after_recovery() {}\n",
+    )
+    .expect("write after recovery");
+    healed.update(&root).expect("update replacement");
+    assert!(
+        healed
+            .find_symbols_by_file("m0.rs", 10)
+            .iter()
+            .any(|symbol| symbol.as_name() == "written_after_recovery"),
+        "the replacement must accept and expose a subsequent write"
+    );
+    drop(healed);
+
+    let reopened = IndexFacade::open_or_create(&db).expect("repeat startup");
+    assert!(
+        reopened
+            .find_symbols_by_file("m0.rs", 10)
+            .iter()
+            .any(|symbol| symbol.as_name() == "written_after_recovery"),
+        "repeat startup must reuse the usable replacement"
+    );
+    assert!(
+        quarantined[0].is_file(),
+        "repeat startup must preserve the quarantined corrupt database"
     );
 }
 

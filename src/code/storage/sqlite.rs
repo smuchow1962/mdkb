@@ -686,7 +686,8 @@ impl CodeDb {
     /// difference between "this calls nothing here" and "this calls nothing".
     pub fn get_call_targets(&self, symbol_id: i64) -> rusqlite::Result<Vec<CallTarget>> {
         let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT r.id, r.to_name, r.to_qualifier, s.id, {RESOLUTION_TIER} \
+            "SELECT r.id, r.to_name, r.to_qualifier, r.to_receiver_type, \
+                    s.id, {RESOLUTION_TIER} \
              FROM code_relationships r \
              JOIN code_symbols fs ON fs.id = r.from_symbol_id \
              LEFT JOIN code_symbols s ON s.name = r.to_name AND {callable} \
@@ -699,8 +700,9 @@ impl CodeDb {
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?;
 
@@ -709,28 +711,42 @@ impl CodeDb {
         // nearest any candidate reached.
         let mut edges: Vec<CandidateEdge> = Vec::new();
         for row in rows {
-            let (rid, name, qualifier, sym_id, tier) = row?;
-            if edges.last().map(|(id, ..)| *id) != Some(rid) {
-                edges.push((rid, name, qualifier, Vec::new()));
+            let (rid, name, qualifier, receiver_type, sym_id, tier) = row?;
+            if edges.last().map(|edge| edge.id) != Some(rid) {
+                edges.push(CandidateEdge {
+                    id: rid,
+                    name,
+                    qualifier,
+                    receiver_type,
+                    candidates: Vec::new(),
+                });
             }
             if let Some(sym_id) = sym_id {
                 edges
                     .last_mut()
                     .expect("just pushed")
-                    .3
+                    .candidates
                     .push((tier, sym_id));
             }
         }
 
         Ok(edges
             .into_iter()
-            .map(|(_, name, qualifier, candidates)| {
+            .map(|edge| {
+                let CandidateEdge {
+                    name,
+                    qualifier,
+                    receiver_type,
+                    candidates,
+                    ..
+                } = edge;
                 let nearest = candidates.iter().map(|(tier, _)| *tier).min();
-                match (nearest, qualifier) {
+                let named_owner = qualifier.or(receiver_type);
+                match (nearest, named_owner) {
                     (Some(TIER_EXTERNAL) | None, Some(qualifier)) => {
                         CallTarget::External { qualifier, name }
                     }
-                    (None, None) => CallTarget::Unknown { name },
+                    (Some(TIER_EXTERNAL) | None, None) => CallTarget::Unknown { name },
                     (Some(nearest), _) => CallTarget::Resolved {
                         tier: nearest,
                         targets: candidates
@@ -1101,9 +1117,18 @@ pub(crate) const RESOLUTION_TIER: &str = "CASE \
      WHEN s.module_path IS NOT NULL AND s.module_path = fs.module_path THEN 6 \
      ELSE 7 END";
 
-/// One `Calls` edge with every candidate the bare-name join found for it:
-/// `(edge id, target name, qualifier, [(tier, symbol id)])`.
-type CandidateEdge = (i64, String, Option<String>, Vec<(i64, i64)>);
+/// One `Calls` edge with every candidate the bare-name join found for it.
+///
+/// The receiver type is part of the classification evidence even though it is
+/// not a candidate: a tier-3 call on a known type is external, while the same
+/// tier reached only because a receiver-producing call is absent is unknown.
+struct CandidateEdge {
+    id: i64,
+    name: String,
+    qualifier: Option<String>,
+    receiver_type: Option<String>,
+    candidates: Vec<(i64, i64)>,
+}
 
 /// The tier that says "the target is named, and it is not in this index".
 ///
@@ -2515,11 +2540,42 @@ mod tests {
         );
     }
 
-    /// `tempdir().path()` — the receiver's type is whatever `tempdir` returns,
-    /// and nothing in this index declares `tempdir`. The receiver came from
-    /// outside, so the call on it did too.
+    /// A known receiver type names an external target even when there is no
+    /// same-named symbol for the candidate join to return. Classification must
+    /// retain the receiver evidence independently of candidate rows.
     #[test]
-    fn a_receiver_produced_by_an_unindexed_function_is_external() {
+    fn a_call_on_a_type_with_no_namesake_is_external() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "join",
+            &CallSite {
+                receiver: Some("path"),
+                receiver_type: Some("PathBuf"),
+                ..CallSite::default()
+            },
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.get_call_targets(caller).unwrap(),
+            vec![CallTarget::External {
+                qualifier: "PathBuf".to_string(),
+                name: "join".to_string(),
+            }]
+        );
+    }
+
+    /// `tempdir().path()` — the receiver's type is whatever `tempdir` returns,
+    /// but nothing in this index declares `tempdir`. Without that type the call
+    /// has no nameable owner, even though same-named local candidates exist.
+    #[test]
+    fn a_receiver_produced_by_an_unindexed_function_is_unknown() {
         let (_dir, db) = temp_db();
         let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
         function_in(&db, "path", (here_file, "here.rs"), "crate::here", 10);
@@ -2544,6 +2600,36 @@ mod tests {
                 name: "path".to_string(),
             }],
             "no type to name and no candidate: the local `path` is not offered"
+        );
+    }
+
+    /// With neither a receiver type nor a same-named target, the missing
+    /// producer still cannot name an external owner. It remains unknown rather
+    /// than fabricating a qualifier from the receiver expression.
+    #[test]
+    fn an_unindexed_receiver_call_with_no_namesake_is_unknown() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "path",
+            &CallSite {
+                receiver: Some("tempdir()"),
+                receiver_call: Some("tempdir"),
+                ..CallSite::default()
+            },
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.get_call_targets(caller).unwrap(),
+            vec![CallTarget::Unknown {
+                name: "path".to_string(),
+            }]
         );
     }
 
