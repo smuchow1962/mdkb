@@ -1,6 +1,7 @@
 //! HTTPS transport for the MCP server with self-signed certificate generation.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Datelike;
@@ -16,7 +17,15 @@ pub async fn run_https_server(
     token: Option<&str>,
 ) -> crate::error::Result<()> {
     let cancellation_token = CancellationToken::new();
-    let router = mcp_router(server, bind, token, true, cancellation_token.clone());
+    let work_gate = Arc::new(crate::daemon::ipc_server::WorkGate::default());
+    let router = mcp_router(
+        server,
+        bind,
+        token,
+        true,
+        cancellation_token.clone(),
+        Arc::clone(&work_gate),
+    );
 
     // Generate or load self-signed certificate
     let (cert_path, key_path) = ensure_self_signed_cert()?;
@@ -35,6 +44,7 @@ pub async fn run_https_server(
 
     let server_handle = axum_server::Handle::new();
     let shutdown_handle = server_handle.clone();
+    let shutdown_gate = Arc::clone(&work_gate);
 
     // Spawn shutdown listener
     tokio::spawn(async move {
@@ -43,7 +53,14 @@ pub async fn run_https_server(
         }
         tracing::info!("Shutdown signal received, stopping HTTPS server...");
         cancellation_token.cancel();
-        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        shutdown_handle.graceful_shutdown(Some(
+            crate::daemon::ipc_server::WORK_DRAIN_GRACE + std::time::Duration::from_secs(5),
+        ));
+        let _ = crate::daemon::ipc_server::drain_in_flight_work(
+            &shutdown_gate,
+            crate::daemon::ipc_server::WORK_DRAIN_GRACE,
+        )
+        .await;
     });
 
     axum_server::bind_rustls(addr, tls_config)

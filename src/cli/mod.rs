@@ -1133,6 +1133,12 @@ pub enum SetupHooksCommand {
         /// Use for non-standard profiles like ~/.claude-private.
         #[arg(long)]
         profile_dir: Option<PathBuf>,
+
+        /// Register supported events as native HTTP hooks at this base URL.
+        /// SessionStart remains a command hook because Claude Code does not
+        /// support HTTP handlers for that event.
+        #[arg(long)]
+        http_url: Option<String>,
     },
 
     /// Register lifecycle hooks with Codex CLI (writes ~/.codex/hooks.json)

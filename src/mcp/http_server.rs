@@ -1,5 +1,6 @@
 //! HTTP transport for the MCP server using axum + rmcp streamable HTTP.
 
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::McpServer;
@@ -12,7 +13,15 @@ pub async fn run_http_server(
     token: Option<&str>,
 ) -> crate::error::Result<()> {
     let cancellation_token = CancellationToken::new();
-    let router = mcp_router(server, bind, token, false, cancellation_token.clone());
+    let work_gate = Arc::new(crate::daemon::ipc_server::WorkGate::default());
+    let router = mcp_router(
+        server,
+        bind,
+        token,
+        false,
+        cancellation_token.clone(),
+        Arc::clone(&work_gate),
+    );
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -31,6 +40,12 @@ pub async fn run_http_server(
         })
         .await
         .map_err(|e| crate::error::Error::mcp(format!("HTTP server error: {e}")))?;
+
+    let _ = crate::daemon::ipc_server::drain_in_flight_work(
+        &work_gate,
+        crate::daemon::ipc_server::WORK_DRAIN_GRACE,
+    )
+    .await;
 
     Ok(())
 }

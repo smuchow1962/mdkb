@@ -3,7 +3,10 @@
 use std::fs;
 use std::sync::MutexGuard;
 
-use mdkb::cli::setup::{HOOK_EVENTS, detect_hook_drift_for_repo, handle_setup_hooks_claude};
+use mdkb::cli::setup::{
+    HOOK_EVENTS, detect_hook_drift_for_repo, handle_setup_hooks_claude,
+    handle_setup_hooks_claude_with_http,
+};
 use tempfile::TempDir;
 
 use super::common::env_lock;
@@ -78,6 +81,48 @@ fn fresh_settings_gets_three_managed_hook_entries() {
             cmd.contains("hook "),
             "entry for {event_name} must include `hook` subcommand, got: {cmd}"
         );
+    }
+}
+
+#[test]
+fn http_registration_uses_native_handlers_except_for_session_start() {
+    let (_guard, project, _home) = isolated_project();
+
+    handle_setup_hooks_claude_with_http(
+        project.path(),
+        "local",
+        "",
+        false,
+        None,
+        Some("http://127.0.0.1:8080/"),
+    )
+    .expect("HTTP hook setup ok");
+
+    let settings = read_json(&local_settings_path(project.path()));
+    for (event_name, cli_event, _) in HOOK_EVENTS {
+        let handler = &mdkb_entries(&settings, event_name)[0]["hooks"][0];
+        if *event_name == "SessionStart" {
+            assert_eq!(handler["type"], "command");
+            assert!(
+                handler["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("hook session-start"))
+            );
+        } else {
+            assert_eq!(handler["type"], "http");
+            assert_eq!(
+                handler["url"],
+                format!("http://127.0.0.1:8080/hook/{}", cli_event.replace('-', "_"))
+            );
+            assert_eq!(
+                handler["headers"]["Authorization"],
+                "Bearer $MDKB_HOOK_TOKEN"
+            );
+            assert_eq!(
+                handler["allowedEnvVars"],
+                serde_json::json!(["MDKB_HOOK_TOKEN"])
+            );
+        }
     }
 }
 

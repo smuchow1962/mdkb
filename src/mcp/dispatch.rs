@@ -465,6 +465,21 @@ fn session_provenance(dctx: &DispatchContext) -> Option<String> {
 }
 
 impl DispatchContext {
+    pub(crate) fn new(
+        metrics: Arc<UsageMetrics>,
+        session_id: Arc<AtomicI64>,
+        persistent_call_count: Arc<AtomicU64>,
+        optimize_interval_calls: u64,
+    ) -> Self {
+        Self {
+            metrics,
+            session_id,
+            persistent_call_count,
+            optimize_interval_calls,
+            hook_dedup: Arc::new(StdMutex::new(HookDedupState::default())),
+        }
+    }
+
     fn with_hook_session<R>(&self, key: &str, f: impl FnOnce(&mut HookSessionState) -> R) -> R {
         let mut state = self
             .hook_dedup

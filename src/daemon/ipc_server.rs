@@ -63,7 +63,7 @@ const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// deadline. An operator who will not wait sends a second signal, which exits
 /// the process outright (see `main::ShutdownSignals`) — stopping the wait alone
 /// would not, because the runtime still owns the blocking write.
-const WORK_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const WORK_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Marks the window during which a hook request is executing.
 ///
@@ -73,24 +73,24 @@ const WORK_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(600
 /// shutdown, and a `cli.mutate` halfway through rewriting the index must not be
 /// cut off by the grace period sized for idle sockets.
 #[derive(Debug, Default)]
-struct WorkGate(tokio::sync::RwLock<()>);
+pub(crate) struct WorkGate(tokio::sync::RwLock<()>);
 
 impl WorkGate {
     /// Hold the gate for as long as the returned guard lives.
-    async fn enter(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+    pub(crate) async fn enter(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
         self.0.read().await
     }
 
     /// Resolve once every holder has released it. Tokio's `RwLock` is
     /// write-preferring, so a steady stream of new requests cannot starve this.
-    async fn quiesced(&self) {
+    pub(crate) async fn quiesced(&self) {
         let _exclusive = self.0.write().await;
     }
 }
 
 /// How [`drain_in_flight_work`] stopped waiting.
 #[derive(Debug, PartialEq, Eq)]
-enum DrainOutcome {
+pub(crate) enum DrainOutcome {
     /// No handler is executing any more.
     Quiesced,
     /// The grace period elapsed with work still running.
@@ -104,7 +104,10 @@ enum DrainOutcome {
 /// started, and that work — the document update inside `update_impl` — is
 /// exactly what a long drain is waiting for. An operator who will not wait is
 /// served by `main`, which exits the process outright on a second signal.
-async fn drain_in_flight_work(gate: &WorkGate, grace: std::time::Duration) -> DrainOutcome {
+pub(crate) async fn drain_in_flight_work(
+    gate: &WorkGate,
+    grace: std::time::Duration,
+) -> DrainOutcome {
     tokio::select! {
         biased;
         () = gate.quiesced() => DrainOutcome::Quiesced,
@@ -480,7 +483,7 @@ pub const DISPATCHED_ERROR_CODE: i32 = -32603;
 /// `params.root` is the absolute path to the target repository — required for
 /// every method except `ping`. The handle is acquired via
 /// `registry.get_or_open(root)`, which honours the daemon whitelist.
-async fn dispatch_hook_message(
+pub(crate) async fn dispatch_hook_message(
     body: &[u8],
     registry: &Arc<RepoRegistry>,
     dctx: &Arc<DispatchContext>,

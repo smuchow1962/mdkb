@@ -91,6 +91,32 @@ impl std::fmt::Debug for McpServer {
 
 #[tool_router]
 impl McpServer {
+    pub(crate) fn hook_runtime(
+        &self,
+    ) -> (Arc<RepoRegistry>, Arc<super::dispatch::DispatchContext>) {
+        let registry = if let Some(registry) = &self.registry {
+            Arc::clone(registry)
+        } else {
+            let handle = Arc::clone(
+                self.standalone_handle
+                    .as_ref()
+                    .expect("standalone server has a repo handle"),
+            );
+            let config = crate::daemon::config::DaemonConfig {
+                whitelist_dirs: vec![handle.root.display().to_string()],
+                ..crate::daemon::config::DaemonConfig::default()
+            };
+            Arc::new(RepoRegistry::with_handle(config, handle))
+        };
+        let dispatch = Arc::new(super::dispatch::DispatchContext::new(
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.session_id),
+            Arc::clone(&self.persistent_call_count),
+            self.full_config.db.optimize_interval_calls,
+        ));
+        (registry, dispatch)
+    }
+
     /// Create a new MCP server with default config.
     pub fn new(root: PathBuf) -> Self {
         Self::with_config(root, McpConfig::default())

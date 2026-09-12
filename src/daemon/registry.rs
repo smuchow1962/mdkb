@@ -191,6 +191,18 @@ impl RepoRegistry {
         }
     }
 
+    /// Create a single-repo registry around an already-open standalone handle.
+    ///
+    /// Network MCP and HTTP hooks then resolve the same `RepoHandle` and share
+    /// its SQLite connection, index facade, and startup state.
+    pub(crate) fn with_handle(config: DaemonConfig, handle: Arc<RepoHandle>) -> Self {
+        let registry = Self::new(config);
+        registry
+            .handles
+            .insert(handle.root.clone(), Arc::clone(&handle));
+        registry
+    }
+
     /// Get or open a repo handle, applying whitelist check and LRU eviction.
     pub fn get_or_open(&self, root: &Path) -> Result<Arc<RepoHandle>> {
         let canonical = canonicalize_root(root)?;

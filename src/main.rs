@@ -1439,13 +1439,15 @@ MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<n
                     disable,
                     dry_run,
                     profile_dir,
+                    http_url,
                 } => {
-                    let result = mdkb::cli::setup::handle_setup_hooks_claude(
+                    let result = mdkb::cli::setup::handle_setup_hooks_claude_with_http(
                         &cwd,
                         &scope,
                         &disable,
                         dry_run,
                         profile_dir.as_deref(),
+                        http_url.as_deref(),
                     )?;
                     if !result.dry_run {
                         if !result.events_registered.is_empty() {
