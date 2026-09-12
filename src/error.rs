@@ -250,10 +250,7 @@ impl ErrorKind {
     pub fn is_index_corrupt(&self) -> bool {
         match self {
             Self::IndexCorrupt { .. } | Self::IndexCorruptInUse { .. } => true,
-            Self::Database(rusqlite::Error::SqliteFailure(err, _)) => matches!(
-                err.code,
-                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
-            ),
+            Self::Database(err) => is_sqlite_corruption(err),
             _ => false,
         }
     }
@@ -282,6 +279,27 @@ impl ErrorKind {
             Self::InvalidEntryId(_) | Self::InvalidEntryField { .. }
         )
     }
+}
+
+/// True when SQLite says the database file itself is torn: it is not a
+/// database at all (`SQLITE_NOTADB`) or holds a malformed page
+/// (`SQLITE_CORRUPT`).
+///
+/// This is the one definition of corruption; every classifier that decides
+/// whether to quarantine a file or close a connection routes through it. Every
+/// other code — `BUSY`, `LOCKED`, `IOERR`, `NOMEM`, `CANTOPEN` — describes the
+/// attempt, not the file, so acting on it would rename a healthy database over
+/// a transient fault.
+#[must_use]
+pub fn is_sqlite_corruption(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            )
+    )
 }
 
 // Implement From for ErrorKind to Error

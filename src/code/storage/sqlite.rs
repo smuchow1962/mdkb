@@ -10,11 +10,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, ErrorCode, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::code::relationship::CallTarget;
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
+use crate::store::heal::Soundness;
 
 use super::schema;
 
@@ -942,21 +943,14 @@ fn quarantine_if_corrupt(path: &Path) -> rusqlite::Result<()> {
         return Ok(());
     }
 
+    // The same verdict as `index.sqlite`: only a file SQLite itself calls torn
+    // is moved. A lock or an I/O fault fails this open instead.
     let probe = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    probe.busy_timeout(std::time::Duration::from_secs(5))?;
-    let check = probe.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0));
-    let reason = match check {
-        Ok(result) if result == "ok" => return Ok(()),
-        Ok(result) => result,
-        Err(rusqlite::Error::SqliteFailure(err, message))
-            if matches!(
-                err.code,
-                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
-            ) =>
-        {
-            message.unwrap_or_else(|| err.to_string())
-        }
-        Err(e) => return Err(e),
+    probe.busy_timeout(crate::store::heal::PROBE_BUSY_TIMEOUT)?;
+    let reason = match crate::store::heal::is_structurally_sound(&probe) {
+        Soundness::Sound => return Ok(()),
+        Soundness::Corrupt { reason } => reason,
+        Soundness::Undetermined(e) => return Err(e),
     };
     drop(probe);
 
