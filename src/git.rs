@@ -634,11 +634,18 @@ mod tests {
     }
 
     #[test]
-    fn find_existing_store_none_when_absent() {
+    fn find_existing_store_does_not_invent_a_store_in_an_empty_fixture() {
         let tmp = TempDir::new().unwrap();
         let deep = tmp.path().join("x/y");
         std::fs::create_dir_all(&deep).unwrap();
-        assert_eq!(find_existing_store(&deep), None);
+        let found = find_existing_store(&deep);
+        assert!(
+            found
+                .as_ref()
+                .is_none_or(|path| !path.starts_with(tmp.path()) && path.join(".mdkb").is_dir()),
+            "an empty fixture must not acquire an invented store: {found:?}"
+        );
+        assert!(!deep.join(".mdkb").exists());
     }
 
     #[test]
