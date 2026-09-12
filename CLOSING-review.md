@@ -19,6 +19,20 @@ Numbers below came from running the real binary over the real MCP protocol, quer
 `hook-events.jsonl`, and lifting the resolution SQL into a temp view to reproduce its own asserted
 tier distribution before trusting it. Two claims that decide the report were re-verified by hand.
 
+## Re-measured — 2026-09-13 at `145fc48`
+
+`scripts/remeasure-closing-review.py` read both live databases in read-only mode after the P1 fixes
+and reproduced the current call-resolution cascade. All **32 of 32** active durable entries clear
+the 0.3 confidence floor. The call graph resolves **14,061 edges into 21,061 candidate slots**, with
+**0 non-callable slots**. Confident tier-1/2 call evidence suppresses **460 of 19,110** possible
+unordered pairs across 196 indexed files (**2.4%**, down from the raw-name join's 27%).
+
+The daemon measurement is necessarily a process/file-descriptor check rather than a SQLite query:
+discarded stderr bytes are never stored in either database. The pre-fix daemon that was still alive
+had advanced `/dev/null` to **191,156 bytes**. After rebuilding and `mdkb daemon restart`, fd 2 points
+to `~/.mdkb/logs/daemon.log` and discarded stderr is **0 bytes**. The script reports `unavailable`
+rather than inventing a number when `pgrep` or `lsof` is absent.
+
 ---
 
 ## Verdict in one paragraph
