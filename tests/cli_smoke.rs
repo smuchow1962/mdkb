@@ -1902,6 +1902,28 @@ fn smoke_search_no_init_fails_gracefully() {
     );
 }
 
+/// The first error most users meet. It must read as one line of English, not
+/// as the Rust `Debug` dump of the error struct (`Error { kind:
+/// DatabaseNotFound { .. }, backtrace: <disabled> }`) that `fn main() ->
+/// Result<()>` printed, which threw away every `#[error]` Display string.
+#[test]
+fn smoke_no_init_error_is_one_display_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(&["memory", "list"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "one line on stderr, got: {stderr}");
+    assert!(
+        lines[0].contains("database not initialized"),
+        "the Display text must reach the user: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Error {") && !stderr.contains("backtrace"),
+        "a Rust debug payload leaked: {stderr}"
+    );
+}
+
 #[test]
 fn smoke_get_nonexistent() {
     let repo = Repo::new();

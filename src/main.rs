@@ -83,7 +83,19 @@ fn print_eval_recall(runs: &[mdkb::eval::ModeRun<mdkb::eval::recall::RecallRepor
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    // A `Result` returned from `main` is printed with `{:?}`, which for our
+    // error type is the struct dump `Error { kind: .., backtrace: .. }` and
+    // hides every `#[error]` Display string. Print the Display form once,
+    // where the error finally surfaces, and exit 1 as the default would.
+    if let Err(e) = run_process() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Everything `main` does, as the `Result` it reports.
+fn run_process() -> Result<()> {
     // `--detach` has to happen before any threads exist — tokio spawns
     // workers eagerly, and fork() with live threads is undefined behavior.
     // We detect the flag by argv and run the double-fork in a single
