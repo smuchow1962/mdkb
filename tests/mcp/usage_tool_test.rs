@@ -1,7 +1,7 @@
 //! Integration tests for the `usage` MCP tool — surfaces the token ledger.
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, EmptyObject, RawContent};
+use rmcp::model::{CallToolResult, ContentBlock, EmptyObject};
 
 use mdkb::mcp::server::McpServer;
 use mdkb::mcp::tools::{MemoryWriteParams, SearchParams, UsageParams};
@@ -10,8 +10,8 @@ fn first_text(result: &CallToolResult) -> String {
     result
         .content
         .iter()
-        .find_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.clone()),
+        .find_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.clone()),
             _ => None,
         })
         .unwrap_or_default()

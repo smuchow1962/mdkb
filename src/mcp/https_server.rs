@@ -1,19 +1,13 @@
 //! HTTPS transport for the MCP server with self-signed certificate generation.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use axum::Router;
-use axum::middleware;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Datelike;
-use rmcp::transport::streamable_http_server::StreamableHttpService;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
 use tokio_util::sync::CancellationToken;
 
 use super::McpServer;
-use super::common::{AppState, auth_middleware, health_handler};
+use super::common::mcp_router;
 
 /// Run the HTTPS MCP server with self-signed certificates.
 pub async fn run_https_server(
@@ -22,30 +16,7 @@ pub async fn run_https_server(
     token: Option<&str>,
 ) -> crate::error::Result<()> {
     let cancellation_token = CancellationToken::new();
-
-    let config = StreamableHttpServerConfig {
-        stateful_mode: true,
-        cancellation_token: cancellation_token.clone(),
-        ..Default::default()
-    };
-
-    let session_manager = Arc::new(LocalSessionManager::default());
-
-    let mcp_service =
-        StreamableHttpService::new(move || Ok(server.clone()), session_manager, config);
-
-    let state = AppState {
-        token: token.map(String::from),
-    };
-
-    let router = Router::new()
-        .route("/health", axum::routing::get(|| health_handler(true)))
-        .nest_service("/mcp", mcp_service)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state);
+    let router = mcp_router(server, bind, token, true, cancellation_token.clone());
 
     // Generate or load self-signed certificate
     let (cert_path, key_path) = ensure_self_signed_cert()?;

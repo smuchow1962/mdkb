@@ -47,7 +47,7 @@ fs4 = "0.12"
 libc = "0.2"
 
 # MCP protocol
-rmcp = { version = "0.14", features = ["server", "transport-io"] }
+rmcp = { version = "3.3", features = ["server", "transport-io"] }
 
 # HTTP server (for MCP HTTP transport)
 axum = { version = "0.8", optional = true }
@@ -135,7 +135,7 @@ assert_cmd = "2"
 predicates = "3"
 # Enable the rmcp client only for tests so we can drive the daemon's
 # rmcp-over-unix endpoint with a real handshake.
-rmcp = { version = "0.14", features = ["server", "transport-io", "client"] }
+rmcp = { version = "3.3", features = ["server", "transport-io", "client"] }
 # `test-util` gives tests a paused clock, so a timeout measured in minutes
 # (the daemon's shutdown drain) can be asserted without waiting for one.
 tokio = { version = "1", features = ["full", "test-util"] }

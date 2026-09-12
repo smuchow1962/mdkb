@@ -1187,8 +1187,9 @@ mod tests {
         })
     }
 
-    fn args_from(v: Value) -> Option<serde_json::Map<String, Value>> {
-        v.as_object().cloned()
+    fn call_params(name: &'static str, args: Value) -> CallToolRequestParams {
+        CallToolRequestParams::new(name)
+            .with_arguments(args.as_object().cloned().expect("arguments are an object"))
     }
 
     #[tokio::test]
@@ -1217,12 +1218,7 @@ mod tests {
             .expect("client handshake error");
         let result = timeout(
             Duration::from_secs(15),
-            client.call_tool(CallToolRequestParams {
-                name: "status".into(),
-                arguments: args_from(json!({})),
-                meta: None,
-                task: None,
-            }),
+            client.call_tool(call_params("status", json!({}))),
         )
         .await
         .expect("call_tool status timed out")
@@ -1270,16 +1266,14 @@ mod tests {
             .expect("client handshake error");
         let result = timeout(
             Duration::from_secs(15),
-            client.call_tool(CallToolRequestParams {
-                name: "search".into(),
-                arguments: args_from(json!({
+            client.call_tool(call_params(
+                "search",
+                json!({
                     "query": "anything",
                     "scope": "docs",
                     "root": root.display().to_string(),
-                })),
-                meta: None,
-                task: None,
-            }),
+                }),
+            )),
         )
         .await
         .expect("call_tool search timed out")
