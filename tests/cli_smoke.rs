@@ -1,34 +1,37 @@
 //! CLI smoke test: exercises every `mdkb` subcommand in an isolated tempdir
 //! repo, checking that each exits 0 (or expected non-zero) and produces valid
 //! output. Invoke with `cargo test --test cli_smoke`.
+//!
+//! Every spawn goes through `cli::command()`, which gives the binary a
+//! throwaway `HOME` and `MDKB_NO_DAEMON` (story 067-5ab6). Until then this
+//! suite sent 78 mutation and hook requests per run to the developer's real
+//! daemon socket, and would have spawned a daemon under the developer's
+//! account when none was listening. The one test that needs a daemon,
+//! `smoke_memory_add_routed_through_a_daemon_renders_like_the_direct_path`,
+//! starts its own under its own `HOME`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 #[path = "common/cli.rs"]
 mod cli;
-use cli::{bin, run};
+use cli::run;
 
 fn run_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Output {
-    Command::new(bin())
+    cli::command()
         .args(args)
         .envs(env.iter().copied())
         .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .output()
         .unwrap_or_else(|e| panic!("spawn failed for `mdkb {}`: {e}", args.join(" ")))
 }
 
 fn run_stdin(args: &[&str], cwd: &Path, stdin: &str) -> Output {
-    let mut child = Command::new(bin())
+    let mut child = cli::command()
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("spawn failed for `mdkb {}`: {e}", args.join(" ")));
 
@@ -937,6 +940,159 @@ fn smoke_memory_lifecycle() {
 
     let out = run(&["memory", "rm", "smoke-test-entry"], &repo.root);
     assert_ok(&out, "memory rm");
+}
+
+/// A daemon serving one repository, under a `HOME` that belongs to this test.
+///
+/// The hermetic default keeps every other test away from any daemon. This is
+/// the one place a daemon is wanted: the routed CLI path renders the daemon's
+/// typed result through `print_routed_result`, and before story 067-5ab6 that
+/// renderer was never exercised — every routed call in this suite reached the
+/// developer's daemon, was refused (the tempdir is outside its whitelist) and
+/// fell back to the direct path.
+#[cfg(unix)]
+struct Daemon {
+    child: std::process::Child,
+    home: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl Daemon {
+    fn serving(repo_root: &Path) -> Self {
+        let home = tempfile::tempdir().expect("daemon HOME");
+        let mdkb_dir = home.path().join(".mdkb");
+        std::fs::create_dir_all(&mdkb_dir).expect("daemon home dir");
+        // Default-deny confines the daemon to `HOME`; the repository lives in
+        // a tempdir, so it has to be admitted explicitly.
+        let parent = repo_root.parent().expect("repo parent");
+        std::fs::write(
+            mdkb_dir.join("daemon.toml"),
+            format!("whitelist_dirs = [{:?}]\n", parent.display().to_string()),
+        )
+        .expect("write daemon.toml");
+
+        let child = cli::command()
+            .args(["serve", "--daemon"])
+            .env("HOME", home.path())
+            .env_remove("MDKB_NO_DAEMON")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn mdkb serve --daemon");
+        let daemon = Self { child, home };
+
+        let socket = daemon.hook_socket();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon did not bind {} within 20s",
+                socket.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        daemon
+    }
+
+    fn hook_socket(&self) -> PathBuf {
+        self.home.path().join(".mdkb/daemon-hook.sock")
+    }
+
+    /// The `mdkb` invocation a user gets with this daemon running: routed.
+    /// `-v` because the fallback branch announces itself at info level and the
+    /// routed branch does not, so the log is what tells the two apart. (A bare
+    /// `RUST_LOG=info` does not raise the level: the CLI adds its own `warn`
+    /// directive on top of the environment filter, and that one wins.)
+    fn client(&self) -> std::process::Command {
+        let mut cmd = cli::command();
+        cmd.arg("-v")
+            .env("HOME", self.home.path())
+            .env_remove("MDKB_NO_DAEMON");
+        cmd
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `main.rs` has three exits for a routed mutation: the daemon's result goes
+/// through `print_routed_result`; an `Undetermined` failure exits non-zero; an
+/// `Unstarted` failure logs `writing in-process` and runs the direct path. Exit
+/// 0 without that log line is therefore the routed renderer — and the control
+/// run below, with the daemon gone, proves the line does appear when the
+/// fallback runs, so the negative assertion cannot pass by accident.
+#[cfg(unix)]
+#[test]
+fn smoke_memory_add_routed_through_a_daemon_renders_like_the_direct_path() {
+    const FALLBACK: &str = "writing in-process";
+    let repo = Repo::new();
+    let daemon = Daemon::serving(&repo.root);
+
+    let routed = daemon
+        .client()
+        .args([
+            "memory",
+            "add",
+            "routed-entry",
+            "-t",
+            "Routed",
+            "-c",
+            "body",
+        ])
+        .current_dir(&repo.root)
+        .output()
+        .expect("routed memory add");
+    assert_ok(&routed, "routed memory add");
+    let routed_stderr = String::from_utf8_lossy(&routed.stderr);
+    assert!(
+        !routed_stderr.contains(FALLBACK),
+        "with a daemon serving the repo the CLI must not write in-process: {routed_stderr}"
+    );
+    assert_eq!(
+        stdout(&routed),
+        "Added memory entry 'routed-entry'\n",
+        "the routed renderer must print the same line as the direct one"
+    );
+    let shown = run(&["memory", "show", "routed-entry"], &repo.root);
+    assert_ok(&shown, "memory show after routed add");
+    assert!(
+        stdout(&shown).contains("Routed"),
+        "the daemon's write must be visible to a direct reader: {}",
+        stdout(&shown)
+    );
+
+    // Control: same command, daemon gone, spawning forbidden.
+    let home = daemon.home.path().to_path_buf();
+    drop(daemon);
+    let direct = cli::command()
+        .args([
+            "-v",
+            "memory",
+            "add",
+            "direct-entry",
+            "-t",
+            "Direct",
+            "-c",
+            "body",
+        ])
+        .env("HOME", &home)
+        .env_remove("MDKB_NO_DAEMON")
+        .current_dir(&repo.root)
+        .output()
+        .expect("direct memory add");
+    assert_ok(&direct, "direct memory add");
+    let direct_stderr = String::from_utf8_lossy(&direct.stderr);
+    assert!(
+        direct_stderr.contains(FALLBACK),
+        "with no daemon the fallback must announce itself, or the assertion \
+         above proves nothing: {direct_stderr}"
+    );
+    assert_eq!(stdout(&direct), "Added memory entry 'direct-entry'\n");
 }
 
 #[test]
