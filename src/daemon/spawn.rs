@@ -66,12 +66,18 @@ async fn try_connect(socket_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Spawn `mdkb serve --daemon` as a detached background process.
+/// Spawn `mdkb serve --daemon --detach` as a detached background process.
 ///
-/// stdio is nulled and the child is placed in its own process group so
-/// killing the parent (e.g. Claude tearing down the MCP transport) does
-/// not propagate SIGHUP/SIGINT to the daemon.
-fn spawn_daemon_detached() -> Result<()> {
+/// `--detach` makes the child double-fork, `setsid`, and point its stdout and
+/// stderr at `~/.mdkb/logs/daemon.log` (`cli::daemon::detach_current_process`).
+/// Without it the daemon keeps the nulled stdio below and every warning it
+/// emits is lost (story 062). The child is also placed in its own process
+/// group so killing the parent (e.g. Claude tearing down the MCP transport)
+/// does not propagate SIGHUP/SIGINT to the daemon.
+///
+/// The one spawn path for the auto-spawn above and `mdkb daemon restart`, so
+/// both reach the same log setup.
+pub fn spawn_daemon_detached() -> Result<()> {
     let exe = current_exe()?;
 
     #[cfg(unix)]
@@ -80,6 +86,7 @@ fn spawn_daemon_detached() -> Result<()> {
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("serve")
         .arg("--daemon")
+        .arg("--detach")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

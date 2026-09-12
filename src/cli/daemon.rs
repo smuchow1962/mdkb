@@ -4,6 +4,8 @@
 //! daemon via Unix signals. None of them require the daemon to be healthy —
 //! a stale pid file with a dead process is reported as "not running".
 
+#[cfg(unix)]
+use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -15,6 +17,17 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum time `restart` waits for the fresh daemon's sockets to appear.
 #[cfg(unix)]
 const RESTART_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Rotation bound for `~/.mdkb/logs/daemon.log`: 10 MiB.
+///
+/// One policy: when a detached daemon starts and the log is larger than this,
+/// the file is renamed to `daemon.log.1` (replacing the previous one) and a
+/// fresh log is opened. Disk use is bounded at about two files of this size
+/// plus what one daemon lifetime appends, because the size is checked at
+/// start only, never while running. Measured 2026-09-12: the unrotated log
+/// had reached 15.8 MB (story 062).
+#[cfg(unix)]
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 #[cfg(unix)]
 mod platform {
@@ -137,7 +150,7 @@ mod platform {
             handle_stop().await?;
         }
 
-        spawn_daemon_detached()?;
+        crate::daemon::spawn::spawn_daemon_detached()?;
 
         let deadline = Instant::now() + RESTART_READY_TIMEOUT;
         while Instant::now() < deadline {
@@ -153,25 +166,6 @@ mod platform {
         Err(Error::other(format!(
             "daemon did not become ready within {RESTART_READY_TIMEOUT:?}"
         )))
-    }
-
-    fn spawn_daemon_detached() -> Result<()> {
-        use std::os::unix::process::CommandExt;
-
-        let exe = std::env::current_exe().map_err(|e| Error::other(format!("current_exe: {e}")))?;
-
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("serve")
-            .arg("--daemon")
-            .arg("--detach")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0);
-
-        cmd.spawn()
-            .map(|_| ())
-            .map_err(|e| Error::other(format!("spawn mdkb daemon ({}): {e}", exe.display())))
     }
 }
 
@@ -314,6 +308,7 @@ fn redirect_stdio_to_log() -> Result<()> {
     std::fs::create_dir_all(&logs_dir)
         .map_err(|e| Error::other(format!("mkdir {}: {e}", logs_dir.display())))?;
     let log_path = logs_dir.join("daemon.log");
+    rotate_if_larger_than(&log_path, MAX_LOG_BYTES)?;
 
     let devnull = std::fs::OpenOptions::new()
         .read(true)
@@ -337,6 +332,25 @@ fn redirect_stdio_to_log() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Move `path` aside to `<path>.1` when it is larger than `max_bytes`, replacing
+/// any earlier `<path>.1`. A missing file is not an error: the daemon may be
+/// starting for the first time.
+#[cfg(unix)]
+fn rotate_if_larger_than(path: &Path, max_bytes: u64) -> Result<()> {
+    let size = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::other(format!("stat {}: {e}", path.display()))),
+    };
+    if size <= max_bytes {
+        return Ok(());
+    }
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1");
+    std::fs::rename(path, &rotated)
+        .map_err(|e| Error::other(format!("rotate {}: {e}", path.display())))
 }
 
 #[cfg(test)]
@@ -373,5 +387,40 @@ mod tests {
     fn process_alive_is_false_for_unused_high_pid() {
         // PID 0xFFFF_FFFE is effectively guaranteed not to exist.
         assert!(!process_alive(0xFFFF_FFFE));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rotate_moves_an_oversized_log_aside_and_replaces_the_old_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("daemon.log");
+        let rotated = tmp.path().join("daemon.log.1");
+        std::fs::write(&rotated, "stale").unwrap();
+        std::fs::write(&log, "0123456789A").unwrap(); // 11 bytes, limit 10
+
+        rotate_if_larger_than(&log, 10).unwrap();
+
+        assert!(!log.exists(), "the oversized log must be moved, not copied");
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "0123456789A");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rotate_leaves_a_log_at_or_under_the_limit_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("daemon.log");
+        std::fs::write(&log, "0123456789").unwrap(); // exactly 10 bytes
+
+        rotate_if_larger_than(&log, 10).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "0123456789");
+        assert!(!tmp.path().join("daemon.log.1").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rotate_accepts_a_missing_log() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        rotate_if_larger_than(&tmp.path().join("daemon.log"), 10).unwrap();
     }
 }

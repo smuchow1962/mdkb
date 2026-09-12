@@ -215,3 +215,77 @@ fn hook_cli_exits_zero_on_whitelist_rejection() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A daemon that a client auto-spawned under a temp HOME. It is not our child
+/// process, so `mdkb daemon stop` under the same HOME is what ends it. Runs on
+/// drop so no detached daemon outlives the test, pass or fail.
+struct AutoSpawnedDaemon {
+    home: TempDir,
+}
+
+impl Drop for AutoSpawnedDaemon {
+    fn drop(&mut self) {
+        let _ = Command::new(BIN)
+            .args(["daemon", "stop"])
+            .env("HOME", self.home.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Story 062: the daemon a hook client spawns on its own must write its
+/// tracing output to `~/.mdkb/logs/daemon.log`, the same file a manual
+/// `mdkb serve --daemon --detach` writes. Before the fix the auto-spawn
+/// omitted `--detach`, so the stdio redirect never ran and every line the
+/// daemon emitted went to /dev/null.
+#[test]
+fn auto_spawned_daemon_writes_daemon_log() {
+    let repo = make_repo();
+    let root = repo.path().canonicalize().unwrap();
+    let home = TempDir::new().unwrap();
+    let mdkb_dir = home.path().join(".mdkb");
+    std::fs::create_dir_all(&mdkb_dir).unwrap();
+    std::fs::write(
+        mdkb_dir.join("daemon.toml"),
+        format!(
+            "whitelist_dirs = [{:?}]\n",
+            root.parent().unwrap().display().to_string()
+        ),
+    )
+    .unwrap();
+    let daemon = AutoSpawnedDaemon { home };
+
+    // No daemon runs under this HOME, so the client goes through
+    // `daemon::spawn::spawn_daemon_detached`. The spawned daemon inherits
+    // RUST_LOG, which lifts its INFO startup line above the default WARN
+    // filter. The directive has to name the target: `run_cli` adds a bare WARN
+    // directive on top of RUST_LOG, and between two bare directives the WARN
+    // one wins, while a target-scoped one is more specific and takes effect.
+    let output = Command::new(BIN)
+        .args(["hook", "status", "--root"])
+        .arg(&root)
+        .env("HOME", daemon.home.path())
+        .env("RUST_LOG", "mdkb=info")
+        .output()
+        .expect("run hook status");
+    assert!(
+        output.status.success(),
+        "hook status must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log_path = daemon.home.path().join(".mdkb/logs/daemon.log");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if content.contains("mdkb daemon started (pid") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon.log never received the startup line. Content: {content:?}"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
