@@ -20,6 +20,15 @@ by a session on the host that reported them.
 
 ### Added
 
+- **Native lifecycle hooks over HTTP and HTTPS.** Both network transports now
+  expose `POST /hook/{method}` through the same dispatcher, repository registry,
+  and shutdown work gate as Unix hook IPC. Claude Code setup accepts
+  `--http-url`; UserPromptSubmit, PreToolUse, PostToolUse, and Stop become native
+  HTTP handlers with bearer authentication, while SessionStart remains a
+  command hook because that event does not support HTTP handlers.
+- **Complete MCP tool annotations.** All 12 advertised tools declare read-only,
+  destructive, idempotent, and open-world hints so an agent can reason about
+  side effects before calling them.
 - **`mdkb dup` reports duplicated code**, and `search scope="duplicates"` asks
   the same question over MCP. One handler serves both surfaces, so the CLI and
   the MCP server cannot disagree about the same repository, and there is no
@@ -97,6 +106,20 @@ by a session on the host that reported them.
 
 ### Changed
 
+- **Prompt recall is gated by the final hybrid score.** Memory recall now returns
+  its BM25/vector relevance fused with confidence, and `min_recall_score`
+  filters that result instead of filtering on age-derived confidence alone.
+  Topics, problems, and decisions no longer decay merely because they are old;
+  reminders, priors, and handoffs retain lifecycle decay.
+- **Call resolution understands receiver types.** Method calls retain their
+  written qualifier and an inferred receiver type; the resolution cascade and
+  coupling audit share that evidence instead of treating every same-named
+  symbol as connected.
+- **rmcp upgraded from 0.14 to 3.3.** The HTTP/HTTPS MCP surface keeps the same
+  12-tool semantic contract while adopting current JSON Schema conventions.
+  Bearer auth and constant-time token checks protect both MCP and HTTP hook
+  routes; MCP additionally validates the Host header against an allow-list.
+  RUSTSEC-2026-0189 is no longer present.
 - **Duplication clusters use complete linkage.** Similarity is not transitive.
   Union-find closed it transitively anyway, and on this repository that produced
   one component of 3209 symbols across 241 modules whose widest pair sat 47 bits
@@ -218,6 +241,13 @@ by a session on the host that reported them.
 
 ### Fixed
 
+- **Every memory-writing surface uses one mutation pipeline.** CLI, MCP, batch,
+  import, and hook-driven writes now share duplicate admission, embeddings,
+  edges, revisions, and Markdown projection behavior.
+- **Shutdown and configuration are explicit.** HTTP/HTTPS accept loops stop
+  before in-flight work drains, detached daemon stderr goes to its log file,
+  and dead configuration knobs have been removed so unknown keys are reported
+  by dotted path instead of pretending to work.
 - **`mdkb dup` and `mdkb coupling` honour `--format`.** The flag is declared
   `global = true`, so both commands advertised `json`, `csv` and `markdown` in
   their own `--help` — and printed the prose report whatever was asked for. A

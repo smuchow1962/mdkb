@@ -218,13 +218,23 @@ memory_write(
 **When NOT to use TTL:**
 - Architectural decisions — these belong in permanent memory
 - Solved problems worth preserving — no TTL
-- If in doubt, omit `ttl` and rely on confidence decay instead
+- If in doubt, omit `ttl`; durable topics, problems, and decisions remain active
+  until explicitly superseded, refuted, or expired
 
 ## Memory Search vs Memory Index
 
-- **Warmup index** (`memory_list`): Top 50 entries by usage. Check this first.
-- **Search** (`search(query, scope="memory")`): Hybrid BM25+vector search for specific entries.
-- **Confidence**: Each entry has a confidence score (0-1) based on temporal decay and source type.
+- **Warmup index**: Up to 10 project-affine entries, bounded by an approximate
+  300-token budget and a confidence floor. Due reminders and the newest handoff
+  have dedicated slots instead of competing with durable knowledge.
+- **Search** (`search(query, scope="memory")`): Hybrid BM25+vector search for
+  specific entries. Hook recall applies `min_recall_score` to the final hybrid
+  relevance-plus-confidence score.
+- **Confidence**: Topics, problems, and decisions do not decay with age; their
+  truth changes through TTL, supersession, or refutation. Reminders, priors, and
+  handoffs are lifecycle records, so their confidence does decay over time.
+- **Relations**: Active one-hop memory neighbors can expand recall, while a
+  superseded or net-refuted dependency marks the entry `[STALE-DEP]` without
+  mutating stored confidence.
 
 The warmup index auto-loads at session start. Use `get(id)` to retrieve full content.
 

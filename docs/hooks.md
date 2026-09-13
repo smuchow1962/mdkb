@@ -12,16 +12,17 @@ from stale training data. Hooks make recall proactive:
 
 - **SessionStart** — inject a warmup block listing recently-accessed
   memory entries as soon as a session opens.
-- **UserPromptSubmit** — match the user's prompt against the memory FTS
-  index and inject the top-N entries before the assistant replies; when the
-  prompt names a document, also inject its 1-hop frontmatter doc-graph
-  neighbors.
+- **UserPromptSubmit** — hybrid-rank memory and documents against the user's
+  prompt and inject only entries above the final-score floor; when the prompt
+  names a document, also inject its 1-hop frontmatter doc-graph neighbors.
 - **PreToolUse** — intercept `Grep`/`Bash` searches; on a definition search for
   an indexed symbol inject the real `file:line` from the code index, otherwise
   suggest `mdkb search` / `mdkb code` CLI commands. Works without MCP.
 - **PostToolUse** — when `Edit` / `Write` / `MultiEdit` / `NotebookEdit`
-  touches a file, append it to `.mdkb/reindex-queue.jsonl` so the next
-  `mdkb update` pass picks it up.
+  touches a file, send it directly to the daemon watcher for targeted reindex.
+- **Stop** — trigger pending embedding backfill and, when explicitly enabled,
+  distill the completed episode into a reusable behavioral prior in the
+  background.
 
 All hooks are fire-and-forget: internal errors are logged to stderr and
 swallowed — the host CLI is never blocked by mdkb.
@@ -34,6 +35,15 @@ mdkb setup hooks claude --scope local
 
 # Claude Code, user-scoped (writes ~/.claude/settings.json)
 mdkb setup hooks claude --scope user
+
+# Terminal 1: serve native HTTP hooks. The server token and the token exposed
+# to Claude's allowed environment must have the same value.
+export MDKB_TOKEN='replace-with-a-secret'
+export MDKB_HOOK_TOKEN="$MDKB_TOKEN"
+mdkb serve --http --bind 127.0.0.1:8080 --token "$MDKB_TOKEN"
+
+# Terminal 2: write the matching Claude registration.
+mdkb setup hooks claude --scope local --http-url http://127.0.0.1:8080
 
 # Codex CLI (writes ~/.codex/hooks.json)
 mdkb setup hooks codex
@@ -49,7 +59,8 @@ mdkb setup hooks claude --disable post-tool-use
 mdkb setup hooks claude --disable user-prompt-submit,post-tool-use
 ```
 
-Valid values: `session-start`, `user-prompt-submit`, `pre-tool-use`, `post-tool-use`.
+Valid values: `session-start`, `user-prompt-submit`, `pre-tool-use`,
+`post-tool-use`, `stop`.
 
 ### Dry run
 
@@ -61,9 +72,18 @@ Prints the merged settings JSON to stdout without writing.
 
 ## Event contracts
 
-Every handler reads the event JSON from stdin and writes a JSON object
-to stdout. Exit code is always 0. When a hook has nothing to contribute,
-it returns `{}` (empty object).
+Command handlers read the event JSON from stdin and write a JSON object to
+stdout. Exit code is always 0. Native HTTP handlers send the same event object
+to `POST /hook/{method}` and receive the same compact JSON-RPC envelope used by
+the Unix hook socket. `cwd` becomes the repository `root` when the host does not
+supply an mdkb-specific field. Dispatch errors, including malformed JSON, use
+HTTP 200 with a JSON-RPC error; missing or invalid bearer credentials are
+rejected before the body is parsed.
+
+`mdkb setup hooks claude --http-url <base>` installs HTTP handlers for
+UserPromptSubmit, PreToolUse, PostToolUse, and Stop. SessionStart remains a
+command handler because Claude Code does not support HTTP for that event. Codex
+setup remains command-based.
 
 ### SessionStart
 
@@ -89,9 +109,12 @@ Input:
 ```
 
 Empty or wrap-up prompts (`/clear`, `/compact`, `/exit`, `/quit`,
-`/wrapup`) are skipped. The handler tokenizes the prompt, strips
-stopwords and sub-3-char fragments, and runs an FTS5 OR query against
-the memory index.
+`/wrapup`) are skipped. By default, recall also requires a leading `*` opt-in
+sigil. The handler strips the sigil, stopwords, and sub-3-character fragments,
+then ranks memory through hybrid BM25 and local-vector retrieval. The configured
+floor applies to the final relevance-plus-confidence score, not confidence
+alone. Matching documents reuse the same query embedding, avoiding a second
+ONNX inference pass.
 
 Output (when matches are found):
 
@@ -197,6 +220,15 @@ via `canonicalize_under_cwd()` to reject traversal attempts.
 Output: `{"queued": true}` on success, `{}` when skipped or on error
 (PostToolUse must never return `additionalContext`).
 
+### Stop
+
+Stop is an end-of-episode signal. It always schedules a best-effort background
+backfill for memory entries whose embedding could not be generated on their
+write path. Behavioral-prior mining is separate and disabled by default. When
+`[priors] mining_enabled = true` and `distiller_program` is configured, mdkb
+reads a bounded transcript tail and launches the external distiller without
+holding up the host. The hook itself returns `{}` immediately.
+
 ## Configuration
 
 All toggles live under `[hooks]` in `.mdkb/config.toml`:
@@ -207,6 +239,14 @@ session_start_enabled = true
 user_prompt_submit_enabled = true
 pre_tool_use_enabled = true
 post_tool_use_enabled = true
+
+# Keep normal prompts untouched unless they begin with `*`.
+user_prompt_submit_require_sigil = true
+
+# Warmup is bounded by both entry count and tokens.
+warmup_limit = 10
+warmup_token_budget = 300
+warmup_min_confidence = 0.25
 
 # Max recall results injected on UserPromptSubmit.
 recall_limit = 5
@@ -222,6 +262,9 @@ latency_budget_ms = 200
 
 # Minimum hybrid score for a recall result to be injected.
 min_recall_score = 0.3
+
+# Require daemon delivery instead of using the in-process fallback.
+daemon_required = false
 
 # PreToolUse: inject real code-index file:line hits for definition
 # searches (fn/struct/…) instead of a suggestion. Falls back to the
@@ -245,13 +288,13 @@ memory-only behavior.
 Three ways, in order of granularity:
 
 1. **Per-project file marker** — create an empty `.mdkbignore-hooks`
-   file at the repo root. All three hooks return `{}` immediately for
+   file at the repo root. All hooks return `{}` immediately for
    any working directory under that marker. Useful for one-off repos
    where you do not want mdkb to participate even if hooks are
    globally installed.
-2. **Per-event config toggle** — set
-   `session_start_enabled = false` (or the other two) in
-   `.mdkb/config.toml`.
+2. **Per-event config toggle** — disable SessionStart, UserPromptSubmit,
+   PreToolUse, or PostToolUse in `.mdkb/config.toml`. Stop mining has its own
+   `[priors] mining_enabled` switch and is off by default.
 3. **Uninstall** — `mdkb setup remove hooks claude --scope local|user`
    or `mdkb setup remove hooks codex`. Or remove the `_managedBy: "mdkb"`
    entries manually from the settings file.
@@ -278,8 +321,10 @@ directory.
 
 ### Recall is empty
 
-- `search_entries_fts` requires at least one indexed memory entry. Run
-  `mdkb memory list` and confirm the DB is populated.
+- Recall requires a leading `*` by default. Use `* your prompt`, or set
+  `user_prompt_submit_require_sigil = false` for always-on recall.
+- Hybrid recall requires at least one indexed memory entry. Run `mdkb memory
+  list` and confirm the DB is populated.
 - Conversational prompts with only stopwords (e.g. "what is this?")
   produce no tokens and are skipped by design.
 
@@ -296,13 +341,16 @@ Use this to tune the budget or diagnose cold-start issues.
 
 ### Edited files not reindexing
 
-PostToolUse sends edited paths to the daemon's watcher channel. If
-the daemon is not running, the path is lost. Restart the daemon with
-`mdkb daemon restart` or run `mdkb update` for a full differential
-reindex.
+Command hooks auto-start the daemon and fall back in-process unless
+`daemon_required = true`; check `mdkb daemon status` if delivery fails. Native
+HTTP hooks require the configured HTTP/HTTPS server to remain running and
+`MDKB_HOOK_TOKEN` to match its bearer token. `mdkb update` remains the safe full
+differential fallback.
 
 ## Automated verification
 
 The hook contract is covered end-to-end by `tests/e2e_hooks.rs`,
 which spawns the real `mdkb` binary and asserts that warmup, recall,
-and reindex-queue output matches the spec.
+and immediate watcher delivery match the spec. HTTP/Unix parity, authentication,
+root admission, and JSON-RPC errors are covered in `src/mcp/common.rs` and
+`tests/e2e_mcp_http.rs`.

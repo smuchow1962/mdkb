@@ -23,10 +23,10 @@ use and then runs on-device.
 
 - **Repository-first, not conversation-first** — docs, decisions, solved
   problems, symbols, and dependencies are searchable as one project context.
-- **Memory designed to age well** — typed entries carry provenance, confidence
-  decay, confirmation/refutation signals, TTL, reminders, revisions,
-  supersession, and explicit relations. Stale knowledge is surfaced instead of
-  silently becoming permanent truth.
+- **Memory designed to age well** — durable topics, problems, and decisions stay
+  valid until explicitly superseded, refuted, or expired; lifecycle records
+  (reminders, priors, and handoffs) still decay with age. Typed entries also
+  carry provenance, revisions, confirmation signals, and explicit relations.
 - **Recall is not dependent on a lucky tool call** — hooks inject a compact
   session warmup, provide opt-in prompt recall with a leading `*` by default,
   redirect code searches to indexed symbols, and reindex after edits. Always-on
@@ -79,6 +79,35 @@ the primary requirement.
   commands.
 - **Self-maintaining indexes** — automatic watching, differential reindexing,
   integrity checks, repair, and database maintenance.
+
+## Recent improvements
+
+- **Content-aware prompt recall** now ranks memory with the same hybrid
+  BM25-plus-vector score used by search. The injection floor applies to that
+  final relevance score rather than to age-derived confidence, so old but
+  relevant engineering decisions survive while weak lexical matches stay out.
+- **One memory mutation path** serves CLI, MCP, batch writes, imports, and hook
+  workflows. Duplicate checks, embeddings, typed edges, revisions, and the
+  Git-reviewable Markdown projection therefore stay consistent regardless of
+  which surface wrote the entry.
+- **Typed receiver resolution** records both the written qualifier and the
+  inferred receiver type of method calls. The graph can distinguish calls such
+  as `store.write()` and `cache.write()` even when the member name is identical;
+  coupling analysis now trusts the same resolved-edge cascade instead of raw
+  name equality.
+- **Native HTTP/HTTPS hooks** share the exact Unix-hook dispatcher at
+  `POST /hook/{method}`. Claude Code can install supported HTTP handlers with
+  `--http-url`; authentication, repository selection, work draining, and error
+  envelopes are identical across transports.
+- **Safer network MCP** uses rmcp 3.3, bearer authentication, constant-time
+  token comparison, and an allow-list for `Host` headers to block DNS rebinding.
+- **Agent-readable tool metadata** labels all 12 MCP tools as read-only or
+  mutating, destructive or safe, idempotent or not, and open-world or local.
+  Clients can plan and ask for approval from declared behavior rather than
+  guessing from a tool name.
+- **Cleaner operations** remove dead configuration knobs, reject unknown config
+  with its dotted path, drain in-flight work on shutdown, and keep detached
+  daemon stderr in `~/.mdkb/logs/daemon.log`.
 
 See [CHANGES.md](CHANGES.md) for release history.
 
@@ -136,6 +165,14 @@ mdkb setup hooks claude --scope local
 # Claude Code, user-scoped / global (writes ~/.claude/settings.json)
 mdkb setup hooks claude --scope user
 
+# Terminal 1: serve native HTTP hooks (SessionStart remains a command hook)
+export MDKB_TOKEN='replace-with-a-secret'
+export MDKB_HOOK_TOKEN="$MDKB_TOKEN"
+mdkb serve --http --bind 127.0.0.1:8080 --token "$MDKB_TOKEN"
+
+# Terminal 2: write the matching Claude registration
+mdkb setup hooks claude --scope local --http-url http://127.0.0.1:8080
+
 # Codex CLI (writes ~/.codex/hooks.json)
 mdkb setup hooks codex
 
@@ -147,7 +184,11 @@ mdkb setup hooks claude --disable post-tool-use
 mdkb setup hooks claude --disable user-prompt-submit,post-tool-use
 ```
 
-Restart the host CLI after setup. Re-running is idempotent: existing hook entries are replaced, unrelated settings preserved. Events: `session-start`, `user-prompt-submit`, `pre-tool-use` (Grep interceptor), `post-tool-use`. Full contract, config, and opt-out in [docs/hooks.md](docs/hooks.md).
+Restart the host CLI after setup. Re-running is idempotent: existing hook
+entries are replaced and unrelated settings are preserved. Events:
+`session-start`, `user-prompt-submit`, `pre-tool-use` (Grep/Bash interceptor),
+`post-tool-use`, and `stop`. Full command and HTTP contracts, configuration,
+and opt-out behavior are in [docs/hooks.md](docs/hooks.md).
 
 Per-prompt recall is quiet by default: prefix a prompt with `*` to inject
 matching memory, documents, and graph hints. To make it always-on, set
@@ -220,6 +261,10 @@ full in-process server, sharing one daemon for file watching and indexing.
 | `memory_list` | List memory entries sorted by recency, popularity, or creation date |
 | `usage` | Session and lifetime token ledger (per-tool call counts, token totals, truncation stats) |
 
+Every advertised tool includes MCP annotations for read-only, destructive,
+idempotent, and open-world behavior. These hints describe effects; server-side
+validation and write admission remain authoritative.
+
 ### Search Scopes
 
 | Scope | What it searches |
@@ -235,7 +280,10 @@ full in-process server, sharing one daemon for file watching and indexing.
 
 Persistent AI knowledge that survives across sessions — decisions, patterns, solved problems:
 
-- **Confidence scoring** — entries decay over time unless re-confirmed (0-1 score based on age, access count, source type)
+- **Confidence scoring** — topics, problems, and decisions do not lose trust
+  merely because they are old; reminders, priors, and handoffs decay using age,
+  access count, and source authority. Explicit TTL, supersession, and refutation
+  still retire durable knowledge.
 - **Duplicate detection** — near-duplicate entries are rejected before writing
 - **Revision tracking** — manual entries track up to 3 revision diffs
 - **TTL (time-to-live)** — pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Expired entries are filtered from searches and listings but remain accessible via `get(id)` with an `[EXPIRED]` marker, so they can be inspected or renewed. `mdkb update` then archives them and moves their file to `memory/archive/` — archived, never deleted, so a renewal is always possible. Only entries given a TTL are ever reached: omit `ttl` and the entry is permanent, which is what `topic`, `problem` and `decision` are by default.
@@ -317,6 +365,10 @@ Tree-sitter parsing for **14 languages**: Rust, Go, TypeScript, JavaScript, Pyth
 - **Semantic code search** — find conceptually similar code using embeddings
 - **Persistent call graph** — function calls, callers, and transitive impact radius survive restarts
 - **Scope-resolved calls** — every symbol carries an address, and a call site keeps the qualifier it was written with, so `Store::write` and `Cache::write` are not the same edge
+- **Receiver-type inference** — Rust method receivers are reduced through local
+  bindings, parameters, constructors, `Self`, and return values before the call
+  cascade resolves the target. Ambiguous bare-name matches remain candidates,
+  not invented edges.
 - **A call the index cannot place says so** — the graph distinguishes a call resolved inside the index, one naming a module the index does not contain (`std::fs::write`), and a bare name with no candidate. None of the three is reported as "no callers"
 - **Macro invocations are their own edge kind** — `assert!` and `println!` are expansions, not calls to functions that do not exist
 - **Imports, inheritance, type usage and construction** are recorded as edges, not only definitions
@@ -372,8 +424,9 @@ mdkb code impact init --depth 5
 ```
 
 Two audits read the same index. `dup` reports what the repository says twice;
-`coupling` reports files that change together in git history with no edge
-between them in the code graph.
+`coupling` reports files that change together in git history with no confidently
+resolved edge between them. It uses the same callable-kind and resolution-tier
+cascade as the call graph, so a coincidental bare name cannot hide coupling.
 
 ```bash
 mdkb dup                          # sweep the repository
