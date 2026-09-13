@@ -184,9 +184,9 @@ async fn injected_path_triggers_code_reindex() {
             watcher_code,
             true,
             vec![],
-            true, // respect_gitignore
-            50,   // debounce_ms — fast for test
-            200,  // fast flush for test
+            true,  // respect_gitignore
+            50,    // debounce_ms — fast for test
+            1_000, // fast enough for tests; long enough to coalesce bulk loss under load
             Some(ready_clone),
             Some(rx),
         )
