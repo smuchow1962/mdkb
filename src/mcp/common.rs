@@ -468,6 +468,38 @@ mod tests {
         assert!(json.get("error").is_some(), "{json}");
     }
 
+    #[tokio::test]
+    async fn hook_http_parse_errors_are_json_rpc_http_200() {
+        let temp = tempfile::tempdir().unwrap();
+        let (router, _, _) = real_hook_router(temp.path(), Some("secret"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/hook/session_start")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert!(json["id"].is_null());
+        assert_eq!(json["error"]["code"], -32700);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("parse error")),
+            "{json}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn hook_http_work_gate_drains_an_in_flight_request() {
         let gate = Arc::new(WorkGate::default());
