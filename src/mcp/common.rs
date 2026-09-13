@@ -500,6 +500,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn standalone_hook_http_refuses_a_sibling_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let server_root = temp.path().join("served");
+        let sibling_root = temp.path().join("sibling");
+        std::fs::create_dir_all(&server_root).unwrap();
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        crate::core::Context::init(&sibling_root).unwrap();
+        let (router, _, _) = real_hook_router(&server_root, Some("secret"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/hook/session_start")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "root": sibling_root,
+                    "session_id": "outside-standalone-root"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], -32602);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("whitelist")),
+            "{json}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn hook_http_work_gate_drains_an_in_flight_request() {
         let gate = Arc::new(WorkGate::default());
