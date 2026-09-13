@@ -157,6 +157,7 @@ pub enum CliMutation {
         sessions_path: PathBuf,
         project_root: String,
     },
+    MetricsPurge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +230,9 @@ pub enum CliMutationResult {
     },
     SessionIndexed {
         outcome: UpdateResult,
+    },
+    MetricsPurged {
+        deleted: usize,
     },
 }
 
@@ -492,6 +496,9 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
                 &sessions_path,
                 &project_root,
             )?,
+        },
+        MetricsPurge => R::MetricsPurged {
+            deleted: crate::core::ops::handle_metrics_purge(ctx)?,
         },
     })
 }

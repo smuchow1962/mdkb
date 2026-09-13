@@ -2,6 +2,7 @@
 //!
 //! Tracks token counts to optimize response sizes and measure efficiency.
 
+pub mod privacy;
 pub mod tokens;
 pub mod usage;
 

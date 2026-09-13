@@ -2016,6 +2016,7 @@ dependencies = [
  "rayon",
  "rcgen",
  "regex",
+ "ring",
  "rmcp",
  "rusqlite",
  "rustls",

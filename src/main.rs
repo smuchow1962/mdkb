@@ -29,8 +29,8 @@ use mdkb::cli::handlers::{
     handle_memory_export, handle_memory_import, handle_memory_import_dir,
     handle_memory_import_file, handle_memory_link, handle_memory_list, handle_memory_prune,
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
-    handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_prune_sessions,
-    handle_superseded_by, parse_retention_secs,
+    handle_metrics_export, handle_metrics_latency, handle_metrics_purge, handle_metrics_show,
+    handle_metrics_status, handle_prune_sessions, handle_superseded_by, parse_retention_secs,
 };
 use mdkb::cli::hook_client;
 use mdkb::cli::hook_logic;
@@ -740,27 +740,43 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 eprintln!("code.sqlite vacuumed ({} KB)", code_size / 1024);
             }
         }
-        Command::Metrics(cmd) => {
-            let ctx = Context::open_read_only_migrating(&cwd)?;
-            match cmd {
-                MetricsCommand::Show { period } => {
-                    let metrics = handle_metrics_show(&ctx, period)?;
-                    format_metrics_summary(&metrics, period, cli.format);
-                }
-                MetricsCommand::Latency { period } => {
-                    let stats = handle_metrics_latency(&ctx)?;
-                    format_latency_stats(&stats, period, cli.format);
-                }
-                MetricsCommand::Quality { period } => {
-                    let metrics = handle_metrics_show(&ctx, period)?;
-                    format_quality_metrics(&metrics, period, cli.format);
-                }
-                MetricsCommand::Export { period } => {
-                    let events = handle_metrics_export(&ctx, period)?;
-                    format_metrics_export(&events, cli.format);
-                }
+        Command::Metrics(cmd) => match cmd {
+            MetricsCommand::Status => {
+                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let status = handle_metrics_status(&ctx, &cwd)?;
+                format_telemetry_status(&status, cli.format);
             }
-        }
+            MetricsCommand::Show { period } => {
+                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let metrics = handle_metrics_show(&ctx, period)?;
+                format_metrics_summary(&metrics, period, cli.format);
+            }
+            MetricsCommand::Latency { period } => {
+                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let stats = handle_metrics_latency(&ctx)?;
+                format_latency_stats(&stats, period, cli.format);
+            }
+            MetricsCommand::Quality { period } => {
+                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let metrics = handle_metrics_show(&ctx, period)?;
+                format_quality_metrics(&metrics, period, cli.format);
+            }
+            MetricsCommand::Export { period } => {
+                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let events = handle_metrics_export(&ctx, period)?;
+                format_metrics_export(&events, cli.format);
+            }
+            MetricsCommand::Purge { yes } => {
+                if !yes {
+                    return Err(mdkb::Error::other(
+                        "refusing to delete query telemetry without --yes",
+                    ));
+                }
+                let ctx = Context::open_writer_admitted(&cwd)?;
+                let deleted = handle_metrics_purge(&ctx)?;
+                println!("Deleted {deleted} query telemetry event(s)");
+            }
+        },
         Command::Eval(cmd) => match cmd {
             EvalCommand::Recall {
                 fixture,
@@ -1404,6 +1420,20 @@ MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<n
             }
         },
         Command::Setup(cmd) => match cmd {
+            SetupCommand::Developer {
+                retention_days,
+                dry_run,
+            } => {
+                let result =
+                    mdkb::cli::setup::handle_setup_developer(&cwd, retention_days, dry_run)?;
+                if !result.dry_run {
+                    println!("Developer telemetry enabled for {}", cwd.display());
+                    println!("Retention: {} days", result.retention_days);
+                    println!("Config: {}", result.config_path.display());
+                    println!("Private key: {}", result.key_path.display());
+                    println!("Restart the mdkb daemon to activate the changed repository config.");
+                }
+            }
             SetupCommand::Mcp(mcp_cmd) => match mcp_cmd {
                 SetupMcpCommand::Claude { scope, yes } => {
                     let global = scope == "user";
@@ -2008,6 +2038,9 @@ fn print_routed_result(
             } else {
                 println!("Memory entry '{id}' not found");
             }
+        }
+        (Command::Metrics(MetricsCommand::Purge { .. }), R::MetricsPurged { deleted }) => {
+            println!("Deleted {deleted} query telemetry event(s)");
         }
         (Command::Memory(MemoryCommand::Sync), R::MemorySynced { summary }) => {
             println!(
@@ -3051,6 +3084,59 @@ fn format_metrics_summary(
             println!("  > 0.8: {:.1}%", metrics.score_above_80);
             println!("  0.5-0.8: {:.1}%", metrics.score_50_to_80);
             println!("  < 0.5: {:.1}%", metrics.score_below_50);
+        }
+    }
+}
+
+fn format_telemetry_status(status: &mdkb::core::ops::TelemetryStatus, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(status).unwrap_or_default()
+            );
+        }
+        OutputFormat::Csv => {
+            println!("enabled,retention_days,key_present,stored_events");
+            println!(
+                "{},{},{},{}",
+                status.enabled, status.retention_days, status.key_present, status.stored_events
+            );
+        }
+        OutputFormat::Markdown => {
+            println!("| Enabled | Retention days | Private key | Stored events |");
+            println!("|---|---:|---|---:|");
+            println!(
+                "| {} | {} | {} | {} |",
+                status.enabled,
+                status.retention_days,
+                if status.key_present {
+                    "present"
+                } else {
+                    "missing"
+                },
+                status.stored_events
+            );
+        }
+        OutputFormat::Text => {
+            println!(
+                "Developer telemetry: {}",
+                if status.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!("Retention:          {} days", status.retention_days);
+            println!(
+                "Private HMAC key:    {}",
+                if status.key_present {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
+            println!("Stored events:      {}", status.stored_events);
         }
     }
 }

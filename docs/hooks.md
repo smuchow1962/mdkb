@@ -283,6 +283,23 @@ assistant is getting too much noise on every prompt.
 the two graph/index injectors if you want the plain suggestion /
 memory-only behavior.
 
+### Measuring recall in a development repository
+
+```bash
+mdkb setup developer
+mdkb metrics status
+mdkb metrics quality --period 7
+```
+
+The developer profile enables `[telemetry] query_events` with 30-day retention
+by default. It records result count, final top score, and latency, but never the
+prompt text. The correlation identifier is an HMAC-SHA-256 value keyed by a
+random repository-local `.mdkb/telemetry.key`, so an exported database does not
+permit an offline dictionary attack without that key. Use
+`mdkb metrics purge --yes` to remove every stored query event. Restart the
+daemon after changing the profile because repository configuration is cached by
+the active daemon handle.
+
 ## Opt out
 
 Three ways, in order of granularity:

@@ -3769,22 +3769,46 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             None => return json!({}),
         };
 
-        // Opt-in, privacy-safe telemetry: record the recall's shape (hash +
+        // Opt-in, privacy-minimized telemetry: record the recall's shape (HMAC +
         // latency + count) but NEVER the prompt text. Off by default.
         if handle.config.telemetry.query_events {
+            let telemetry_now = chrono::Utc::now().timestamp();
+            let mut eligible_scores = scored_results
+                .iter()
+                .filter(|entry| {
+                    entry.score >= cfg.min_recall_score
+                        && (entry.entry_type != crate::store::memory::EntryType::Prior
+                            || entry.confidence_at(telemetry_now) >= PRIOR_CONFIDENCE_GATE)
+                })
+                .map(|entry| entry.score);
+            let top_score = eligible_scores.next();
+            let result_count = i64::try_from(1 + eligible_scores.count()).unwrap_or(i64::MAX);
+            let result_count = if top_score.is_some() { result_count } else { 0 };
+            let query_hash = match crate::metrics::privacy::hash_query(&handle.root, prompt) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    tracing::warn!("query telemetry key unavailable: {error}");
+                    String::new()
+                }
+            };
             let ev = stats::QueryEvent {
-                query_hash: crate::store::documents::compute_hash(prompt),
+                query_hash,
                 query_text: String::new(),
                 search_type: "recall".to_string(),
-                result_count: scored_results.len() as i64,
+                result_count,
                 latency_ms: search_t0.elapsed().as_millis() as i64,
-                top_score: None,
+                top_score,
                 session_id: None,
             };
-            if let Some(Err(error)) =
-                crate::core::run_guarded_write(&mut ctx_guard, "query event telemetry", |ctx| {
-                    stats::record_query_event(&ctx.conn, &ev)
-                })
+            if !ev.query_hash.is_empty()
+                && let Some(Err(error)) =
+                    crate::core::run_guarded_write(&mut ctx_guard, "query event telemetry", |ctx| {
+                        stats::record_query_event(
+                            &ctx.conn,
+                            &ev,
+                            handle.config.telemetry.retention_days,
+                        )
+                    })
             {
                 tracing::warn!("record_query_event failed: {error}");
             }

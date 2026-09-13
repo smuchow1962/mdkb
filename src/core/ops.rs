@@ -326,6 +326,28 @@ pub fn handle_metrics_latency(ctx: &Context) -> Result<Vec<stats::QueryLatencySt
 pub fn handle_metrics_export(ctx: &Context, period: u32) -> Result<Vec<stats::QueryEvent>> {
     stats::export_query_events(&ctx.conn, period)
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TelemetryStatus {
+    pub enabled: bool,
+    pub retention_days: u32,
+    pub key_present: bool,
+    pub stored_events: i64,
+}
+
+pub fn handle_metrics_status(ctx: &Context, root: &Path) -> Result<TelemetryStatus> {
+    let config = crate::Config::load_or_default(root.join(".mdkb/config.toml"));
+    Ok(TelemetryStatus {
+        enabled: config.telemetry.query_events,
+        retention_days: config.telemetry.retention_days,
+        key_present: crate::metrics::privacy::key_exists(root),
+        stored_events: stats::count_query_events(&ctx.conn)?,
+    })
+}
+
+pub fn handle_metrics_purge(ctx: &Context) -> Result<usize> {
+    stats::purge_query_events(&ctx.conn)
+}
 /// Handle `mdkb experiment create`.
 pub fn handle_experiment_create(
     ctx: &Context,

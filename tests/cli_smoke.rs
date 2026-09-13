@@ -1644,6 +1644,28 @@ fn smoke_experiment_lifecycle() {
 fn smoke_metrics() {
     let repo = Repo::new();
 
+    let out = run(&["setup", "developer", "--dry-run"], &repo.root);
+    assert_ok(&out, "setup developer dry-run");
+    assert!(stdout(&out).contains("query_events = true"));
+    assert!(!repo.root.join(".mdkb/telemetry.key").exists());
+
+    let out = run(
+        &["setup", "developer", "--retention-days", "14"],
+        &repo.root,
+    );
+    assert_ok(&out, "setup developer");
+    let config = std::fs::read_to_string(repo.root.join(".mdkb/config.toml")).unwrap();
+    assert!(config.contains("query_events = true"));
+    assert!(config.contains("retention_days = 14"));
+    assert!(repo.root.join(".mdkb/telemetry.key").is_file());
+
+    let out = run(&["--format", "json", "metrics", "status"], &repo.root);
+    assert_ok(&out, "metrics status");
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["retention_days"], 14);
+    assert_eq!(status["key_present"], true);
+
     let out = run(&["metrics", "show"], &repo.root);
     assert_ok(&out, "metrics show");
 
@@ -1655,6 +1677,12 @@ fn smoke_metrics() {
 
     let out = run(&["metrics", "export"], &repo.root);
     assert_ok(&out, "metrics export");
+
+    let out = run(&["metrics", "purge"], &repo.root);
+    assert!(!out.status.success(), "purge without --yes must refuse");
+
+    let out = run(&["metrics", "purge", "--yes"], &repo.root);
+    assert_ok(&out, "metrics purge --yes");
 }
 
 // ── Hook lifecycle events (stdin→stdout) ────────────────────────────

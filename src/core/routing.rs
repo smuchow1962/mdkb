@@ -103,7 +103,14 @@ pub fn routing_for(command: &Command) -> Routing {
         | Command::Current { .. }
         | Command::SupersededBy { .. }
         | Command::Eval(_) => Routing::Read,
-        Command::Metrics(_) => Routing::Read,
+        Command::Metrics(c) => match c {
+            crate::cli::MetricsCommand::Purge { .. } => Routing::Mutation,
+            crate::cli::MetricsCommand::Status
+            | crate::cli::MetricsCommand::Show { .. }
+            | crate::cli::MetricsCommand::Latency { .. }
+            | crate::cli::MetricsCommand::Quality { .. }
+            | crate::cli::MetricsCommand::Export { .. } => Routing::Read,
+        },
 
         // ── no store ────────────────────────────────────────────────────────
         Command::Init
@@ -424,6 +431,14 @@ pub fn mutation_request(
                 .clone()
                 .unwrap_or_else(|| store_root.to_string_lossy().to_string()),
         },
+        Command::Metrics(crate::cli::MetricsCommand::Purge { yes }) => {
+            if !*yes {
+                return Err(Error::other(
+                    "refusing to delete query telemetry without --yes",
+                ));
+            }
+            M::MetricsPurge
+        }
         Command::Init
         | Command::Search { .. }
         | Command::Dup { .. }
@@ -434,7 +449,13 @@ pub fn mutation_request(
         | Command::Daemon(_)
         | Command::Mcp { .. }
         | Command::Stats { .. }
-        | Command::Metrics(_)
+        | Command::Metrics(
+            crate::cli::MetricsCommand::Status
+            | crate::cli::MetricsCommand::Show { .. }
+            | crate::cli::MetricsCommand::Latency { .. }
+            | crate::cli::MetricsCommand::Quality { .. }
+            | crate::cli::MetricsCommand::Export { .. },
+        )
         | Command::Eval(_)
         | Command::History { .. }
         | Command::Current { .. }

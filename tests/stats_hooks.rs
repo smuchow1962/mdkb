@@ -167,6 +167,10 @@ fn query_events_on_records_hash_but_never_text() {
         )
         .unwrap();
     assert!(!hash.is_empty(), "query_hash must be populated");
+    assert!(
+        tmp.path().join(".mdkb/telemetry.key").is_file(),
+        "opt-in telemetry must create its repository-local HMAC key"
+    );
     assert_eq!(text, "", "query_text must NEVER be persisted");
 }
 
@@ -186,7 +190,7 @@ fn record_query_event_never_persists_query_text() {
         top_score: None,
         session_id: None,
     };
-    stats::record_query_event(&conn, &ev).unwrap();
+    stats::record_query_event(&conn, &ev, 30).unwrap();
     let stored: String = conn
         .query_row("SELECT query_text FROM query_events", [], |r| r.get(0))
         .unwrap();

@@ -36,6 +36,158 @@ pub enum McpScope {
     Local,
 }
 
+/// Result of enabling the repository-local developer telemetry profile.
+#[derive(Debug)]
+pub struct DeveloperSetupResult {
+    pub config_path: PathBuf,
+    pub key_path: PathBuf,
+    pub retention_days: u32,
+    pub dry_run: bool,
+    pub merged_toml: String,
+}
+
+/// Enable privacy-minimized query telemetry for the current repository.
+pub fn handle_setup_developer(
+    root: &Path,
+    retention_days: u32,
+    dry_run: bool,
+) -> Result<DeveloperSetupResult> {
+    if !(1..=365).contains(&retention_days) {
+        return Err(Error::from(ErrorKind::ConfigInvalid {
+            field: "telemetry.retention_days".to_string(),
+            message: "must be between 1 and 365".to_string(),
+        }));
+    }
+
+    let mdkb_dir = root.join(".mdkb");
+    if !mdkb_dir.is_dir() {
+        return Err(Error::from(ErrorKind::Command {
+            command: "setup developer".to_string(),
+            message: format!(
+                "{} is not initialized; run `mdkb init` first",
+                root.display()
+            ),
+        }));
+    }
+    let config_path = mdkb_dir.join("config.toml");
+    let key_path = crate::metrics::privacy::key_path(root);
+
+    if dry_run {
+        let merged_toml = render_developer_config(&config_path, retention_days)?;
+        println!("{merged_toml}");
+        return Ok(DeveloperSetupResult {
+            config_path,
+            key_path,
+            retention_days,
+            dry_run: true,
+            merged_toml,
+        });
+    }
+
+    // Validate or create the private key before enabling collection. A failed
+    // key setup must never leave query_events=true with no usable HMAC key.
+    crate::metrics::privacy::load_or_create_key(root)?;
+    let merged_toml = locked_write_developer_config(&config_path, retention_days)?;
+    Ok(DeveloperSetupResult {
+        config_path,
+        key_path,
+        retention_days,
+        dry_run: false,
+        merged_toml,
+    })
+}
+
+fn render_developer_config(config_path: &Path, retention_days: u32) -> Result<String> {
+    let raw = if config_path.exists() {
+        std::fs::read_to_string(config_path).map_err(|error| {
+            Error::from(ErrorKind::Io {
+                path: config_path.to_path_buf(),
+                operation: format!("read config.toml: {error}"),
+            })
+        })?
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|error| {
+        Error::from(ErrorKind::Command {
+            command: "setup developer".to_string(),
+            message: format!("failed to parse {}: {error}", config_path.display()),
+        })
+    })?;
+    if !doc.contains_key("telemetry") {
+        doc["telemetry"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let telemetry = doc["telemetry"].as_table_mut().ok_or_else(|| {
+        Error::from(ErrorKind::Command {
+            command: "setup developer".to_string(),
+            message: "`telemetry` must be a TOML table".to_string(),
+        })
+    })?;
+    telemetry.insert("query_events", toml_edit::value(true));
+    telemetry.insert(
+        "retention_days",
+        toml_edit::value(i64::from(retention_days)),
+    );
+    let merged = doc.to_string();
+    let parsed: Config = toml::from_str(&merged)?;
+    parsed.validate()?;
+    Ok(merged)
+}
+
+fn locked_write_developer_config(config_path: &Path, retention_days: u32) -> Result<String> {
+    let parent = config_path
+        .parent()
+        .expect("config path always has a parent");
+    let mut lock_path = config_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            Error::from(ErrorKind::Io {
+                path: lock_path.clone(),
+                operation: format!("open lock file: {error}"),
+            })
+        })?;
+    lock.lock_exclusive().map_err(|error| {
+        Error::from(ErrorKind::Io {
+            path: lock_path,
+            operation: format!("lock config: {error}"),
+        })
+    })?;
+
+    let merged = render_developer_config(config_path, retention_days)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        Error::from(ErrorKind::Io {
+            path: parent.to_path_buf(),
+            operation: format!("create temp config: {error}"),
+        })
+    })?;
+    temp.write_all(merged.as_bytes()).map_err(|error| {
+        Error::from(ErrorKind::Io {
+            path: config_path.to_path_buf(),
+            operation: format!("write temp config: {error}"),
+        })
+    })?;
+    temp.flush().map_err(|error| {
+        Error::from(ErrorKind::Io {
+            path: config_path.to_path_buf(),
+            operation: format!("flush temp config: {error}"),
+        })
+    })?;
+    temp.persist(config_path).map_err(|error| {
+        Error::from(ErrorKind::Io {
+            path: config_path.to_path_buf(),
+            operation: format!("rename temp config: {error}"),
+        })
+    })?;
+    Ok(merged)
+}
+
 impl std::fmt::Display for McpScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1211,6 +1363,39 @@ mod tests {
     fn test_mcp_scope_display() {
         assert_eq!(format!("{}", McpScope::Global), "global");
         assert_eq!(format!("{}", McpScope::Local), "local");
+    }
+
+    #[test]
+    fn developer_profile_preserves_unrelated_config_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".mdkb")).unwrap();
+        let path = root.path().join(".mdkb/config.toml");
+        std::fs::write(
+            &path,
+            "# keep this comment\n[hooks]\nrecall_limit = 7\n\n[telemetry]\nquery_events = false\n",
+        )
+        .unwrap();
+
+        let first = handle_setup_developer(root.path(), 21, false).unwrap();
+        let first_text = std::fs::read_to_string(&path).unwrap();
+        assert!(first_text.contains("# keep this comment"));
+        assert!(first_text.contains("recall_limit = 7"));
+        assert!(first_text.contains("query_events = true"));
+        assert!(first_text.contains("retention_days = 21"));
+        assert_eq!(first.merged_toml, first_text);
+
+        let second = handle_setup_developer(root.path(), 21, false).unwrap();
+        assert_eq!(second.merged_toml, first_text);
+    }
+
+    #[test]
+    fn developer_profile_dry_run_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".mdkb")).unwrap();
+        let result = handle_setup_developer(root.path(), 30, true).unwrap();
+        assert!(result.merged_toml.contains("query_events = true"));
+        assert!(!result.config_path.exists());
+        assert!(!result.key_path.exists());
     }
 
     #[test]

@@ -43,19 +43,32 @@ pub struct Config {
     /// AI-distilled behavioral-prior mining.
     pub priors: PriorsConfig,
 
-    /// Usage telemetry (opt-in, privacy-safe).
+    /// Usage telemetry (opt-in and privacy-minimized, not anonymous).
     pub telemetry: TelemetryConfig,
 }
 
 /// Usage telemetry settings. Hook-call counts are always recorded (counts, not
 /// content); richer per-query events are opt-in and never store query text.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetryConfig {
     /// Record a `query_events` row per recall search (hash + latency + result
     /// count — NEVER the query text). Off by default: it is the input for the
     /// self-evaluation roadmap, opt-in until that ships.
     pub query_events: bool,
+
+    /// Maximum age of query events in days. Applied on every telemetry write,
+    /// so retention does not depend on a background job being alive.
+    pub retention_days: u32,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            query_events: false,
+            retention_days: 30,
+        }
+    }
 }
 
 /// Indexing settings.
@@ -820,6 +833,14 @@ impl Config {
 
     /// Validate configuration values.
     pub fn validate(&self) -> Result<()> {
+        if self.telemetry.retention_days == 0 || self.telemetry.retention_days > 365 {
+            return Err(ErrorKind::ConfigInvalid {
+                field: "telemetry.retention_days".to_string(),
+                message: "must be between 1 and 365".to_string(),
+            }
+            .into());
+        }
+
         // Chunking validation
         if !VALID_CHUNKING_STRATEGIES.contains(&self.chunking.strategy.as_str()) {
             return Err(ErrorKind::ConfigInvalid {
@@ -918,6 +939,19 @@ mod tests {
         assert!(!config.indexing.respect_gitignore);
         assert!(config.search.auto_embed_docs);
         assert_eq!(config.memory.warmup_limit, 50);
+        assert!(!config.telemetry.query_events);
+        assert_eq!(config.telemetry.retention_days, 30);
+    }
+
+    #[test]
+    fn telemetry_retention_must_be_bounded() {
+        let mut config = Config::default();
+        config.telemetry.retention_days = 0;
+        assert!(config.validate().is_err());
+        config.telemetry.retention_days = 366;
+        assert!(config.validate().is_err());
+        config.telemetry.retention_days = 30;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

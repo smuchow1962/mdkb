@@ -60,6 +60,13 @@ or telemetry statement reports SQLite corruption, the daemon releases that
 repository context immediately so the next request can quarantine, salvage, and
 rebuild the index.
 
+The developer telemetry profile keeps this write path opt-in. It correlates
+normalized repeated queries with HMAC-SHA-256 under a random per-repository key,
+stores no prompt text, records the final eligible recall count and top score,
+and removes rows older than the configured retention window during each insert.
+Telemetry purge is a typed CLI mutation, so a running daemon remains the sole
+SQLite writer.
+
 ### Native HTTP/HTTPS transport
 
 The HTTP and HTTPS MCP servers expose `POST /hook/{method}` beside `/mcp` and

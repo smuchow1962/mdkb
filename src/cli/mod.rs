@@ -694,6 +694,9 @@ pub fn parse_eval_modes(mode: &str) -> Vec<EvalMode> {
 /// Metrics subcommands.
 #[derive(Subcommand, Debug)]
 pub enum MetricsCommand {
+    /// Show developer telemetry configuration and stored event count
+    Status,
+
     /// Show query metrics summary
     Show {
         /// Period in days (default: 7)
@@ -720,6 +723,13 @@ pub enum MetricsCommand {
         /// Period in days (default: 7)
         #[arg(short, long, default_value = "7")]
         period: u32,
+    },
+
+    /// Delete all stored developer query telemetry
+    Purge {
+        /// Confirm destructive deletion
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1077,6 +1087,17 @@ pub enum GraphCommand {
 /// Setup and configuration subcommands.
 #[derive(Subcommand, Debug)]
 pub enum SetupCommand {
+    /// Enable privacy-minimized local telemetry for mdkb development
+    Developer {
+        /// Delete query events older than this many days
+        #[arg(long, default_value = "30", value_parser = clap::value_parser!(u32).range(1..=365))]
+        retention_days: u32,
+
+        /// Print the merged repository config without writing files
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Register mdkb as an MCP server
     #[command(subcommand)]
     Mcp(SetupMcpCommand),

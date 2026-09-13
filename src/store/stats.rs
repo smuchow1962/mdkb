@@ -410,26 +410,14 @@ pub struct QueryEvent {
     pub session_id: Option<i64>,
 }
 
-/// Compute hash of normalized query for de-duplication.
-pub fn hash_query(query: &str) -> String {
-    use sha2::{Digest, Sha256};
-
-    // Normalize: lowercase, trim, collapse whitespace
-    let normalized = query
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
-    let result = hasher.finalize();
-    format!("{:x}", result)
-}
-
 /// Record a query event.
-pub fn record_query_event(conn: &Connection, event: &QueryEvent) -> Result<i64> {
+pub fn record_query_event(
+    conn: &Connection,
+    event: &QueryEvent,
+    retention_days: u32,
+) -> Result<i64> {
     let now = chrono::Utc::now().timestamp();
+    prune_query_events(conn, retention_days, now)?;
 
     // Privacy: query_text is NEVER persisted (queries can contain secrets/pasted
     // code). Only the hash + aggregate metrics are stored. The column is kept for
@@ -451,6 +439,30 @@ pub fn record_query_event(conn: &Connection, event: &QueryEvent) -> Result<i64> 
     )?;
 
     Ok(conn.last_insert_rowid())
+}
+
+/// Delete every query event older than the configured retention window.
+pub fn prune_query_events(conn: &Connection, retention_days: u32, now: i64) -> Result<usize> {
+    let cutoff = now - i64::from(retention_days) * 24 * 60 * 60;
+    Ok(conn.execute(
+        "DELETE FROM query_events WHERE created_at < ?1",
+        params![cutoff],
+    )?)
+}
+
+/// Delete all developer query telemetry from this repository.
+pub fn purge_query_events(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM query_events", [])?)
+}
+
+/// Count stored developer query events without reading their contents.
+pub fn count_query_events(conn: &Connection) -> Result<i64> {
+    let count = conn.query_row("SELECT COUNT(*) FROM query_events", [], |row| row.get(0));
+    match count {
+        Ok(count) => Ok(count),
+        Err(error) if is_missing_table(&error, "query_events") => Ok(0),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Get query latency statistics.
@@ -882,26 +894,11 @@ mod tests {
     // ==================== Query Event Tests ====================
 
     #[test]
-    fn test_hash_query_normalization() {
-        // Same query with different whitespace/case should hash the same
-        let h1 = hash_query("  How do I   configure  AUTH  ");
-        let h2 = hash_query("how do i configure auth");
-        let h3 = hash_query("HOW DO I CONFIGURE AUTH");
-
-        assert_eq!(h1, h2);
-        assert_eq!(h2, h3);
-
-        // Different queries should hash differently
-        let h4 = hash_query("different query");
-        assert_ne!(h1, h4);
-    }
-
-    #[test]
     fn test_record_query_event() {
         let conn = setup_db();
 
         let event = QueryEvent {
-            query_hash: hash_query("test query"),
+            query_hash: "test-query-hmac".to_string(),
             query_text: "test query".to_string(),
             search_type: "hybrid".to_string(),
             result_count: 5,
@@ -910,8 +907,52 @@ mod tests {
             session_id: None,
         };
 
-        let id = record_query_event(&conn, &event).unwrap();
+        let id = record_query_event(&conn, &event, 30).unwrap();
         assert!(id > 0);
+    }
+
+    #[test]
+    fn recording_an_event_applies_retention() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO query_events (query_hash, query_text, search_type, result_count, latency_ms, created_at) VALUES ('old', '', 'recall', 0, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let event = QueryEvent {
+            query_hash: "current-hmac".to_string(),
+            query_text: "must not persist".to_string(),
+            search_type: "recall".to_string(),
+            result_count: 1,
+            latency_ms: 2,
+            top_score: None,
+            session_id: None,
+        };
+        record_query_event(&conn, &event, 30).unwrap();
+        assert_eq!(count_query_events(&conn).unwrap(), 1);
+        let hash: String = conn
+            .query_row("SELECT query_hash FROM query_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(hash, "current-hmac");
+    }
+
+    #[test]
+    fn purge_query_events_deletes_only_query_telemetry() {
+        let conn = setup_db();
+        let event = QueryEvent {
+            query_hash: "hmac".to_string(),
+            query_text: String::new(),
+            search_type: "recall".to_string(),
+            result_count: 1,
+            latency_ms: 2,
+            top_score: None,
+            session_id: None,
+        };
+        record_query_event(&conn, &event, 30).unwrap();
+        let session = create_session(&conn).unwrap();
+        assert_eq!(purge_query_events(&conn).unwrap(), 1);
+        assert_eq!(count_query_events(&conn).unwrap(), 0);
+        assert!(get_session(&conn, session).unwrap().is_some());
     }
 
     #[test]
@@ -921,7 +962,7 @@ mod tests {
         // Record several query events of different types
         for i in 0..5 {
             let event = QueryEvent {
-                query_hash: hash_query(&format!("query {i}")),
+                query_hash: format!("query-{i}-hmac"),
                 query_text: format!("query {i}"),
                 search_type: "hybrid".to_string(),
                 result_count: i64::from(i),
@@ -929,12 +970,12 @@ mod tests {
                 top_score: Some(0.8),
                 session_id: None,
             };
-            record_query_event(&conn, &event).unwrap();
+            record_query_event(&conn, &event, 30).unwrap();
         }
 
         for i in 0..3 {
             let event = QueryEvent {
-                query_hash: hash_query(&format!("bm25 query {i}")),
+                query_hash: format!("bm25-query-{i}-hmac"),
                 query_text: format!("bm25 query {i}"),
                 search_type: "bm25".to_string(),
                 result_count: 1,
@@ -942,7 +983,7 @@ mod tests {
                 top_score: Some(0.9),
                 session_id: None,
             };
-            record_query_event(&conn, &event).unwrap();
+            record_query_event(&conn, &event, 30).unwrap();
         }
 
         let stats = get_query_latency_stats(&conn).unwrap();

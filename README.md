@@ -423,6 +423,31 @@ mdkb code callers handle_get
 mdkb code impact init --depth 5
 ```
 
+### Developer Telemetry Profile
+
+Use the developer profile on repositories where mdkb itself is being evaluated.
+It enables local per-recall measurements while the shipped default remains off
+for end users:
+
+```bash
+mdkb setup developer                       # 30-day retention
+mdkb setup developer --retention-days 14
+mdkb metrics status
+mdkb metrics show --period 7
+mdkb metrics latency --period 7
+mdkb metrics quality --period 7
+mdkb metrics purge --yes                   # delete every query event
+```
+
+Prompt text is never stored. Repeated queries are correlated with HMAC-SHA-256
+using a random 256-bit key unique to the repository at
+`.mdkb/telemetry.key`; the key is outside Git and owner-readable only on Unix.
+Every recorded recall deletes events older than the configured retention window.
+`setup developer` preserves unrelated TOML settings and comments and supports
+`--dry-run`. Restart the daemon after enabling the profile so its cached
+repository configuration is reloaded. This profile does not make prompt recall
+always-on: the `*` opt-in sigil remains a separate content-selection choice.
+
 Two audits read the same index. `dup` reports what the repository says twice;
 `coupling` reports files that change together in git history with no confidently
 resolved edge between them. It uses the same callable-kind and resolution-tier

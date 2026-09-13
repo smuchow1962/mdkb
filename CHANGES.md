@@ -20,6 +20,15 @@ by a session on the host that reported them.
 
 ### Added
 
+- **Privacy-minimized developer telemetry profile.** `mdkb setup developer`
+  enables repository-local recall measurements with bounded retention (30 days
+  by default), preserves unrelated config and comments, and creates a private
+  256-bit key at `.mdkb/telemetry.key`. Query correlation now uses keyed
+  HMAC-SHA-256 instead of an unsalted digest; prompt text is still never stored.
+  `mdkb metrics status` exposes activation, retention, key presence, and event
+  count without exposing the key, while `mdkb metrics purge --yes` routes
+  deletion through the daemon's single-writer protocol. End-user defaults and
+  the prompt-recall sigil remain unchanged.
 - **Native lifecycle hooks over HTTP and HTTPS.** Both network transports now
   expose `POST /hook/{method}` through the same dispatcher, repository registry,
   and shutdown work gate as Unix hook IPC. Claude Code setup accepts
