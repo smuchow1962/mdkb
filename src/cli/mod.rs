@@ -1121,7 +1121,7 @@ pub enum SetupHooksCommand {
         #[arg(short, long, default_value = "local")]
         scope: String,
 
-        /// Comma-separated list of events to skip (session-start, user-prompt-submit, post-tool-use, pre-tool-use)
+        /// Comma-separated list of events to skip (session-start, user-prompt-submit, post-tool-use, pre-tool-use, stop)
         #[arg(long, default_value = "")]
         disable: String,
 
@@ -1143,7 +1143,7 @@ pub enum SetupHooksCommand {
 
     /// Register lifecycle hooks with Codex CLI (writes ~/.codex/hooks.json)
     Codex {
-        /// Comma-separated list of events to skip (session-start, user-prompt-submit, post-tool-use)
+        /// Comma-separated list of events to skip (session-start, user-prompt-submit, post-tool-use, pre-tool-use, stop)
         #[arg(long, default_value = "")]
         disable: String,
 
