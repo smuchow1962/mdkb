@@ -58,7 +58,7 @@ pub fn init_stats_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS query_events (
             id INTEGER PRIMARY KEY,
             query_hash TEXT NOT NULL,       -- SHA256 of normalized query
-            query_text TEXT NOT NULL,       -- Original query text
+            query_text TEXT NOT NULL,       -- Reserved for schema stability; always empty
             search_type TEXT NOT NULL,      -- bm25, semantic, hybrid
             result_count INTEGER NOT NULL,
             latency_ms INTEGER NOT NULL,

@@ -3439,6 +3439,9 @@ pub async fn hook_session_start_impl(
     if !cfg.session_start_enabled {
         return json!({});
     }
+    if !handle.root.join(".mdkb").is_dir() {
+        return json!({});
+    }
     if ensure_handle_context(handle).await.is_err() {
         return json!({});
     }
@@ -3551,19 +3554,11 @@ pub async fn hook_session_start_impl(
     }));
 
     // Drain any prior-session pending memory embeddings in the background. Placed
-    // here — after the function's last await, before the empty-warmup early return
-    // — so it fires independently of whether warmup produced any output (a repo
+    // here — after the function's last await — so it fires independently of
+    // whether warmup produced any output (a repo
     // with pending embeddings but an empty/filtered warmup still gets drained).
     // Single-flight + best-effort; the ctx lock is already released.
     spawn_embedding_backfill(Arc::clone(handle));
-
-    if lines.is_empty()
-        && handoff_body.is_none()
-        && quarantine_banner.is_none()
-        && drift_banner.is_none()
-    {
-        return json!({});
-    }
 
     let bin = std::env::current_exe()
         .ok()
@@ -3600,7 +3595,7 @@ pub async fn hook_session_start_impl(
         }
     }
     body.push_str(&format!(
-        "\n**mdkb CLI** (semantic search — not available via Grep/Glob). Run `{bin} cheatsheet` for full syntax.\n"
+        "\n**mdkb:** `* query` = recall | `{bin} cheatsheet` = search/code/graph/audit/memory\n"
     ));
 
     // Check code index staleness. If stale, kick a detached refresh instead of
@@ -8296,12 +8291,17 @@ mod tests {
     // ── hook method tests ─────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn hook_session_start_silent_on_empty_index() {
+    async fn hook_session_start_advertises_power_features_on_empty_index() {
         let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".mdkb")).unwrap();
         let handle = make_handle(&tmp);
         let result = hook_session_start_impl(&handle, None).await;
-        // Empty index → no warmup lines → silent ({})
-        assert_eq!(result, json!({}), "must be silent when index is empty");
+        let context = result["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("initialized repositories always advertise power features");
+        assert!(context.contains("* query"));
+        assert!(context.contains("cheatsheet"));
+        assert!(context.contains("search/code/graph/audit/memory"));
     }
 
     #[tokio::test]

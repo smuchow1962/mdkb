@@ -244,11 +244,19 @@ fn the_cheatsheet_names_only_commands_that_exist() {
     // starts with it rather than a placeholder. Checked explicitly: an earlier
     // version of this test looked for a `{0} ` prefix that the output never
     // contains, so it scanned nothing and passed for the wrong reason.
-    let bin = env!("CARGO_BIN_EXE_mdkb");
+    let bin = Path::new(env!("CARGO_BIN_EXE_mdkb"));
     let mut checked = 0usize;
     let mut broken = Vec::new();
     for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix(bin) else {
+        let line = line.trim();
+        // The executable path may contain spaces. Find the first separator for
+        // which the whole prefix is the same native path instead of splitting
+        // at the first space in the string.
+        let Some(rest) = line
+            .match_indices(' ')
+            .find(|(i, _)| Path::new(&line[..*i]) == bin)
+            .map(|(i, _)| &line[i + 1..])
+        else {
             continue;
         };
         let words: Vec<&str> = rest

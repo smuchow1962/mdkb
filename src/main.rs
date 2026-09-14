@@ -1318,6 +1318,14 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 # Collections
 {0} collection list                                    # name, path, pattern, doc count per collection
 {0} collection add <name> <path> -p '**/*.md'          # register a collection
+{0} collection update <name> --path <path> -p '**/*.md' # change path/pattern without dropping matching embeddings
+
+# Developer feedback (local; prompt text is never stored)
+{0} setup developer                                    # enable private per-repository recall telemetry
+{0} metrics status                                     # activation, retention, key, stored event count
+{0} metrics quality --period 7                         # zero results, repeated searches, score bands
+{0} metrics latency --period 7                         # recall count and latency
+{0} metrics purge --yes                                # delete all stored query telemetry
 
 # Maintenance
 {0} update                                             # reindex all (auto-embeds docs + backfills memory)

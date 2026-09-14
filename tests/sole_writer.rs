@@ -267,6 +267,7 @@ fn direct_cli_mutations_wait_for_the_outer_lock() {
 /// A successfully routed mutation must not open the main store in the CLI
 /// process. A fake daemon returns the typed success without touching SQLite;
 /// any WAL/SHM sidecar therefore proves the CLI opened its own writer.
+#[cfg(unix)]
 #[test]
 fn a_routed_mutation_creates_no_local_sqlite_sidecars() {
     use std::io::{Read, Write};
@@ -340,6 +341,7 @@ fn a_routed_mutation_creates_no_local_sqlite_sidecars() {
 /// minutes — so a client that retries in-process becomes the second writer the
 /// routing exists to remove, on the longest write in the program. Failing loudly
 /// is the only honest answer (invariant I3: no silent success).
+#[cfg(unix)]
 #[test]
 fn a_mutation_is_not_retried_after_the_daemon_took_the_request() {
     use std::io::Read;

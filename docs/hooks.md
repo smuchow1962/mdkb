@@ -89,13 +89,18 @@ setup remains command-based.
 
 Input: any JSON (ignored).
 
-Output (when memory is non-empty):
+Output always includes a compact power-feature hint in an initialized
+repository. The payload can contain, in order: an outstanding quarantine or
+projection-drift warning, the latest project-scoped handoff in full, due
+reminders, ranked memory, and the one-line feature map. The map is present even
+when the memory index is empty; disabled hooks and uninitialized repositories
+remain silent.
 
 ```json
 {
   "hookSpecificOutput": {
     "hookEventName": "SessionStart",
-    "additionalContext": "## mdkb memory warmup\n\n- [topic] …\n- [decision] …\n"
+    "additionalContext": "## mdkb memory warmup\n\n- [topic] …\n- [decision] …\n\n**mdkb:** `* query` = recall | `mdkb cheatsheet` = search/code/graph/audit/memory\n"
   }
 }
 ```
@@ -110,7 +115,10 @@ Input:
 
 Empty or wrap-up prompts (`/clear`, `/compact`, `/exit`, `/quit`,
 `/wrapup`) are skipped. By default, recall also requires a leading `*` opt-in
-sigil. The handler strips the sigil, stopwords, and sub-3-character fragments,
+sigil, for example `* how does writer recovery work?`. The asterisk is explicit
+consent to search the current repository's context. Without it, the prompt
+passes through unchanged. The handler strips the sigil before search and
+telemetry, then removes stopwords and sub-3-character fragments,
 then ranks memory through hybrid BM25 and local-vector retrieval. The configured
 floor applies to the final relevance-plus-confidence score, not confidence
 alone. Matching documents reuse the same query embedding, avoiding a second
@@ -299,6 +307,21 @@ permit an offline dictionary attack without that key. Use
 `mdkb metrics purge --yes` to remove every stored query event. Restart the
 daemon after changing the profile because repository configuration is cached by
 the active daemon handle.
+
+Query telemetry has no denominator because it records only activated recalls.
+Use `mdkb stats` for engagement: the Hooks row for `user_prompt_submit` reports
+all calls, fired recalls, and Hit%. Use `mdkb metrics quality` for retrieval
+quality after activation. Low Hit% points to discoverability or opt-in friction;
+high zero-result rate or low score bands point to retrieval/index quality.
+These are technical proxies: a high ranking score is not a user judgment, and
+cross-language prompts can still return irrelevant high-scoring matches. MDKB
+does not claim helpfulness without an explicit feedback signal.
+
+`mdkb cheatsheet` is the compact command inventory intended for agents. It
+covers search and batch reads, durable memory/provenance, code relationships,
+knowledge graph navigation, duplication/coupling audits, collection mutation,
+developer telemetry, maintenance, daemon control, and the machine-readable CLI
+schema.
 
 ## Opt out
 

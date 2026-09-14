@@ -190,11 +190,26 @@ entries are replaced and unrelated settings are preserved. Events:
 `post-tool-use`, and `stop`. Full command and HTTP contracts, configuration,
 and opt-out behavior are in [docs/hooks.md](docs/hooks.md).
 
-Per-prompt recall is quiet by default: prefix a prompt with `*` to inject
-matching memory, documents, and graph hints. To make it always-on, set
-`user_prompt_submit_require_sigil = false` under `[hooks]` in
+Session start includes a compact power-feature reminder and points to
+`mdkb cheatsheet`. Per-prompt recall is quiet by default: prefix a prompt with
+`*` to inject matching memory, documents, and graph hints. MDKB removes the
+asterisk before search and before telemetry; it is an activation signal, not
+part of the query. Without it, the prompt passes through unchanged. To make
+recall always-on, set `user_prompt_submit_require_sigil = false` under `[hooks]` in
 `.mdkb/config.toml`. Session warmup and the other enabled hooks do not require
 the sigil.
+
+SessionStart keeps discovery compact and operational:
+
+- restores the latest project-scoped handoff;
+- surfaces due reminders, ranked memory, quarantine, and projection drift;
+- emits `* query = recall` and the executable `mdkb cheatsheet` command even
+  when the memory index is empty.
+
+The cheatsheet is the complete AI-facing command map: hybrid search and batch
+reads, durable memory and provenance, code callers/calls/impact, knowledge
+graph navigation, duplication and hidden-coupling audits, collection updates,
+developer telemetry, maintenance, daemon control, and machine-readable schema.
 
 ### Binary path caveat
 
@@ -448,6 +463,21 @@ Every recorded recall deletes events older than the configured retention window.
 repository configuration is reloaded. This profile does not make prompt recall
 always-on: the `*` opt-in sigil remains a separate content-selection choice.
 
+The two reports answer different questions:
+
+- `mdkb metrics quality/latency` measures recalls after `*` activated them:
+  result count, score bands, repeated-query rate, and latency.
+- `mdkb stats` measures engagement. In the Hooks table, `user_prompt_submit`
+  `Calls` is the denominator, `Fired` is successful activation, and `Hit%` is
+  the activation rate. A low Hit% indicates that the opt-in instruction may be
+  missed; it does not by itself mean retrieval quality is poor.
+
+Score bands are ranking diagnostics, not human relevance labels. A high score
+can still be unhelpful, especially when the prompt language differs from the
+indexed corpus. The current profile proves activation, performance, result
+shape, and repeated use; it does not infer helpfulness without explicit user
+feedback.
+
 Two audits read the same index. `dup` reports what the repository says twice;
 `coupling` reports files that change together in git history with no confidently
 resolved edge between them. It uses the same callable-kind and resolution-tier
@@ -485,6 +515,11 @@ the same `buckets` summary alongside `evidence.hamming` per cluster. See
 
 Typed edges are extracted during indexing from allowlisted frontmatter keys
 (strong) and body `[[wikilinks]]` (soft). Configure via the `[graph]` section.
+Repository authors and agents define relationships; MDKB maintains them. A
+re-index replaces one document's extracted edges atomically, so removing a link
+removes the edge and repeated updates do not duplicate it. Memory edges are
+written transactionally with `memory_write` or explicitly with `memory link`.
+MDKB never invents a taxonomy or rewrites documents from graph analysis.
 
 ```bash
 mdkb graph links project.md                 # outgoing edges (owner, themes, links_to, ...)
@@ -492,7 +527,16 @@ mdkb graph links project.md --relation owner # filter by relation
 mdkb graph backlinks alice                   # who points at this entity (works on dangling slugs)
 mdkb graph neighbors project.md --depth 2    # adjacent entities, undirected
 mdkb graph path project.md guide.md          # shortest path between two entities
+mdkb graph dangling                          # broken references / missing pages
+mdkb graph hubs --relation owner             # central nodes for one relation
 ```
+
+Use search to discover relevant content; use the graph after finding an entity
+to inspect impact, dependencies, ownership, and paths. Graph neighbors also
+enrich prompt recall within strict caps. `supersedes` retires old memory in the
+same transaction, while `[STALE-DEP]` marks recalled knowledge whose supporting
+memory was superseded or refuted. `dangling` and `hubs` are read-only gardening
+reports: they identify reorganization work but never mutate the repository.
 
 **[docs/graph.md](docs/graph.md)** — how edges are created, how references
 resolve, what each query is for, and when to reach for the graph instead of

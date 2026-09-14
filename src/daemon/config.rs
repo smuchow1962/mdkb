@@ -297,7 +297,7 @@ whitelist_dirs = ["~/Code"]
     fn test_daemon_socket_path_default() {
         let config = DaemonConfig::default();
         let path = config.socket_path();
-        assert!(path.to_string_lossy().ends_with(".mdkb/daemon.sock"));
+        assert!(path.ends_with(".mdkb/daemon.sock"));
     }
 
     #[test]
@@ -307,14 +307,14 @@ whitelist_dirs = ["~/Code"]
             ..Default::default()
         };
         let path = config.socket_path();
-        assert!(path.to_string_lossy().ends_with("custom/mdkb.sock"));
+        assert!(path.ends_with("custom/mdkb.sock"));
     }
 
     #[test]
     fn test_daemon_pid_path() {
         let config = DaemonConfig::default();
         let path = config.pid_path();
-        assert!(path.to_string_lossy().ends_with(".mdkb/daemon.pid"));
+        assert!(path.ends_with(".mdkb/daemon.pid"));
     }
 
     #[test]

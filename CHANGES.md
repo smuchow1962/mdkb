@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.9.0 (2026-09-14)
 
 Two questions the index could not answer before: *what does this repository say
 twice?* and *what changes together without any edge saying why?*
@@ -12,14 +12,18 @@ trustworthy core is the clusters at 0–3 bits apart. The numbers are under *The
 structural threshold* below, because a reader who does not have them will
 over-trust the headline.
 
-This release also closes every open issue in the tracker, plus the collection
-command their absence kept asking for. Three of them were Windows-only. Those
-three now **compile** for `x86_64-pc-windows-msvc`, but nothing here has been
-**run** on Windows: the platform rules are pinned by portable unit tests, not
-by a session on the host that reported them.
+This release also resolves the concrete defects tracked in issues #5–#11 and
+adds the missing collection update command. CI now includes a native
+`windows-latest` test job instead of relying only on cross-compilation and
+portable unit tests.
 
 ### Added
 
+- **Session start advertises the power features it can activate.** Every
+  initialized repository receives one compact instruction for `* <prompt>`
+  recall and `mdkb cheatsheet`, even before the memory index has entries. The
+  cheatsheet now includes collection updates and the developer telemetry
+  commands that were previously absent.
 - **Privacy-minimized developer telemetry profile.** `mdkb setup developer`
   enables repository-local recall measurements with bounded retention (30 days
   by default), preserves unrelated config and comments, and creates a private
@@ -29,6 +33,7 @@ by a session on the host that reported them.
   count without exposing the key, while `mdkb metrics purge --yes` routes
   deletion through the daemon's single-writer protocol. End-user defaults and
   the prompt-recall sigil remain unchanged.
+
 - **Native lifecycle hooks over HTTP and HTTPS.** Both network transports now
   expose `POST /hook/{method}` through the same dispatcher, repository registry,
   and shutdown work gate as Unix hook IPC. Claude Code setup accepts
@@ -250,6 +255,11 @@ by a session on the host that reported them.
 
 ### Fixed
 
+- **Windows test coverage follows the current architecture.** The native CI
+  suite keeps Unix-socket-only writer tests on Unix while retaining portable
+  singleton coverage on Windows, exercises directory aliases when Developer
+  Mode permits them, and compares native paths by component so separators and
+  spaces in executable paths do not create false failures.
 - **Every memory-writing surface uses one mutation pipeline.** CLI, MCP, batch,
   import, and hook-driven writes now share duplicate admission, embeddings,
   edges, revisions, and Markdown projection behavior.

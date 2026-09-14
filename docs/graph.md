@@ -12,6 +12,20 @@ Search answers "which documents mention this?". The graph answers "which
 documents did the author connect to this, and how?" — a relation an author
 typed is evidence; a term two documents happen to share is not.
 
+## Ownership and reorganization
+
+Humans and agents own meaning: they write frontmatter, wikilinks, and memory
+relations. MDKB owns mechanical consistency: indexing extracts document edges,
+re-indexing replaces the changed document's edges, collection reconciliation
+assigns each document to the most specific collection, and `supersedes` updates
+memory status atomically with its edge.
+
+MDKB does not infer a taxonomy, move files, rewrite prose, or automatically act
+on centrality. `graph dangling` and `graph hubs` are read-only gardening reports;
+`dup` and `coupling` are separate read-only structural audits. This boundary
+keeps repository organization reviewable instead of letting a ranking heuristic
+silently reshape source material.
+
 ## The document graph
 
 ### How edges are created
