@@ -21,32 +21,31 @@
 //! unprivileged processes cannot write into a directory they do not own when
 //! its mode is `0700`.
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(unix)]
-use rmcp::ServiceExt;
 use serde_json::{Value, json};
-#[cfg(unix)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
-#[cfg(unix)]
-use tokio::sync::Semaphore;
-#[cfg(unix)]
-use tokio_util::sync::CancellationToken;
-#[cfg(unix)]
-use tokio_util::task::TaskTracker;
 
 use crate::mcp::dispatch::{DispatchContext, dispatch_call};
-#[cfg(unix)]
-use crate::mcp::server::McpServer;
 
 use super::registry::RepoRegistry;
+
+/// What the socket server needs and the rest of this module does not.
+///
+/// Grouped under one gate rather than nine, so the platform boundary reads as a
+/// single decision instead of a property repeated per line.
+#[cfg(unix)]
+use {
+    crate::mcp::server::McpServer,
+    rmcp::ServiceExt,
+    std::os::unix::fs::PermissionsExt,
+    std::path::PathBuf,
+    tokio::io::{AsyncReadExt, AsyncWriteExt},
+    tokio::net::{UnixListener, UnixStream},
+    tokio::sync::Semaphore,
+    tokio_util::sync::CancellationToken,
+    tokio_util::task::TaskTracker,
+};
 
 /// Names of the two sockets under the daemon base directory (`~/.mdkb`).
 pub const MCP_SOCKET_NAME: &str = "daemon.sock";
@@ -604,6 +603,8 @@ mod tests {
     /// on every platform.
     fn json_str(p: &std::path::Path) -> String {
         let quoted = serde_json::to_string(&p.display().to_string()).expect("serialize path");
+        // serde_json always wraps a string in one pair of quotes, and the bodies
+        // here supply their own, so the quotes come back off.
         quoted[1..quoted.len() - 1].to_string()
     }
 
