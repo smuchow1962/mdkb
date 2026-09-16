@@ -45,8 +45,15 @@ pub fn model_cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FASTEMBED_CACHE_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").expect("HOME must be set to locate the model cache");
-    PathBuf::from(home).join(".cache/fastembed")
+    // `USERPROFILE` is the Windows spelling, and a bare Windows runner sets only
+    // that one. An empty value counts as absent so the cache path cannot degrade
+    // into the filesystem root. Same rule as `git::home_dir`.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .expect("HOME or USERPROFILE must be set to locate the model cache");
+    home.join(".cache/fastembed")
 }
 
 /// A hermetic `mdkb` invocation. Callers add arguments, a working directory
