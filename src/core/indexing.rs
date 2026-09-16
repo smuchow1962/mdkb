@@ -25,6 +25,7 @@ use crate::config::Config;
 use crate::core::Context;
 use crate::core::memory_sync::sync_memory_files;
 use crate::domain::frontmatter::{ParsedDocument, parse_frontmatter};
+use crate::domain::paths::index_key;
 use crate::domain::{Collection, Document, UpdateResult};
 use crate::error::{Error, Result};
 use crate::store::evolution::RelationshipType;
@@ -503,7 +504,7 @@ fn narrower_collections(
 fn claimed_by_a_narrower_collection(path: &Path, narrower: &[NarrowerCollection]) -> bool {
     narrower.iter().any(|other| {
         path.strip_prefix(&other.base)
-            .is_ok_and(|rel| other.matcher.is_match(rel))
+            .is_ok_and(|rel| other.matcher.is_match(index_key::normalize(rel)))
     })
 }
 /// Update a single collection by scanning for file changes.
@@ -585,15 +586,21 @@ fn update_collection(
             // collection's glob pattern and that no collection rooted deeper
             // already owns.
             match path.strip_prefix(&base_path) {
-                Ok(rel) => glob.is_match(rel) && !claimed_by_a_narrower_collection(path, &narrower),
+                Ok(rel) => {
+                    glob.is_match(index_key::normalize(rel))
+                        && !claimed_by_a_narrower_collection(path, &narrower)
+                }
                 Err(_) => false,
             }
         },
     );
 
     for path in discovered {
+        // The stored key is the document's identity: it goes in the database,
+        // in search results and in links, so it carries the `/` spelling on
+        // every platform rather than the host separator.
         let relative = match path.strip_prefix(&base_path) {
-            Ok(rel) => rel.to_string_lossy().to_string(),
+            Ok(rel) => index_key::normalize(rel),
             Err(_) => continue,
         };
 
@@ -926,9 +933,8 @@ pub(crate) fn index_specified_files(
             .filter_map(|(coll, matcher, canonical_base)| {
                 let relative = canonical_file
                     .strip_prefix(canonical_base)
-                    .ok()?
-                    .to_string_lossy()
-                    .to_string();
+                    .ok()
+                    .map(index_key::normalize)?;
 
                 matcher
                     .is_match(&relative)

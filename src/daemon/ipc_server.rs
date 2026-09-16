@@ -595,6 +595,18 @@ mod tests {
         Arc::new(RepoRegistry::new(config))
     }
 
+    /// A filesystem path as the body of a JSON string, without the quotes.
+    ///
+    /// These tests write request bodies as literal JSON. A Windows path carries
+    /// backslashes, and JSON reads a backslash as the start of an escape, so
+    /// interpolating the path directly produces `invalid escape` instead of the
+    /// response under test. Serializing through serde_json escapes it correctly
+    /// on every platform.
+    fn json_str(p: &std::path::Path) -> String {
+        let quoted = serde_json::to_string(&p.display().to_string()).expect("serialize path");
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
     fn make_dctx() -> Arc<DispatchContext> {
         Arc::new(DispatchContext {
             metrics: Arc::new(UsageMetrics::new()),
@@ -894,7 +906,7 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"no_such","params":{{"root":"{}"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let resp = dispatch_hook_message(body.as_bytes(), &make_registry(), &make_dctx()).await;
         assert!(resp.contains("-32601"), "resp: {resp}");
@@ -926,7 +938,7 @@ mod tests {
         let root = std::env::temp_dir();
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"cli.mutate","params":{{"root":"{}","command":"not_real"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let response = dispatch_hook_message(body.as_bytes(), &make_registry(), &make_dctx()).await;
         let envelope: Value = serde_json::from_str(&response).unwrap();
@@ -967,7 +979,7 @@ mod tests {
                 "repo the daemon will not serve",
                 format!(
                     r#"{{"jsonrpc":"2.0","id":1,"method":"update","params":{{"root":"{}"}}}}"#,
-                    outside_root.display()
+                    json_str(&outside_root)
                 ),
             ),
         ];
@@ -999,7 +1011,7 @@ mod tests {
         crate::cli::handlers::handle_init(&served_root).expect("init store");
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"cli.mutate","params":{{"root":"{}","command":"memory_add","id":"Bad Id","title":"T","entry_type":"topic","content":"body"}}}}"#,
-            served_root.display()
+            json_str(&served_root)
         );
         let resp = dispatch_hook_message(body.as_bytes(), &make_registry(), &make_dctx()).await;
         let envelope: Value = serde_json::from_str(&resp).unwrap();
@@ -1034,7 +1046,7 @@ mod tests {
         let dctx = make_dctx();
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":42,"method":"status","params":{{"root":"{}"}}}}"#,
-            root.display()
+            json_str(&root)
         );
 
         let resp = dispatch_hook_message(body.as_bytes(), &registry, &dctx).await;
@@ -1065,12 +1077,12 @@ mod tests {
 
         let without = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"hook.session_start","params":{{"root":"{}"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let with = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"hook.session_start","params":{{"root":"{}","cwd":"{}"}}}}"#,
-            root.display(),
-            project.display()
+            json_str(&root),
+            json_str(&project)
         );
 
         let a: Value = serde_json::from_str(
@@ -1103,7 +1115,7 @@ mod tests {
 
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"status","params":{{"root":"{}"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let hook_resp = dispatch_hook_message(body.as_bytes(), &registry, &dctx).await;
         let hook_parsed: Value = serde_json::from_str(&hook_resp).unwrap();
@@ -1129,7 +1141,7 @@ mod tests {
 
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"search","params":{{"root":"{}","query":"anything","scope":"docs"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let hook_resp = dispatch_hook_message(body.as_bytes(), &registry, &dctx).await;
         let hook_parsed: Value = serde_json::from_str(&hook_resp).unwrap();
